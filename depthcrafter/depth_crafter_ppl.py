@@ -1,5 +1,6 @@
 from typing import Callable, Dict, List, Optional, Union
 
+import os
 import numpy as np
 import torch
 import logging 
@@ -30,13 +31,19 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         :return: image_embeddings in shape of [b, 1024]
         """
 
-        video_224 = _resize_with_antialiasing(video.float(), (224, 224))
-        video_224 = (video_224 + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+        # override da env per video lunghi (evita "32-bit index math")
+        # es: export SC_ENCODE_CHUNK=32
+        chunk_size = int(os.environ.get("SC_ENCODE_CHUNK", str(chunk_size)))
+        chunk_size = max(1, chunk_size)
 
         embeddings = []
-        for i in range(0, video_224.shape[0], chunk_size):
+        for i in range(0, video.shape[0], chunk_size):
+            # PATCH: resize+antialias SOLO sul chunk (non su tutto il video)
+            video_224 = _resize_with_antialiasing(video[i : i + chunk_size].float(), (224, 224))
+            video_224 = (video_224 + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+
             tmp = self.feature_extractor(
-                images=video_224[i : i + chunk_size],
+                images=video_224,
                 do_normalize=True,
                 do_center_crop=False,
                 do_resize=False,
@@ -59,6 +66,11 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         :param chunk_size: the chunk size to encode video
         :return: vae latents in shape of [b, c, h, w]
         """
+        # (opzionale) override per OOM:
+        # export SC_VAE_CHUNK=8
+        chunk_size = int(os.environ.get("SC_VAE_CHUNK", str(chunk_size)))
+        chunk_size = max(1, chunk_size)
+
         video_latents = []
         for i in range(0, video.shape[0], chunk_size):
             video_latents.append(
@@ -95,7 +107,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         guidance_scale: float = 1.0,
         window_size: Optional[int] = 110,
         noise_aug_strength: float = 0.02,
-        decode_chunk_size: Optional[int] = 5,
+        decode_chunk_size: Optional[int] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
@@ -128,7 +140,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
         num_frames = video.shape[0]
-        decode_chunk_size = decode_chunk_size if decode_chunk_size is not None else 8
+        decode_chunk_size = decode_chunk_size if decode_chunk_size is not None else 2
         if num_frames <= window_size:
             window_size = num_frames
             overlap = 0
@@ -352,14 +364,15 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             # cast back to fp16 if needed
             if needs_upcasting:
                 self.vae.to(dtype=torch.float16)
-            frames = self.decode_latents(latents_all, num_frames, decode_chunk_size)
+            frames = self.decode_latents(latents_all, num_frames, 5)
 
             if track_time:
                 decode_event.record()
                 torch.cuda.synchronize()
                 elapsed_time_ms = denoise_event.elapsed_time(decode_event)
                 print(f"Elapsed time for decoding video: {elapsed_time_ms} ms")
-
+            
+            frames = frames.detach().to("cpu")
             frames = self.video_processor.postprocess_video(
                 video=frames, output_type=output_type
             )
