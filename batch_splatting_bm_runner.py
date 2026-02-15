@@ -82,8 +82,12 @@ MOVE_TO_FINISHED = False  # IMPORTANT: disable finished/failed moving in GUI log
 # Skip policy
 SKIP_IF_OUTPUT_EXISTS = True  # skip each task if its final mp4 exists and size>0
 
+# Retry / cleanup policy (handles occasional ffmpeg encode failures)
+RETRY_ON_FAIL = 1          # number of retries for the same clip when encoding fails (0 disables)
+CLEANUP_ON_FAIL = True     # delete leftover corrupted output(s) before retry / before moving on
 
-# Hires skip target width (matches your naming: <name>_1920_splatted2.mp4)
+
+# Hires skip target width (matches your naming: <name>_1920_splatted2.mp4) (matches your naming: <name>_1920_splatted2.mp4)
 HIRES_SKIP_WIDTH = 1920
 
 
@@ -190,45 +194,105 @@ def main():
     except Exception:
         pass
 
-    # Monkey-patch depthSplatting to implement skip-if-output-exists.
-    if SKIP_IF_OUTPUT_EXISTS:
-        orig_depthSplatting = app.depthSplatting
+    # Monkey-patch depthSplatting to implement:
+    # - skip-if-output-exists (optional)
+    # - cleanup of corrupted leftover outputs on failure
+    # - single retry on failure (configurable)
+    orig_depthSplatting = app.depthSplatting
 
-        def depthSplatting_skip_wrapper(*args, **kwargs):
-            # We only care about hires + splatted2 output (user constraint).
-            output_video_path_base = kwargs.get("output_video_path_base", None)
-            target_output_width = kwargs.get("target_output_width", None)
+    def _compute_hires_final_out(output_video_path_base, target_output_width):
+        base_dir = os.path.dirname(str(output_video_path_base))
+        base_name = os.path.splitext(os.path.basename(str(output_video_path_base)))[0]
 
-            if output_video_path_base is None and len(args) >= 6:
-                output_video_path_base = args[5]
-            if target_output_width is None and len(args) >= 8:
-                target_output_width = args[7]
+        # Ensure we are checking inside .../hires
+        if os.path.basename(base_dir).lower() != "hires":
+            hires_dir = os.path.join(base_dir, "hires")
+        else:
+            hires_dir = base_dir
 
+        final_out = os.path.join(
+            hires_dir,
+            f"{base_name}_{int(target_output_width)}_splatted2.mp4"
+        )
+        return final_out
+
+    def _compute_replace_mask_out(final_out: str):
+        # Must mirror splatting_bm_gui.py naming:
+        #   <basename_without_ext>_replace_mask.mkv
+        if not bool(REPLACE_MASK_ENABLED):
+            return None
+        out_dir = str(MASK_OUTPUT).strip()
+        if not out_dir:
+            out_dir = os.path.dirname(final_out)
+        base_no_ext = os.path.splitext(os.path.basename(final_out))[0]
+        return os.path.join(out_dir, f"{base_no_ext}_replace_mask.mkv")
+
+    def _safe_remove(path: str | None, tag: str):
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"[CLEAN] removed {tag}: {path}")
+        except Exception as ex:
+            print(f"[WARN] failed to remove {tag} '{path}': {ex}")
+
+    def depthSplatting_wrapper(*args, **kwargs):
+        # We only care about hires + splatted2 output (user constraint).
+        output_video_path_base = kwargs.get("output_video_path_base", None)
+        target_output_width = kwargs.get("target_output_width", None)
+
+        if output_video_path_base is None and len(args) >= 6:
+            output_video_path_base = args[5]
+        if target_output_width is None and len(args) >= 8:
+            target_output_width = args[7]
+
+        final_out = None
+        replace_out = None
+
+        try:
+            final_out = _compute_hires_final_out(output_video_path_base, target_output_width)
+            replace_out = _compute_replace_mask_out(final_out)
+            if SKIP_IF_OUTPUT_EXISTS and os.path.exists(final_out) and os.path.getsize(final_out) > 0:
+                print(f"[SKIP] hires splatted2 exists: {final_out}")
+                return True
+        except Exception as ex:
+            # If anything goes wrong, fall back to normal behavior.
+            print(f"[WARN] skip/compute paths failed, continuing: {ex}")
+
+        max_attempts = 1 + max(0, int(RETRY_ON_FAIL))
+        last_exc = None
+
+        for attempt in range(1, max_attempts + 1):
+            ok = False
             try:
-                base_dir = os.path.dirname(str(output_video_path_base))
-                base_name = os.path.splitext(os.path.basename(str(output_video_path_base)))[0]
-
-                # Ensure we are checking inside .../hires
-                if os.path.basename(base_dir).lower() != "hires":
-                    hires_dir = os.path.join(base_dir, "hires")
-                else:
-                    hires_dir = base_dir
-
-                final_out = os.path.join(
-                    hires_dir,
-                    f"{base_name}_{int(target_output_width)}_splatted2.mp4"
-                )
-
-                if os.path.exists(final_out) and os.path.getsize(final_out) > 0:
-                    print(f"[SKIP] hires splatted2 exists: {final_out}")
-                    return True
+                ok = bool(orig_depthSplatting(*args, **kwargs))
             except Exception as ex:
-                # If anything goes wrong, fall back to normal behavior.
-                print(f"[WARN] skip-check failed, continuing: {ex}")
+                last_exc = ex
+                ok = False
+                print(f"[ERR ] depthSplatting raised: {ex}")
 
-            return orig_depthSplatting(*args, **kwargs)
+            if ok:
+                return True
 
-        app.depthSplatting = depthSplatting_skip_wrapper  # type: ignore
+            # Failure path: cleanup corrupted leftovers
+            if bool(CLEANUP_ON_FAIL):
+                _safe_remove(final_out, "hires out")
+                _safe_remove(replace_out, "replace mask")
+
+            if attempt < max_attempts:
+                print(f"[RETRY] encoding failed, retrying ({attempt}/{max_attempts - 1})...")
+                continue
+
+        if last_exc is not None:
+            print(f"[ERR ] giving up after {max_attempts} attempt(s). Last exception: {last_exc}")
+        else:
+            print(f"[ERR ] giving up after {max_attempts} attempt(s).")
+
+        return False
+
+    app.depthSplatting = depthSplatting_wrapper  # type: ignore
+
 
     # Monkey-patch _process_single_video_tasks to skip the WHOLE chain early
     # (avoids global depth stats pre-pass when output already exists).
