@@ -32,6 +32,40 @@ from pipelines.stereo_video_inpainting import (
 
 GUI_VERSION = "26-01-13.0"
 
+# === STREAM ENCODING HELPERS ===
+def _start_ffmpeg_rawvideo_writer(output_path: str, width: int, height: int, fps: float, crf: int, preset: str = "veryfast") -> subprocess.Popen:
+    """Start ffmpeg process that reads raw RGB frames from stdin and encodes to H.264 MP4."""
+    # Use rgb24 for simplicity; ffmpeg will convert to yuv420p for compatibility.
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{width}x{height}",
+        "-r", f"{fps}",
+        "-i", "pipe:0",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-crf", str(crf),
+        "-pix_fmt", "yuv420p",
+        output_path
+    ]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+def _write_rgb_frame(p: subprocess.Popen, frame_rgb_u8: np.ndarray) -> None:
+    """Write a single HxWx3 uint8 RGB frame to ffmpeg stdin."""
+    if p.stdin is None:
+        raise RuntimeError("ffmpeg stdin is not available")
+    p.stdin.write(frame_rgb_u8.tobytes())
+
+def _close_ffmpeg_writer(p: subprocess.Popen) -> int:
+    """Close stdin and wait for ffmpeg."""
+    try:
+        if p.stdin:
+            p.stdin.close()
+    finally:
+        return p.wait()
+
+
 # torch.backends.cudnn.benchmark = True
 
 class InpaintingGUI(ThemedTk):    
@@ -1532,9 +1566,39 @@ class InpaintingGUI(ThemedTk):
         # 3. INPAINTING CHUNKS (The main loop)
         # This part of the loop remains the same, but the logic inside is simplified
         total_frames_to_process_actual = num_frames_original        
+
         stride = max(1, frames_chunk - overlap)
-        results = [] 
+
+        # Streaming encode (write MP4 as we generate frames) drastically reduces RAM usage.
+        # NOTE: If Hi-Res blending is enabled, we fall back to the original (non-streaming) path.
+        stream_encode_enabled = not hires_data.get("is_hires_blend_enabled", False)
+        results = []  # kept for non-streaming fallback
         previous_chunk_output_frames: Optional[torch.Tensor] = None
+
+        ffmpeg_p = None
+        video_only_path = None
+        if stream_encode_enabled:
+            # Determine output frame size (after finalization/concat)
+            out_H = padded_H
+            out_W = padded_W
+            if not is_dual_input:
+                out_W = out_W * 2  # SBS
+            # Encode directly to the output MP4 (no audio).
+            video_only_path = output_video_path
+            try:
+                ffmpeg_p = _start_ffmpeg_rawvideo_writer(
+                    output_path=output_video_path,
+                    width=out_W,
+                    height=out_H,
+                    fps=fps,
+                    crf=output_crf,
+                    preset="veryfast"
+                )
+            except Exception as e:
+                logger.warning(f"Streaming writer init failed ({e}); falling back to non-streaming encoding.")
+                stream_encode_enabled = False
+                ffmpeg_p = None
+                video_only_path = None
 
         for i in range(0, total_frames_to_process_actual, stride):
             if stop_event and stop_event.is_set():
@@ -1621,14 +1685,111 @@ class InpaintingGUI(ThemedTk):
             ]).cpu()
             self._save_debug_image(current_chunk_generated, f"07_inpainted_chunk_{i}", base_video_name, i)
 
-            # Append only the "new" frames
+            # Emit only the "new" frames
             if i == 0:
-                results.append(current_chunk_generated[:actual_sliced_length])
+                chunk_new = current_chunk_generated[:actual_sliced_length]
+                global_start = 0
             else:
-                results.append(current_chunk_generated[overlap:actual_sliced_length])
-            
-            previous_chunk_output_frames = current_chunk_generated
-        # --- END INPAINTING CHUNKS ---
+                chunk_new = current_chunk_generated[overlap:actual_sliced_length]
+                global_start = i + overlap
+
+            # Keep only overlap tail (on CPU) for the next chunk to reduce VRAM growth
+            if overlap > 0 and current_chunk_generated.shape[0] >= overlap:
+                previous_chunk_output_frames = current_chunk_generated[-overlap:].detach().cpu()
+            else:
+                previous_chunk_output_frames = None
+
+            if stream_encode_enabled and ffmpeg_p is not None:
+                # Crop to padded canvas
+                chunk_new = chunk_new[:, :, :padded_H, :padded_W]
+
+                # Slice matching mask/warped/left for per-chunk post-processing
+                global_end = global_start + chunk_new.shape[0]
+                mask_chunk = frames_mask_processed_unpadded_original_length[global_start:global_end]
+                warped_chunk = frames_warpped_original_unpadded_normalized[global_start:global_end]
+                left_chunk = None
+                if not is_dual_input:
+                    left_chunk = frames_left_original_cropped[global_start:global_end]
+
+                # Color transfer (chunk-wise)
+                if self.enable_color_transfer.get():
+                    reference_frames_for_transfer = None
+                    if is_dual_input:
+                        # Dual input: create occlusion-free reference from warped frames via directional dilation
+                        reference_frames_for_transfer = self._apply_directional_dilation(
+                            frame_chunk=warped_chunk.cpu(),
+                            mask_chunk=mask_chunk.cpu()
+                        )
+                    else:
+                        reference_frames_for_transfer = left_chunk
+
+                    if reference_frames_for_transfer is not None and reference_frames_for_transfer.numel() > 0:
+                        adjusted = []
+                        target_H, target_W = chunk_new.shape[2], chunk_new.shape[3]
+                        # Operate on CPU to keep VRAM lower during streaming
+                        ref_cpu = reference_frames_for_transfer.cpu()
+                        tgt_cpu = chunk_new.cpu()
+                        for t in range(tgt_cpu.shape[0]):
+                            ref_frame_resized = F.interpolate(
+                                ref_cpu[t].unsqueeze(0),
+                                size=(target_H, target_W),
+                                mode='bilinear', align_corners=False
+                            ).squeeze(0)
+                            adjusted_frame = self._apply_color_transfer(ref_frame_resized, tgt_cpu[t])
+                            adjusted.append(adjusted_frame)
+                        chunk_new = torch.stack(adjusted)
+
+                # Post-inpainting blend (chunk-wise)
+                if self.enable_post_inpainting_blend.get():
+                    chunk_new = self._apply_post_inpainting_blend(
+                        inpainted_frames=chunk_new,
+                        original_warped_frames=warped_chunk,
+                        mask=mask_chunk,
+                        base_video_name=base_video_name
+                    )
+
+                # Final concat (SBS if quad input)
+                if not is_dual_input:
+                    if left_chunk is None or left_chunk.numel() == 0:
+                        raise RuntimeError("Missing left_chunk for SBS output in streaming mode")
+                    # Ensure left is on CPU and matches
+                    left_cpu = left_chunk[:, :, :padded_H, :padded_W].cpu()
+                    right_cpu = chunk_new.cpu()
+                    if left_cpu.shape[:3] != right_cpu.shape[:3]:
+                        raise RuntimeError(f"SBS shape mismatch: left {left_cpu.shape} vs right {right_cpu.shape}")
+                    out_chunk = torch.cat([left_cpu, right_cpu], dim=3)
+                else:
+                    out_chunk = chunk_new.cpu()
+
+                # Write frames to ffmpeg
+                out_np = (out_chunk.clamp(0, 1).permute(0, 2, 3, 1).numpy() * 255.0).round().astype(np.uint8)
+                for t in range(out_np.shape[0]):
+                    _write_rgb_frame(ffmpeg_p, out_np[t])
+            else:
+                # Non-streaming fallback: accumulate results in RAM
+                if i == 0:
+                    results.append(current_chunk_generated[:actual_sliced_length])
+                else:
+                    results.append(current_chunk_generated[overlap:actual_sliced_length])
+
+# --- END INPAINTING CHUNKS ---
+
+        # If streaming encoding is enabled, we have already written frames to ffmpeg as they were generated.
+        if stream_encode_enabled and ffmpeg_p is not None and video_only_path is not None:
+            if update_info_callback:
+                self.after(0, lambda: update_info_callback(base_video_name, f"Finalizing MP4...", "stream", overlap, original_input_blend_strength))
+
+            rc = _close_ffmpeg_writer(ffmpeg_p)
+            if rc != 0:
+                logger.error(f"ffmpeg streaming encoder failed with return code {rc} for {base_video_name}.")
+                return False, None
+
+            if update_info_callback:
+                self.after(0, lambda: update_info_callback(base_video_name, "Done (stream)", "OK", overlap, original_input_blend_strength))
+
+            hires_video_path = hires_data.get("hires_video_path", None)
+            return True, hires_video_path
+
 
         # 4. PREPARE FRAMES FOR FINALIZATION (Temporal/Spatial Cropping)
         if not results:
