@@ -8,6 +8,7 @@
 - Merging_gui using the new clean mask + single process button
 - Multithreaded RealESRGAN upscale script
 - Rejoin segments ps1 script (ffmpeg)
+- Added modified Forward-Warp cuda submodule, compatible with latest pytorch (need build)
 
 ## Fork workflow example (1080p)
 
