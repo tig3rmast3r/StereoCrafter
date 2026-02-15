@@ -1,3 +1,115 @@
+# Fork Info
+
+- added sh + runners for headless batches (mainly for docker usage and handling errors/skip)
+- Depthcrafter script memory usage optimization (will allow larger files before OOM)
+- Splatting improvement, blur for left borders + clean mask for merge
+- Multithreaded Sharpness Analyzer Script - will analyze splat and predict sharpness inside the masked (inpaint) area (to be used relatively with inpaint steps)
+- Inpaint with dynamic step selector based on sharpness.csv + Stream behaviour (will allow much longer files)
+- Merging_gui using the new clean mask + single process button
+- Multithreaded RealESRGAN upscale script
+- Rejoin segments ps1 script (ffmpeg)
+
+## Fork workflow example (1080p)
+
+NOTE: always check files after each step
+```bash
+find ./work/***folder*** -maxdepth 1 -type f -name '*.mp4' -print0 | xargs -0 -n1 -P"$(nproc)" sh -c 'ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,avg_frame_rate,nb_frames -show_entries format=duration -of default=nw=1:nk=1 "$1" >/dev/null || echo "BROKEN: $1"' _
+```
+NOTE2: this is a very long task, consider ~1 hour for 1 minute with an RTX 5090
+
+### Step 1- SceneDetect
+
+Pick your source.mkv and divide by scenes using SceneDetect (not included), use same pass to crop bars if needed
+```
+IN="./work/source.mkv"
+OUT_SCENES="./work/seg/"
+```
+for full 1080p (no black bars)
+```
+scenedetect -i "$IN" detect-adaptive -t 2.0 split-video -o "$OUT_SCENES" -a "-map 0:v:0 -an -dn -sn -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p"
+```
+1080p IMAX -> 1024
+```
+scenedetect -i "$IN" detect-adaptive -t 2.0 split-video -o "$OUT_SCENES" -a "-map 0:v:0 -an -dn -sn -vf crop=iw:1024:0:trunc(((ih-1024)/2)/2)*2 -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p"
+```
+1080p standard -> 832
+```
+scenedetect -i "$IN" detect-adaptive -t 2.0 split-video -o "$OUT_SCENES" -a "-map 0:v:0 -an -dn -sn -vf crop=iw:832:0:trunc((ih-832)/4)*2 -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p"
+```
+### Step 2 - DepthCrafter
+
+just run
+```bash
+chmod +x run_depthcrafter_runner.sh
+./run_depthcrafter_runner.sh
+```
+If your work folder is ./work you don't need to do anything else
+It will output depthmap at exactly half size
+
+### Step 3 - Upscale Depthmaps
+
+i use Real ESRGAN (not included) for upscaling, it will help a lot with precision compared to other upscales
+5th arg is tile size, i suggest vertical resolution as tile size (faster)
+it will launch 4 batches in parallel (can be changed by args or inside the script)
+```
+./upscale_esrgan.sh "./work/depthmap" "./work/depthmap/upscaled" 2 realesr-animevideov3-x2 416
+```
+
+### Step 4 - Splatting
+
+just run with default values
+```bash
+chmod +x run_splatting_bm_runner.sh
+./run_splatting_bm_runner.sh
+```
+or play with splatting_bm_gui.py to find your own and then change options inside sh and runner accordingly.
+this bm_gui version will have optional blur on left edges and optional extra binary mask to be used with merging_gui and mask analyze, saved in ./work/mask
+
+### Step 5 - Analyze mask sharpness
+
+```
+python analyze_inpaint_sharpness_newmask.py "./work/splat/hires" "./work/mask" --out_csv "./work/sharpness.csv"
+```
+Will predict masked zone sharpness and save to csv
+
+### Step 6 - Inpaint
+
+just run and wait (a lot)
+for 24GB VRAM (RTX4090) i suggest tile 2, frame chunk size up to 50 and overlap to 4
+for 32GB VRAM (RTX5090) you can push up to 80 chunk size
+```bash
+chmod +x run_inpainting_runner.sh
+./run_inpainting_runner.sh
+```
+
+### Step 7 - Merge inpaint
+
+run or change settings using gui preview and apply on the runner script
+Runner uses ReplaceMask as default option.
+
+```bash
+chmod +x run_merging_runner.sh
+./run_merging_runner.sh
+```
+
+### Step 8 - Merge Scenes and Compress
+
+I merge in Windows with ffmpeg hevc nvenc
+
+```
+Rejoin_HEVC_NVENC.ps1
+```
+
+### Step 9 - Remux other Streams (audio,subs,etc..)
+
+use mkvtoolnix to remux (i use gui version in Windows)
+
+#### Dependencies (not included)
+-RealESRGAN
+-ffmpeg
+-Scenedetect
+-MKVToolNix
+
 # StereoCrafter GUI + DepthCrafter GUI Seg
 
 You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billynom8/DepthCrafter_GUI_Seg">here</a>.

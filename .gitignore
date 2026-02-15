@@ -85,6 +85,10 @@ weights/
 old/
 temp/
 work/
+logs/
+run_inpainting_runner_temp.sh
+run_merging_runner_temp.sh
+run_splatting_bm_runner_temp.sh
 
 
 config.json
