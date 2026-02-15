@@ -31,14 +31,14 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         :return: image_embeddings in shape of [b, 1024]
         """
 
-        # override da env per video lunghi (evita "32-bit index math")
-        # es: export SC_ENCODE_CHUNK=32
+        # Optional env override for long videos (avoids "32-bit index math")
+        # e.g.: export SC_ENCODE_CHUNK=32
         chunk_size = int(os.environ.get("SC_ENCODE_CHUNK", str(chunk_size)))
         chunk_size = max(1, chunk_size)
 
         embeddings = []
         for i in range(0, video.shape[0], chunk_size):
-            # PATCH: resize+antialias SOLO sul chunk (non su tutto il video)
+            # PATCH: resize+antialias only on the chunk (not on the whole video)
             video_224 = _resize_with_antialiasing(video[i : i + chunk_size].float(), (224, 224))
             video_224 = (video_224 + 1.0) / 2.0  # [-1, 1] -> [0, 1]
 
@@ -66,8 +66,8 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         :param chunk_size: the chunk size to encode video
         :return: vae latents in shape of [b, c, h, w]
         """
-        # (opzionale) override per OOM:
-        # export SC_VAE_CHUNK=8
+        # (optional) env override to reduce OOM risk:
+        # e.g.: export SC_VAE_CHUNK=8
         chunk_size = int(os.environ.get("SC_VAE_CHUNK", str(chunk_size)))
         chunk_size = max(1, chunk_size)
 
