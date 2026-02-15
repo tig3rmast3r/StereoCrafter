@@ -153,7 +153,9 @@ class MergingGUI(ThemedTk):
         "inpainted_folder": "./completed_output",
         "original_folder": "./input_source_clips",
         "mask_folder": "./output_splatted/hires",
+        "replace_mask_folder": "",  # optional; if empty uses splatted folder
         "output_folder": "./final_videos",
+        "use_replace_mask": False,
         "mask_binarize_threshold": 0.3,
         "mask_dilate_kernel_size": 3.0,
         "mask_blur_kernel_size": 5.0,
@@ -215,6 +217,26 @@ class MergingGUI(ThemedTk):
             value=self.app_config.get("mask_folder", self.APP_DEFAULTS["mask_folder"])
         )
         self.mask_folder_var.trace_add("write", self._on_folder_changed)
+
+        self.replace_mask_folder_var = tk.StringVar(
+            value=str(
+                self.app_config.get(
+                    "replace_mask_folder",
+                    self.APP_DEFAULTS.get("replace_mask_folder", ""),
+                )
+            )
+        )
+        self.replace_mask_folder_var.trace_add("write", self._on_folder_changed)
+
+
+        # --- Optional: Use external replace-mask video instead of embedded splat mask ---
+        self.use_replace_mask_var = tk.BooleanVar(
+            value=bool(
+                self.app_config.get(
+                    "use_replace_mask", self.APP_DEFAULTS.get("use_replace_mask", False)
+                )
+            )
+        )
         self.output_folder_var = tk.StringVar(
             value=self.app_config.get(
                 "output_folder", self.APP_DEFAULTS["output_folder"]
@@ -710,8 +732,8 @@ class MergingGUI(ThemedTk):
         self.widgets_to_disable.append(entry_orig)
         self.widgets_to_disable.append(btn_orig)
 
-        # Mask Folder
-        ttk.Label(folder_frame, text="Mask Folder:").grid(
+        # Splat Folder
+        ttk.Label(folder_frame, text="Splat Folder:").grid(
             row=2, column=0, sticky="e", padx=5, pady=2
         )
         entry_mask = ttk.Entry(folder_frame, textvariable=self.mask_folder_var)
@@ -726,19 +748,35 @@ class MergingGUI(ThemedTk):
         self.widgets_to_disable.append(entry_mask)
         self.widgets_to_disable.append(btn_mask)
 
-        # Output Folder
-        ttk.Label(folder_frame, text="Output Folder:").grid(
+        
+        # Replace Mask Folder (optional)
+        ttk.Label(folder_frame, text="Replace Mask Folder (optional):").grid(
             row=3, column=0, sticky="e", padx=5, pady=2
         )
+        entry_rmask = ttk.Entry(folder_frame, textvariable=self.replace_mask_folder_var)
+        entry_rmask.grid(row=3, column=1, padx=5, sticky="ew")
+        btn_rmask = ttk.Button(
+            folder_frame,
+            text="Browse",
+            command=lambda: self._browse_folder(self.replace_mask_folder_var),
+        )
+        btn_rmask.grid(row=3, column=2, padx=5)
+        self.widgets_to_disable.append(entry_rmask)
+        self.widgets_to_disable.append(btn_rmask)
+
+# Output Folder
+        ttk.Label(folder_frame, text="Output Folder:").grid(
+            row=4, column=0, sticky="e", padx=5, pady=2
+        )
         entry_out = ttk.Entry(folder_frame, textvariable=self.output_folder_var)
-        entry_out.grid(row=3, column=1, padx=5, sticky="ew")
+        entry_out.grid(row=4, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_out, "output_folder")
         btn_out = ttk.Button(
             folder_frame,
             text="Browse",
             command=lambda: self._browse_folder(self.output_folder_var),
         )
-        btn_out.grid(row=3, column=2, padx=5)
+        btn_out.grid(row=4, column=2, padx=5)
         self.widgets_to_disable.append(entry_out)
         self.widgets_to_disable.append(btn_out)
 
@@ -884,6 +922,18 @@ class MergingGUI(ThemedTk):
             step_size=0.01,
         )
 
+        # --- NEW: Option to use external replace-mask video instead of embedded mask ---
+        replace_mask_check = ttk.Checkbutton(
+            param_frame,
+            text="Use Replace Mask (_replace_mask.mkv) instead of embedded mask",
+            variable=self.use_replace_mask_var,
+            command=self._on_use_replace_mask_changed,
+        )
+        replace_mask_check.grid(
+            row=8, column=0, columnspan=3, sticky="w", padx=5, pady=(8, 2)
+        )
+        self.widgets_to_disable.append(replace_mask_check)
+
         # --- OPTIONS FRAME ---
         options_frame = ttk.LabelFrame(self, text="Options", padding=10)
         options_frame.pack(fill="x", padx=10, pady=5)
@@ -1023,6 +1073,28 @@ class MergingGUI(ThemedTk):
         """Scans a folder for a file matching the core_name with any common video extension."""
         return find_video_by_core_name(folder, core_name)
 
+    def _find_replace_mask_for_splatted(
+        self, splatted_path: str, replace_mask_folder: str = ""
+    ) -> Optional[str]:
+        """Return external replace-mask video path if present.
+
+        Naming: <splatted_basename_without_ext> + '_replace_mask.mkv' (or .mp4).
+        Folder: replace_mask_folder if provided, else same folder as splatted_path.
+        """
+        try:
+            base = os.path.splitext(os.path.basename(splatted_path))[0]
+            folder = (replace_mask_folder or "").strip()
+            if not folder:
+                folder = os.path.dirname(splatted_path)
+
+            for ext in [".mkv", ".mp4"]:
+                candidate = os.path.join(folder, f"{base}_replace_mask{ext}")
+                if os.path.exists(candidate):
+                    return candidate
+            return None
+        except Exception:
+            return None
+
     def _find_sidecar_file(self, base_path: str) -> Optional[str]:
         """Looks for a sidecar JSON file next to the video file."""
         return find_sidecar_file(base_path)
@@ -1063,6 +1135,11 @@ class MergingGUI(ThemedTk):
 
     def _on_add_borders_changed(self, *args):
         """Called when the Add Borders checkbox is toggled. Updates the preview."""
+        if hasattr(self, "previewer") and self.previewer.video_list:
+            self.previewer.update_preview()
+
+    def _on_use_replace_mask_changed(self, *args):
+        """Called when the replace-mask checkbox is toggled. Updates the preview."""
         if hasattr(self, "previewer") and self.previewer.video_list:
             self.previewer.update_preview()
 
@@ -1292,6 +1369,12 @@ class MergingGUI(ThemedTk):
         self.is_processing = True
         self.stop_event.clear()
         self._set_ui_processing_state(True)
+
+        # --- Start the cleanup worker thread (needed for Resume moves) ---
+        self.cleanup_queue = queue.Queue()  # Clear the queue from any previous run
+        self.cleanup_thread = threading.Thread(target=self._cleanup_worker, daemon=True)
+        self.cleanup_thread.start()
+        logger.info("File cleanup worker thread started.")
         self._clear_preview_resources()
         base_name = os.path.basename(inpainted_path)
         self.update_status_label(f"Processing single clip: {base_name}")
@@ -1324,6 +1407,7 @@ class MergingGUI(ThemedTk):
                 "inpainted_folder": self.inpainted_folder_var.get(),
                 "original_folder": self.original_folder_var.get(),
                 "mask_folder": self.mask_folder_var.get(),
+                "replace_mask_folder": self.replace_mask_folder_var.get(),
                 "output_folder": self.output_folder_var.get(),
                 "use_gpu": self.use_gpu_var.get(),
                 "pad_to_16_9": self.pad_to_16_9_var.get(),
@@ -1334,6 +1418,7 @@ class MergingGUI(ThemedTk):
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
                 "preview_size": self.preview_size_var.get(),
                 "preview_source": self.preview_source_var.get(),
+                "use_replace_mask": self.use_replace_mask_var.get(),
                 # Mask params
                 "mask_binarize_threshold": float(
                     self.mask_binarize_threshold_var.get()
@@ -1456,7 +1541,7 @@ class MergingGUI(ThemedTk):
             )
 
             # Initialize readers to None for robust cleanup
-            inpainted_reader, splatted_reader, original_reader = None, None, None
+            inpainted_reader, splatted_reader, replace_mask_reader, original_reader = None, None, None, None
             original_video_path_to_move = None  # To track which original file to move
             try:
                 # --- 1. Find corresponding files (same logic as preview) ---
@@ -1523,6 +1608,29 @@ class MergingGUI(ThemedTk):
 
                 inpainted_reader = VideoReader(inpainted_video_path, ctx=cpu(0))
                 splatted_reader = VideoReader(splatted_file_path, ctx=cpu(0))
+
+                # Optional external replace-mask video (binary mkv/mp4)
+                replace_mask_reader = None
+                replace_mask_path = None
+                if settings.get("use_replace_mask", False):
+                    replace_mask_path = self._find_replace_mask_for_splatted(
+                        splatted_file_path, settings.get("replace_mask_folder", "")
+                    )
+                    if replace_mask_path and os.path.exists(replace_mask_path):
+                        try:
+                            replace_mask_reader = VideoReader(
+                                replace_mask_path, ctx=cpu(0)
+                            )
+                            logger.info(
+                                f"Using external replace mask: {os.path.basename(replace_mask_path)}"
+                            )
+                        except Exception as e_rm:
+                            logger.warning(
+                                f"Failed to open replace mask '{replace_mask_path}': {e_rm}"
+                            )
+                            replace_mask_reader = None
+                            replace_mask_path = None
+
 
                 # --- FIX: Determine original_reader based on input type ---
                 original_reader = None  # Assume None initially
@@ -1667,6 +1775,19 @@ class MergingGUI(ThemedTk):
                     inpainted_np = inpainted_reader.get_batch(frame_indices).asnumpy()
                     splatted_np = splatted_reader.get_batch(frame_indices).asnumpy()
 
+                    replace_mask_np = None
+                    if replace_mask_reader is not None:
+                        try:
+                            replace_mask_np = (
+                                replace_mask_reader.get_batch(frame_indices).asnumpy()
+                            )
+                        except Exception as e_rmread:
+                            logger.warning(
+                                f"Replace mask read failed for {base_name} frames {frame_start}-{frame_end}: {e_rmread}"
+                            )
+                            replace_mask_np = None
+
+
                     # Convert to tensors and extract parts (same logic as preview)
                     # ... (this logic is identical to update_preview's frame loading part)
                     inpainted_tensor_full = (
@@ -1710,9 +1831,23 @@ class MergingGUI(ThemedTk):
                         original_left = splatted_tensor[:, :, : H // 2, : W // 2]
                         mask_raw = splatted_tensor[:, :, H // 2 :, : W // 2]
                         warped_original = splatted_tensor[:, :, H // 2 :, W // 2 :]
-                    mask_np = mask_raw.permute(0, 2, 3, 1).cpu().numpy()
-                    mask_gray_np = np.mean(mask_np, axis=3)
-                    mask = torch.from_numpy(mask_gray_np).float().unsqueeze(1)
+                    # --- NEW: Prefer external replace-mask if available, else fallback to embedded mask ---
+                    if replace_mask_np is not None:
+                        # replace_mask_np: (T,H,W,C) uint8 or float; convert to 0..1 float mask (T,1,H,W)
+                        if replace_mask_np.ndim == 4 and replace_mask_np.shape[3] >= 1:
+                            rm_gray = replace_mask_np[..., :3].mean(axis=3)  # T,H,W
+                        elif replace_mask_np.ndim == 3:
+                            rm_gray = replace_mask_np  # T,H,W
+                        else:
+                            rm_gray = replace_mask_np.squeeze()
+                        rm_gray = rm_gray.astype("float32")
+                        if rm_gray.max() > 1.5:
+                            rm_gray = rm_gray / 255.0
+                        mask = torch.from_numpy(rm_gray).float().unsqueeze(1)
+                    else:
+                        mask_np = mask_raw.permute(0, 2, 3, 1).cpu().numpy()
+                        mask_gray_np = np.mean(mask_np, axis=3)
+                        mask = torch.from_numpy(mask_gray_np).float().unsqueeze(1)
 
                     # Process chunk
                     use_gpu = settings["use_gpu"] and torch.cuda.is_available()
@@ -1907,6 +2042,8 @@ class MergingGUI(ThemedTk):
                         del inpainted_reader
                     if splatted_reader:
                         del splatted_reader
+                    if replace_mask_reader:
+                        del replace_mask_reader
                     if original_reader:
                         del original_reader
                     inpainted_reader, splatted_reader, original_reader = (
@@ -1925,6 +2062,10 @@ class MergingGUI(ThemedTk):
                         self.cleanup_queue.put(
                             (splatted_file_path, settings["mask_folder"])
                         )
+                        if replace_mask_path and os.path.exists(replace_mask_path):
+                            self.cleanup_queue.put(
+                                (replace_mask_path, os.path.dirname(replace_mask_path))
+                            )
                         if original_video_path_to_move:
                             self.cleanup_queue.put(
                                 (
@@ -1955,9 +2096,11 @@ class MergingGUI(ThemedTk):
                 # --- FIX: Ensure readers are closed on exception before the finally block ---
                 if splatted_reader:
                     del splatted_reader
+                if replace_mask_reader:
+                    del replace_mask_reader
                 if original_reader:
                     del original_reader
-                inpainted_reader, splatted_reader, original_reader = None, None, None
+                inpainted_reader, splatted_reader, replace_mask_reader, original_reader = None, None, None, None
                 # --- END FIX ---
                 logger.error(f"Failed to process {base_name}: {e}", exc_info=True)
                 self.after(
@@ -1977,6 +2120,8 @@ class MergingGUI(ThemedTk):
                     del inpainted_reader
                 if splatted_reader:
                     del splatted_reader
+                if replace_mask_reader:
+                    del replace_mask_reader
                 if original_reader:
                     del original_reader
                 # --- END: CHUNK-BASED PROCESSING ---
@@ -2002,7 +2147,7 @@ class MergingGUI(ThemedTk):
         folders_to_check = {
             "Inpainted": self.inpainted_folder_var.get(),
             "Original": self.original_folder_var.get(),
-            "Mask": self.mask_folder_var.get(),
+            "Splat": self.mask_folder_var.get(),
         }
 
         restored_count = 0
@@ -2128,6 +2273,7 @@ class MergingGUI(ThemedTk):
                 "inpainted": inpainted_path,
                 "splatted": None,
                 "original": None,
+                "replace_mask": None,
                 "is_sbs_input": is_sbs_input,
                 "is_quad_input": False,
                 "sidecar": clip_sidecar_data,  # Store sidecar data for borders
@@ -2140,6 +2286,7 @@ class MergingGUI(ThemedTk):
                 )
                 source_dict["splatted"] = splatted_path
                 source_dict["is_quad_input"] = True  # Set flag for quad-splatted input
+                source_dict["replace_mask"] = self._find_replace_mask_for_splatted(splatted_path, self.replace_mask_folder_var.get())
                 # 'original' remains None, which is the necessary structural fix for the crash
             elif splatted2_matches:
                 splatted_path = splatted2_matches[0]
@@ -2147,6 +2294,7 @@ class MergingGUI(ThemedTk):
                     f"  - Found dual-splatted match: {os.path.basename(splatted_path)}"
                 )
                 source_dict["splatted"] = splatted_path
+                source_dict["replace_mask"] = self._find_replace_mask_for_splatted(splatted_path, self.replace_mask_folder_var.get())
                 original_path = self._find_video_by_core_name(
                     self.original_folder_var.get(), core_name
                 )
@@ -2248,10 +2396,19 @@ class MergingGUI(ThemedTk):
                 preview_options.append("Depth Map")
             self.previewer.set_preview_source_options(preview_options)
 
-            # Convert mask to grayscale
-            mask_frame_np = mask_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            mask_gray_np = np.mean(mask_frame_np, axis=2)
-            mask = torch.from_numpy(mask_gray_np).float().unsqueeze(0).unsqueeze(0)
+            # Convert mask to grayscale (optionally using an external replace-mask video)
+            replace_mask_tensor = source_frames.get("replace_mask")
+            if params.get("use_replace_mask", False) and replace_mask_tensor is not None:
+                rm_np = replace_mask_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                rm_gray = np.mean(rm_np[..., :3], axis=2) if rm_np.ndim == 3 else rm_np
+                # Normalize if needed (VideoPreviewer typically provides 0..1 floats)
+                if rm_gray.max() > 1.5:
+                    rm_gray = rm_gray / 255.0
+                mask = torch.from_numpy(rm_gray).float().unsqueeze(0).unsqueeze(0)
+            else:
+                mask_frame_np = mask_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                mask_gray_np = np.mean(mask_frame_np, axis=2)
+                mask = torch.from_numpy(mask_gray_np).float().unsqueeze(0).unsqueeze(0)
 
             # 3. Process the frames
             # Define the processing device based on the 'use_gpu' parameter
