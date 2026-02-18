@@ -110,8 +110,8 @@ REPLACE_MASK_ENABLED = True          # export replace-mask (edge→hole-run)
 REPLACE_MASK_SCALE = 1.0
 REPLACE_MASK_MIN_PX = 1
 REPLACE_MASK_MAX_PX = 32
-REPLACE_MASK_GAP_TOL = 2            # tolerate small non-hole gaps ("ondulations") inside the hole run
-REPLACE_MASK_DRAW_EDGE = True
+REPLACE_MASK_GAP_TOL = 0            # not needed anymore
+REPLACE_MASK_DRAW_EDGE = True       # must be True (removes ondulations)
 
 
 def _parse_args():
