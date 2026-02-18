@@ -92,9 +92,9 @@ GUI_VERSION = "26-01-23.0"
 # Staircase smoothing (post-warp) defaults (used by GUI + processing)
 # ----------------------------------------------------------------------
 SPLAT_STAIR_SMOOTH_ENABLED = False
-SPLAT_BLUR_KERNEL = 5               # selectable: 3/5/7/9 (box blur)
-SPLAT_STAIR_EDGE_X_OFFSET = 1       # +1 shifts mask 1px to the right (inside), -1 left
-SPLAT_STAIR_STRIP_PX = 7            # width (px) to the LEFT of the warped edge
+SPLAT_BLUR_KERNEL = 3               # selectable: 3/5/7/9 (box blur)
+SPLAT_STAIR_EDGE_X_OFFSET = 2       # +1 shifts mask 1px to the right (inside), -1 left
+SPLAT_STAIR_STRIP_PX = 3            # width (px) to the LEFT of the warped edge
 SPLAT_STAIR_STRENGTH = 1.0          # 0..1
 
 SPLAT_STAIR_DEBUG_MASK = False      # show green overlay of selected pixels
@@ -112,7 +112,7 @@ SPLAT_STAIR_FORCE_OUTPUT = "off"
 SPLAT_STAIR_BLUR_PASSES = 0
 
 # ----------------------------------------------------------------------
-# Replace mask (batch export only for now)
+# Replace mask
 # Produces a binary, pixel-perfect mask (white=replace, black=keep) aligned to right view.
 # ----------------------------------------------------------------------
 REPLACE_MASK_ENABLED = True         # set True to export replace mask video in batch mode
@@ -121,7 +121,7 @@ MASK_OUTPUT = "./work/mask/"               # empty => same folder as main output
 REPLACE_MASK_SCALE = 1.0            # scales REPLACE_MASK_MAX_PX (effective_max = max_px*scale)
 REPLACE_MASK_MIN_PX = 1             # require at least this many HOLE pixels to the RIGHT of edge; if shorter => draw nothing
 REPLACE_MASK_MAX_PX = 32            # max expansion to the right (pixels), before scaling
-REPLACE_MASK_GAP_TOL = 2            # treat small "ondulations" (gaps) <= this as HOLE during run
+REPLACE_MASK_GAP_TOL = 0            # treat small "ondulations" (gaps) <= this as HOLE during run
 REPLACE_MASK_CODEC = "ffv1"         # lossless binary mask (MKV, gray)
 REPLACE_MASK_DRAW_EDGE = True     # include the edge pixel itself when run>=MIN_PX
 
@@ -9433,60 +9433,52 @@ def build_replace_mask_edge_hole_run(
     draw_edge: bool = True,
 ) -> torch.Tensor:
     '''
-    Build a binary replace mask:
-    - Find right-edge silhouette (negative disparity gradient, NMS -> ~1px)
-    - Seed only where pixel to the RIGHT is HOLE
-    - Grow to the RIGHT while underlying pixels are HOLE (with small gap tolerance)
-    - If run shorter than min_px: output nothing
+    Build a binary replace mask from HOLE runs (output-space occlusion mask), row-by-row.
 
-    disp_out_winner: [T,1,H,W] disparity in pixel units (output winner disparity)
+    Goal: start *exactly* at the first HOLE pixel of each HOLE run (per scanline),
+    then expand to the RIGHT inside the HOLE region, up to max_px*scale.
+
+    Notes:
+    - `gap_tol` performs a 1D closing along X on the hole mask to treat small ondulations as HOLE.
+    - `min_px` requires a run to have at least that many consecutive HOLE pixels starting at the first HOLE.
+    - `draw_edge` (if True) also includes the solid pixel immediately to the LEFT of the first HOLE
+      (i.e. the boundary pixel), but only when it is not HOLE.
+    - `grad_thr_px` is kept for API compatibility but is not used in this "hole-first" mode.
+      (You can re-enable edge-based seeding later if you want stricter selection.)
+
+    disp_out_winner: [T,1,H,W] disparity in pixel units (unused here)
     hole_mask:       [T,1,H,W] bool (True = HOLE)
     returns:         [T,1,H,W] bool (True = replace)
     '''
     assert disp_out_winner.dim() == 4 and hole_mask.dim() == 4
-    T, _, H, W = disp_out_winner.shape
+    T, _, H, W = hole_mask.shape
 
     # Treat small gaps (ondulations) as hole for run continuation.
     hole_s = _close1d_x_bool(hole_mask.bool(), int(gap_tol))
 
-    # Disparity gradient along X
-    grad = disp_out_winner[..., :, 1:] - disp_out_winner[..., :, :-1]  # [T,1,H,W-1]
+    # First HOLE pixel of each HOLE run (per row): hole & ~hole(x-1)
+    hole_prev = _shift_right_bool(hole_s, 1)
+    hole_start = hole_s & (~hole_prev)  # [T,1,H,W] bool
 
-    # For "right edges" use negative gradients with sufficient magnitude.
-    gmag = (-grad).clamp(min=0.0)  # magnitude of negative gradients
+    # Seeds start INSIDE the HOLE (exact first HOLE pixel).
+    seeds = hole_start
 
-    # Pad back to W
-    gpad = disp_out_winner.new_zeros((T, 1, H, W))
-    gpad[..., :, :-1] = gmag
-
-    # NMS along X: keep only local maxima of gpad (1px thin)
-    gL = disp_out_winner.new_zeros((T, 1, H, W))
-    gR = disp_out_winner.new_zeros((T, 1, H, W))
-    gL[..., :, 1:] = gpad[..., :, :-1]
-    gR[..., :, :-1] = gpad[..., :, 1:]
-    nms = (gpad >= gL) & (gpad >= gR)
-
-    edge = (gpad > float(grad_thr_px)) & nms  # [T,1,H,W] bool
-
-    # Seed only where immediate right pixel is hole (avoid edges with no hole adjacency)
-    hole_right = _shift_left_bool(hole_s, 1)  # at x => hole at x+1
-    seeds = edge & hole_right
-
-    # Effective max expansion
+    # Effective max expansion to the right.
     eff_max = int(max(0, round(int(max_px) * float(scale))))
     eff_max = max(0, min(eff_max, W))  # clamp
 
-    # Gate seeds by min_px (run must reach >= min_px)
+    # Gate by min_px: run must reach >= min_px consecutive HOLE pixels starting at seeds.
     min_px_i = max(0, int(min_px))
-    if min_px_i > 0 and eff_max > 0:
-        test = seeds
-        for _ in range(min(min_px_i, eff_max)):
-            test = _shift_right_bool(test, 1) & hole_s
-        seeds_ok = _shift_left_bool(test, min(min_px_i, eff_max))
-    else:
+    if min_px_i <= 1 or eff_max <= 0:
         seeds_ok = seeds
+    else:
+        steps = min(min_px_i - 1, eff_max)  # how many shifts we can test
+        test = seeds
+        for _ in range(steps):
+            test = _shift_right_bool(test, 1) & hole_s
+        seeds_ok = _shift_left_bool(test, steps)
 
-    # Build replace mask only for accepted seeds
+    # Build replace mask by expanding to the right while inside HOLE.
     active = seeds_ok
     replace = seeds_ok.clone()
 
@@ -9494,13 +9486,12 @@ def build_replace_mask_edge_hole_run(
         active = _shift_right_bool(active, 1) & hole_s
         replace |= active
 
-    # If requested, exclude the edge pixel itself (keep only the HOLE-side run).
-    if not draw_edge:
-        replace &= ~seeds_ok
+    # Optionally include the boundary pixel immediately to the LEFT of the HOLE start.
+    if draw_edge:
+        boundary = _shift_left_bool(seeds_ok, 1) & (~hole_s)
+        replace |= boundary
 
     return replace
-
-
 def compute_global_depth_stats(
     depth_map_reader: VideoReader, total_frames: int, chunk_size: int = 100
 ) -> Tuple[float, float]:
