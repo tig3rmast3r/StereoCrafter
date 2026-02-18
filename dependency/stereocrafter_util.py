@@ -1188,13 +1188,13 @@ def encode_frames_to_mp4(
     # --- Determine Output Codec, Bit-Depth, and Quality ---
     output_codec = "libx264"  # Default to H.264 CPU encoder
     output_pix_fmt = "yuv420p"  # Default to 8-bit
-    default_cpu_crf = "23"  # Default CRF for H.264 (lower is better quality)
+    default_cpu_crf = "1"  # Default CRF for H.264 (lower is better quality)
     output_profile = "main"
     x265_params = []  # For specific x265 parameters
 
     nvenc_preset = "medium"  # Default NVENC preset (e.g., fast, medium, slow, quality)
     default_nvenc_cq = (
-        "23"  # Constant Quality value for NVENC (lower is better quality)
+        "1"  # Constant Quality value for NVENC (lower is better quality)
     )
 
     # NEW: Apply user-specified CRF if provided
@@ -1238,7 +1238,7 @@ def encode_frames_to_mp4(
         output_pix_fmt = "yuv420p10le"
         if user_output_crf is None:
             default_cpu_crf = (
-                "28"  # For CPU x265 (HDR often needs higher CRF to look "good")
+                "1"  # For CPU x265 (HDR often needs higher CRF to look "good")
             )
         output_profile = "main10"
         if video_stream_info.get("mastering_display_metadata"):
@@ -1259,7 +1259,7 @@ def encode_frames_to_mp4(
             logger.debug("    (Using hevc_nvenc for hardware acceleration)")
         output_pix_fmt = "yuv420p10le"
         if user_output_crf is None:
-            default_cpu_crf = "24"  # For CPU x265 (SDR 10-bit)
+            default_cpu_crf = "1"  # For CPU x265 (SDR 10-bit)
         output_profile = "main10"
     else:  # Default to H.264 8-bit, or if no info
         logger.debug(
@@ -1271,7 +1271,7 @@ def encode_frames_to_mp4(
             logger.debug("    (Using h264_nvenc for hardware acceleration)")
         output_pix_fmt = "yuv420p"
         if user_output_crf is None:
-            default_cpu_crf = "18"  # For CPU x264 (SDR 8-bit, higher quality)
+            default_cpu_crf = "1"  # For CPU x264 (SDR 8-bit, higher quality)
         output_profile = "main"
 
     logger.debug(f"default_cpu_crf = {default_cpu_crf}")
@@ -1803,11 +1803,11 @@ def start_ffmpeg_pipe_process(
     # --- Determine Output Codec, Bit-Depth, and Quality ---
     output_codec = "libx264"
     output_pix_fmt = "yuv420p"
-    default_cpu_crf = "23"
+    default_cpu_crf = "1"
     output_profile = "main"
     x265_params = []
     nvenc_preset = "medium"
-    default_nvenc_cq = "23"
+    default_nvenc_cq = "1"
 
     if user_output_crf is not None and user_output_crf >= 0:
         logger.debug(f"Using user-specified output CRF/CQ: {user_output_crf}")
@@ -1845,7 +1845,7 @@ def start_ffmpeg_pipe_process(
             output_codec = "hevc_nvenc"
         output_pix_fmt = "yuv420p10le"
         if user_output_crf is None:
-            default_cpu_crf = "28"
+            default_cpu_crf = "1"
         output_profile = "main10"
         if video_stream_info.get("mastering_display_metadata"):
             x265_params.append(
@@ -1861,7 +1861,7 @@ def start_ffmpeg_pipe_process(
             output_codec = "hevc_nvenc"
         output_pix_fmt = "yuv420p10le"
         if user_output_crf is None:
-            default_cpu_crf = "24"
+            default_cpu_crf = "1"
         output_profile = "main10"
     else:
         output_codec = "libx264"
@@ -1869,7 +1869,7 @@ def start_ffmpeg_pipe_process(
             output_codec = "h264_nvenc"
         output_pix_fmt = "yuv420p"
         if user_output_crf is None:
-            default_cpu_crf = "18"
+            default_cpu_crf = "1"
         output_profile = "main"
 
     ffmpeg_cmd.extend(["-c:v", output_codec])
