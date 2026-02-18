@@ -113,7 +113,7 @@ process_one() {
       continue
     fi
 
-    # Upscale (silenzioso: log su file)
+    # Upscale
     set +e
     "$REALESRGAN_BIN" -i "$TMP/in" -o "$TMP/out" -n "$MODEL" -s "$SCALE" -t "$TILE" >"$log_esr" 2>&1
     rc=$?
@@ -127,7 +127,7 @@ process_one() {
       continue
     fi
 
-    # Normalizza output in sequenza %08d.png
+    # Normalize
     i=1
     while IFS= read -r -d '' f; do
       printf -v n "%08d" "$i"
