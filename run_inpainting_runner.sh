@@ -31,13 +31,15 @@ MASK_DILATE_KERNEL_SIZE=5
 MASK_BLUR_KERNEL_SIZE=10
 
 ENABLE_POST_INPAINTING_BLEND=0        # 1 to enable
-DISABLE_COLOR_TRANSFER=0              # 1 to disable
+DISABLE_COLOR_TRANSFER=1              # 1 to disable
 
 SKIP_EXISTING=1
 MOVE_FAILED=1
 MOVE_FINISHED=0
 FAILED_SUBDIR="failed"
 FINISHED_SUBDIR="finished"
+
+DISABLE_DYNAMIC_CHUNK=1
 
 DEBUG=0
 
@@ -82,14 +84,13 @@ if [[ "$SKIP_EXISTING" == "1" ]]; then CMD+=(--skip_existing); fi
 if [[ "$MOVE_FAILED" == "1" ]]; then CMD+=(--move_failed); fi
 if [[ "$MOVE_FINISHED" == "1" ]]; then CMD+=(--move_finished); fi
 if [[ "$DEBUG" == "1" ]]; then CMD+=(--debug); fi
+if [[ "$DISABLE_DYNAMIC_CHUNK" == "1" ]]; then CMD+=(--no_dynamic_chunk); fi
 
 echo "[CMD] ${CMD[*]}"
 
-# Optional stability knobs
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-
-# Retry on common crash codes (132=illegal instruction, 139=segfault)
-MAX_RETRIES=3
+# Retry on ANY non-zero exit (ignore specific crash codes).
+# Set MAX_RETRIES=0 for infinite restarts.
+MAX_RETRIES=0
 attempt=1
 while true; do
   set +e
@@ -101,15 +102,13 @@ while true; do
     exit 0
   fi
 
-  if [[ $rc -eq 132 || $rc -eq 139 ]]; then
-    if [[ $attempt -lt $MAX_RETRIES ]]; then
-      echo "[WARN] runner crashed with rc=$rc (attempt $attempt/$MAX_RETRIES). Retrying..."
-      attempt=$((attempt+1))
-      sleep 2
-      continue
-    fi
+  echo "[WARN] runner exited with rc=$rc (attempt $attempt). Restarting..."
+
+  if [[ $MAX_RETRIES -ne 0 && $attempt -ge $MAX_RETRIES ]]; then
+    echo "[ERR] reached MAX_RETRIES=$MAX_RETRIES, giving up (last rc=$rc)"
+    exit $rc
   fi
 
-  echo "[ERR] runner exited with rc=$rc"
-  exit $rc
+  attempt=$((attempt+1))
+  sleep 2
 done

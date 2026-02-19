@@ -15,16 +15,24 @@ import argparse
 import csv
 import threading
 import gc
+import subprocess
+import json
+import math
 
 import torch
+
+try:
+    import cv2  # type: ignore
+except Exception:
+    cv2 = None
 
 # The GUI module contains the full inpainting implementation we want to reuse.
 # Importing it is fine headless; we just must not create a real Tk window.
 
 import inpainting_gui as igs
 
-
-
+RESTART_EVERY = 15           # or from env/arg
+PLANNED_RESTART_CODE = 99
 class _Var:
     """Tiny stand-in for tkinter's StringVar/BooleanVar/IntVar."""
 
@@ -113,6 +121,90 @@ def _safe_release_cuda():
     gc.collect()
 
 
+def _run_cmd(cmd):
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+
+
+def _ffprobe_nb_frames(path: str) -> int:
+    """
+    Return an accurate decoded frame count for the first video stream.
+    This is used to detect truncated outputs (files that look valid but are incomplete).
+    """
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-count_frames",
+        "-show_entries", "stream=nb_read_frames",
+        "-of", "default=nw=1:nk=1",
+        path,
+    ]
+    rc, out, err = _run_cmd(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffprobe failed rc={rc}: {err}")
+    try:
+        return int(out.splitlines()[0].strip())
+    except Exception as e:
+        raise RuntimeError(f"ffprobe returned invalid nb_read_frames: {out!r}") from e
+
+
+def _cleanup_outputs(out_path: str) -> None:
+    if not out_path:
+        return
+    for p in (out_path, out_path + ".tmp", out_path + ".part", out_path + ".temp"):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+
+
+def _resume_state_path(output_dir: str) -> str:
+    return os.path.join(output_dir, ".resume_state.json")
+
+
+def _load_resume_state(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_resume_state(path: str, data: dict):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _clear_resume_state(path: str):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+def _is_output_complete(input_path: str, output_path: str, process_length: int, tol_frames: int = 1) -> bool:
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        return False
+    try:
+        in_frames = _ffprobe_nb_frames(input_path)
+        out_frames = _ffprobe_nb_frames(output_path)
+        expected = in_frames
+        if process_length is not None:
+            try:
+                pl = int(process_length)
+            except Exception:
+                pl = -1
+            if pl and pl > 0:
+                expected = min(in_frames, pl)
+        return out_frames >= max(0, expected - int(tol_frames))
+    except Exception:
+        return False
+
+
 def _move_to_subfolder(path: str, subfolder_name: str) -> str:
     folder = os.path.join(os.path.dirname(path), subfolder_name)
     os.makedirs(folder, exist_ok=True)
@@ -149,6 +241,67 @@ def _load_sharpness_csv(csv_path: str):
     except Exception:
         return {}
 
+def _load_chunk_csv(csv_path: str):
+    """Return mapping {basename -> frames_chunk}. If csv missing or column missing, returns empty dict.
+
+    Looks for any of these columns (first found wins per row):
+      - frames_chunk
+      - frame_chunk
+      - chunk
+      - chunk_size
+    """
+    if not csv_path:
+        return {}
+    try:
+        if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+            return {}
+        out = {}
+        with open(csv_path, "r", newline="") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                name = (row.get("file") or "").strip()
+                if not name:
+                    continue
+                # try multiple possible column names
+                val = None
+                for key in ("frames_chunk", "frame_chunk", "chunk", "chunk_size"):
+                    s = (row.get(key) or "").strip()
+                    if s != "":
+                        val = s
+                        break
+                if val is None:
+                    continue
+                try:
+                    c = int(float(val))
+                except Exception:
+                    continue
+                if c > 0:
+                    out[name] = c
+        return out
+    except Exception:
+        return {}
+
+
+def _get_video_wh(path: str):
+    """Fast width/height probe using OpenCV. Returns (w,h) or (None,None)."""
+    try:
+        if cv2 is None:
+            return (None, None)
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            return (None, None)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        cap.release()
+        if w > 0 and h > 0:
+            return (w, h)
+        return (None, None)
+    except Exception:
+        return (None, None)
+
+DEFAULT_CHUNK_K = 3840 * 832 * 16  # reference: 1920x832 -> 16 frames_chunk
+
+
 def _steps_from_sharpness(val: float) -> int:
     """
     Rule:
@@ -173,6 +326,8 @@ def _steps_from_sharpness(val: float) -> int:
 
 def run_batch(args):
     os.makedirs(args.output_dir, exist_ok=True)
+
+    processed_this_run = 0
 
     runner = HeadlessInpainting(
         output_folder=args.output_dir,
@@ -207,9 +362,23 @@ def run_batch(args):
         print("[ERR] no input videos found")
         return 2
 
+    resume_path = _resume_state_path(args.output_dir)
+    resume = _load_resume_state(resume_path)
+    fast_resume_start = None
+    if resume and resume.get("mode") == "planned_restart":
+        last_ok_idx = resume.get("last_ok_idx")
+        if isinstance(last_ok_idx, int) and 0 <= last_ok_idx < len(videos):
+            fast_resume_start = max(0, last_ok_idx - 1)
+            print(f"[RESUME] Fast resume enabled. Rechecking index {fast_resume_start + 1} then continuing.")
+        else:
+            _clear_resume_state(resume_path)
+    elif resume:
+        _clear_resume_state(resume_path)
+
+
     stop_event = threading.Event()
 
-        # Optional: load sharpness.csv once (mapping basename -> sharpness_raw).
+    # Optional: load sharpness.csv once (mapping basename -> sharpness_raw).
     sharpness_map = {}
     sharp_csv = ""
     if not args.no_sharpness_csv:
@@ -224,12 +393,24 @@ def run_batch(args):
         sharp_csv = os.path.join(os.path.abspath(sharp_base), "sharpness.csv")
         sharpness_map = _load_sharpness_csv(sharp_csv)
         print(f"[INFO] sharpness.csv: {sharp_csv} (rows={len(sharpness_map)})")
+        chunk_map = _load_chunk_csv(sharp_csv)
+        if chunk_map:
+            print(f"[INFO] per-file frames_chunk overrides: {len(chunk_map)}")
+        else:
+            print("[INFO] no per-file frames_chunk overrides found in sharpness.csv")
     else:
         print(f"[INFO] sharpness.csv disabled; using fixed steps={args.fixed_steps}")
+        chunk_map = {}
 
     for idx, video_path in enumerate(videos, 1):
+        i = idx - 1
+        if fast_resume_start is not None and i < fast_resume_start:
+            continue
         base = os.path.basename(video_path)
         print(f"\n[{idx}/{len(videos)}] {base}")
+
+        out_path = ""
+        hi_res_input_path = None
 
         try:
             # Ensure GUI vars are consistent for hi-res matching safety checks
@@ -249,8 +430,18 @@ def run_batch(args):
             out_path, _hires = runner._setup_video_info_and_hires(video_path, args.output_dir, is_dual_input)
 
             if args.skip_existing and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                print(f"[SKIP] exists: {out_path}")
-                continue
+                # Fast skip (legacy behavior). Only the resume-boundary file is strictly validated.
+                if fast_resume_start is not None and i == fast_resume_start:
+                    if _is_output_complete(video_path, out_path, args.process_length):
+                        print(f"[SKIP] exists: {out_path}")
+                        fast_resume_start = None
+                        _clear_resume_state(resume_path)
+                        continue
+                    print(f"[WARN] existing output looks incomplete, deleting: {out_path}")
+                    _cleanup_outputs(out_path)
+                else:
+                    print(f"[SKIP] exists: {out_path}")
+                    continue
 
                         # Determine inference steps:
             # - If sharpness.csv is enabled and has a row for this basename, derive steps from it.
@@ -263,12 +454,50 @@ def run_batch(args):
                 num_steps = _steps_from_sharpness(sharp_val)
                 print(f"[INFO] steps={num_steps} (sharp_raw={sharp_val:.2f})")
 
+            # frames_chunk selection:
+            # - If --no_dynamic_chunk is NOT set, compute frames_chunk from frame area using chunk_k:
+            #     frames_chunk ~= chunk_k / (W*H)
+            #   Reference default: 1920x832 -> 24 frames_chunk  (chunk_k = 1920*832*24)
+            # - If sharpness.csv provides a per-file override column, it wins.
+            frames_chunk = int(args.frames_chunk)
+
+            if not args.no_dynamic_chunk:
+                vw, vh = _get_video_wh(video_path)
+                if vw and vh:
+                    dyn = int(round(float(args.chunk_k) / float(vw * vh)))
+                    if dyn < 1:
+                        dyn = 1
+                    # clamp
+                    dyn = max(int(args.chunk_min), min(int(args.chunk_max), dyn))
+                    frames_chunk = dyn
+                    print(f"[INFO] frames_chunk={frames_chunk} (dynamic from {vw}x{vh}, chunk_k={int(args.chunk_k)})")
+                else:
+                    print("[WARN] dynamic frames_chunk enabled but failed to probe video size; using fixed frames_chunk")
+
+            # Per-file override (from sharpness.csv columns, if present).
+            if chunk_map and base in chunk_map:
+                frames_chunk = int(chunk_map[base])
+                # clamp even on override
+                frames_chunk = max(int(args.chunk_min), min(int(args.chunk_max), frames_chunk))
+                print(f"[INFO] frames_chunk={frames_chunk} (per-file override)")
+
+            # Keep overlap valid: must be < frames_chunk (otherwise chunking can't progress).
+            overlap = int(args.overlap)
+            if frames_chunk <= 0:
+                frames_chunk = int(args.frames_chunk)
+            if overlap < 0:
+                overlap = 0
+            if overlap >= frames_chunk:
+                new_overlap = max(0, frames_chunk - 1)
+                print(f"[WARN] overlap={overlap} >= frames_chunk={frames_chunk}; clamping overlap -> {new_overlap}")
+                overlap = new_overlap
+
             completed, hi_res_input_path = runner.process_single_video(
                 pipeline=pipeline,
                 input_video_path=video_path,
                 save_dir=args.output_dir,
-                frames_chunk=args.frames_chunk,
-                overlap=args.overlap,
+                frames_chunk=frames_chunk,
+                overlap=overlap,
                 tile_num=args.tile_num,
                 vf=None,
                 num_inference_steps=num_steps,
@@ -279,25 +508,45 @@ def run_batch(args):
                 process_length=args.process_length,
             )
 
-            if completed:
+
+            if completed and _is_output_complete(video_path, out_path, args.process_length):
                 print(f"[OK] wrote: {out_path}")
+                processed_this_run += 1
+                if fast_resume_start is not None and i >= fast_resume_start:
+                    fast_resume_start = None
+                    _clear_resume_state(resume_path)
+                if RESTART_EVERY > 0 and processed_this_run >= RESTART_EVERY:
+                    print(f"[PLANNED RESTART] processed_this_run={processed_this_run}, exiting {PLANNED_RESTART_CODE}")
+                    _save_resume_state(resume_path, {
+                        "mode": "planned_restart",
+                        "last_ok_idx": i,
+                        "last_ok_input": video_path,
+                        "last_ok_output": out_path,
+                    })
+                    sys.exit(PLANNED_RESTART_CODE)
                 if args.move_finished:
                     _move_to_subfolder(video_path, args.finished_subdir)
                     if hi_res_input_path and os.path.exists(hi_res_input_path):
                         _move_to_subfolder(hi_res_input_path, args.finished_subdir)
             else:
-                print("[FAIL] processing returned incomplete")
+                if completed:
+                    print(f"[FAIL] output incomplete, deleting: {out_path}")
+                else:
+                    print("[FAIL] processing returned incomplete")
+                _cleanup_outputs(out_path)
                 if args.move_failed:
                     _move_to_subfolder(video_path, args.failed_subdir)
 
         except torch.OutOfMemoryError as e:
             print(f"[OOM] {e}")
+            _cleanup_outputs(out_path)
             if args.move_failed:
                 _move_to_subfolder(video_path, args.failed_subdir)
             _safe_release_cuda()
             continue
         except Exception as e:
             print(f"[ERR] {type(e).__name__}: {e}")
+            _cleanup_outputs(out_path)
             if args.move_failed:
                 _move_to_subfolder(video_path, args.failed_subdir)
             _safe_release_cuda()
@@ -325,6 +574,12 @@ def main():
                    help="Fallback steps when sharpness.csv is missing or ignored")
     p.add_argument("--tile_num", type=int, default=2)
     p.add_argument("--frames_chunk", type=int, default=50)
+    p.add_argument("--no_dynamic_chunk", action="store_true",
+                   help="Disable dynamic frames_chunk computation; always use --frames_chunk (unless CSV override exists)")
+    p.add_argument("--chunk_k", type=float, default=float(DEFAULT_CHUNK_K),
+                   help="Constant for dynamic frames_chunk: frames_chunk ~= chunk_k/(W*H). Default based on 1920x832->24.")
+    p.add_argument("--chunk_min", type=int, default=20, help="Minimum frames_chunk when dynamic/override is used")
+    p.add_argument("--chunk_max", type=int, default=500, help="Maximum frames_chunk when dynamic/override is used")
     p.add_argument("--overlap", type=int, default=4)
     p.add_argument("--original_input_blend_strength", type=float, default=0.0)
     p.add_argument("--output_crf", type=int, default=1)
