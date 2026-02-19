@@ -83,12 +83,18 @@ cython_debug/
 outputs/
 weights/
 old/
+segmenting_WIP/
 temp/
 work/
 logs/
 run_inpainting_runner_temp.sh
 run_merging_runner_temp.sh
 run_splatting_bm_runner_temp.sh
+run_merging_nogui_batch_parallel_temp.sh
+run_merging_nogui_batch_temp.sh
+merge_worker_0.log
+merge_worker_1.log
+merge_worker_2.log
 
 
 config.json
