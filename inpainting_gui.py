@@ -868,6 +868,201 @@ class InpaintingGUI(ThemedTk):
             "enable_color_transfer": self.enable_color_transfer.get(),
         }
         return config
+
+    def _process_mask_pipeline_direct(self, current_processed_mask: torch.Tensor, base_video_name: str) -> torch.Tensor:
+        """Apply the same mask binarization/morph/dilate/blur pipeline used in _prepare_video_inputs()."""
+        # 1) Binarization (Direct Thresholding)
+        try:
+            binarize_threshold = float(self.mask_initial_threshold_var.get())
+            if binarize_threshold != 0.0:
+                if not (0.0 <= binarize_threshold <= 1.0):
+                    logger.warning(f"Invalid binarize threshold ({binarize_threshold}). Using default 0.1.")
+                    binarize_threshold = 0.1
+                current_processed_mask = (current_processed_mask > binarize_threshold).float()
+                self._save_debug_image(current_processed_mask, "03_mask_binarized", base_video_name, 0)
+            else:
+                logger.debug("Mask: Binarization step skipped (threshold is 0).")
+        except ValueError:
+            logger.error(f"Invalid value for binarize threshold: {self.mask_initial_threshold_var.get()}. Falling back to 0.1.", exc_info=True)
+            current_processed_mask = (current_processed_mask > 0.1).float()
+
+        # 2) Morphological Closing
+        try:
+            morph_kernel_size = int(float(self.mask_morph_kernel_size_var.get()))
+            if morph_kernel_size != 0:
+                current_processed_mask = self._apply_morphological_closing(current_processed_mask, morph_kernel_size)
+                self._save_debug_image(current_processed_mask, "04_mask_morph_closed", base_video_name, 0)
+            else:
+                logger.debug("Mask: Morphological closing step skipped (kernel size is 0).")
+        except ValueError:
+            logger.error(f"Invalid value for mask_morph_kernel_size: {self.mask_morph_kernel_size_var.get()}. Skipping morphological closing.", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error during morphological closing step: {e}. Skipping.", exc_info=True)
+
+        # 3) Mask Dilation
+        try:
+            dilate_kernel_size = int(self.mask_dilate_kernel_size_var.get())
+            if dilate_kernel_size != 0:
+                current_processed_mask = self._apply_mask_dilation(current_processed_mask, dilate_kernel_size)
+                self._save_debug_image(current_processed_mask, "05_mask_dilated", base_video_name, 0)
+            else:
+                logger.debug("Mask: Dilation step skipped (kernel size is 0).")
+        except ValueError:
+            logger.error(f"Invalid value for mask_dilate_kernel_size: {self.mask_dilate_kernel_size_var.get()}. Skipping dilation.", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error during mask dilation step: {e}. Skipping.", exc_info=True)
+
+        # 4) Mask Gaussian Blur
+        try:
+            blur_kernel_size = int(self.mask_blur_kernel_size_var.get())
+            if blur_kernel_size != 0:
+                current_processed_mask = self._apply_gaussian_blur(current_processed_mask, blur_kernel_size)
+                self._save_debug_image(current_processed_mask, "06_mask_final_blurred", base_video_name, 0)
+            else:
+                logger.debug("Mask: Gaussian blur step skipped (kernel size is 0).")
+        except ValueError:
+            logger.error(f"Invalid value for mask_blur_kernel_size: {self.mask_blur_kernel_size_var.get()}. Skipping blur.", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error during mask blur step: {e}. Skipping.", exc_info=True)
+
+        return current_processed_mask
+
+    def _prepare_video_stream_reader(
+        self,
+        input_video_path: str,
+        base_video_name: str,
+        is_dual_input: bool,
+        tile_num: int,
+        update_info_callback=None,
+        overlap: int = 0,
+        original_input_blend_strength: float = 0.0,
+        process_length: int = -1,
+    ):
+        """Open a decord VideoReader and compute stream meta WITHOUT loading all frames into RAM."""
+        try:
+            vr = VideoReader(input_video_path, ctx=cpu(0))
+        except Exception as e:
+            logger.error(f"Failed to open video with decord: {e}", exc_info=True)
+            if update_info_callback:
+                self.after(0, lambda: update_info_callback(base_video_name, "Open failed", "Skipped", "N/A", "N/A"))
+            return None
+
+        total_frames_in_video = len(vr)
+        actual_frames_to_process_count = total_frames_in_video
+        if process_length != -1 and process_length > 0:
+            actual_frames_to_process_count = min(total_frames_in_video, process_length)
+            logger.info(f"Limiting processing to first {actual_frames_to_process_count} frames (out of {total_frames_in_video}).")
+
+        if actual_frames_to_process_count <= 0:
+            logger.warning(f"No frames to process for {input_video_path}.")
+            if update_info_callback:
+                self.after(0, lambda: update_info_callback(base_video_name, "N/A", "0 frames", overlap, original_input_blend_strength))
+            return None
+
+        # FPS
+        try:
+            fps = float(vr.get_avg_fps())
+        except Exception:
+            fps = 30.0
+            logger.warning(f"Could not read FPS from decord for {base_video_name}; defaulting to {fps}.")
+
+        # Stream info (optional / used in sidecars)
+        try:
+            video_stream_info = get_video_stream_info(input_video_path)
+        except Exception:
+            video_stream_info = None
+
+        # Probe first frame for dimensions
+        first = vr.get_batch([0]).asnumpy()[0]  # HxWx3 uint8
+        total_h_current, total_w_current = int(first.shape[0]), int(first.shape[1])
+
+        frames_left_original_cropped = None  # not returned here; chunk-wise later
+
+        if is_dual_input:
+            half_w = total_w_current // 2
+            output_display_h = total_h_current
+            output_display_w = half_w
+        else:
+            half_h = total_h_current // 2
+            half_w = total_w_current // 2
+            output_display_h = half_h
+            output_display_w = half_w
+
+        required_divisor = 8
+        if output_display_h % required_divisor != 0 or output_display_w % required_divisor != 0:
+            error_msg = (
+                f"Video '{base_video_name}' has an invalid resolution for inpainting.\n\n"
+                f"The target inpainting area has dimensions {output_display_w}x{output_display_h}, "
+                f"but both width and height must be divisible by {required_divisor}.\n\n"
+                "Please crop or resize the source video. Skipping this file."
+            )
+            logger.error(error_msg)
+            if update_info_callback:
+                self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h} (INVALID)", "Skipped", "N/A", "N/A"))
+            self.after(0, lambda: messagebox.showerror("Resolution Error", error_msg))
+            return None
+
+        # Compute padded canvas size (matches pad_for_tiling behavior)
+        dummy = torch.zeros((1, 3, output_display_h, output_display_w), dtype=torch.float32)
+        dummy_padded = pad_for_tiling(dummy, tile_num, tile_overlap=(128, 128))
+        padded_H, padded_W = int(dummy_padded.shape[2]), int(dummy_padded.shape[3])
+        del dummy, dummy_padded
+
+        if update_info_callback:
+            display_frames_info = f"{actual_frames_to_process_count} (out of {total_frames_in_video})" if process_length != -1 else str(total_frames_in_video)
+            self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h}", display_frames_info, overlap, original_input_blend_strength))
+
+        return vr, actual_frames_to_process_count, padded_H, padded_W, video_stream_info, fps
+
+    def _read_and_prepare_chunk_from_reader(
+        self,
+        vr: VideoReader,
+        start_idx: int,
+        end_idx: int,
+        base_video_name: str,
+        is_dual_input: bool,
+        tile_num: int,
+    ):
+        """Read [start_idx:end_idx) from decord and prepare (warped_padded, mask_padded, warped_unpadded, mask_unpadded, left_unpadded)."""
+        idxs = list(range(start_idx, end_idx))
+        frames_np = vr.get_batch(idxs).asnumpy()  # (T,H,W,3) uint8
+        frames = torch.from_numpy(frames_np).permute(0, 3, 1, 2).to(torch.uint8)  # T,C,H,W uint8
+
+        T, C, Hfull, Wfull = frames.shape
+
+        left_unpadded = None
+
+        if is_dual_input:
+            half_w = Wfull // 2
+            frames_mask_raw = frames[:, :, :, :half_w]
+            frames_warped_raw = frames[:, :, :, half_w:]
+        else:
+            half_h = Hfull // 2
+            half_w = Wfull // 2
+            # Top-left quadrant is the original left frames
+            left_unpadded = frames[:, :, :half_h, :half_w].float() / 255.0
+            frames_mask_raw = frames[:, :, half_h:, :half_w]
+            frames_warped_raw = frames[:, :, half_h:, half_w:]
+
+        # Warped normalized [0,1]
+        warped_unpadded = frames_warped_raw.float() / 255.0
+
+        # Mask grayscale in torch (avoid per-frame OpenCV loop)
+        mask_rgb = frames_mask_raw.float() / 255.0  # [T,3,H,W]
+        if mask_rgb.shape[1] == 3:
+            mask_gray = (0.2989 * mask_rgb[:, 0:1] + 0.5870 * mask_rgb[:, 1:2] + 0.1140 * mask_rgb[:, 2:3]).clamp(0.0, 1.0)
+        else:
+            mask_gray = mask_rgb[:, 0:1].clamp(0.0, 1.0)
+
+        self._save_debug_image(mask_gray, "02_mask_initial_grayscale", base_video_name, start_idx)
+
+        mask_unpadded = self._process_mask_pipeline_direct(mask_gray, base_video_name)
+
+        # Pad for tiling (for pipeline input)
+        warped_padded = pad_for_tiling(warped_unpadded, tile_num, tile_overlap=(128, 128))
+        mask_padded = pad_for_tiling(mask_unpadded, tile_num, tile_overlap=(128, 128))
+
+        return warped_padded, mask_padded, warped_unpadded, mask_unpadded, left_unpadded
     
     def _prepare_video_inputs(
         self,
@@ -1542,27 +1737,55 @@ class InpaintingGUI(ThemedTk):
         video_name_for_output = hires_data["video_name_for_output"]
         hires_video_path = hires_data["hires_video_path"] # Optional[str]
         
-        # 2. INPUT PREPARATION (Low-Res)
-        prepared_inputs = self._prepare_video_inputs(
-            input_video_path=input_video_path,
-            base_video_name=base_video_name,
-            is_dual_input=is_dual_input,
-            frames_chunk=frames_chunk,
-            tile_num=tile_num,
-            update_info_callback=update_info_callback,
-            overlap=overlap,
-            original_input_blend_strength=original_input_blend_strength,
-            process_length=process_length
-        )
+        # 2. INPUT PREPARATION
+        is_hires_blend_enabled = hires_data.get("is_hires_blend_enabled", False)
 
-        if prepared_inputs is None:
-            return False, None # Preparation failed
+        # Default: avoid loading the whole video into RAM when Hi-Res blending is OFF.
+        stream_input_enabled = not is_hires_blend_enabled
+        video_reader = None
+
+        # Placeholders (populated in the non-streaming preload path)
+        frames_warpped_padded = None
+        frames_mask_padded = None
+        frames_left_original_cropped = None
+        frames_warpped_original_unpadded_normalized = None
+        frames_mask_processed_unpadded_original_length = None
+
+        if stream_input_enabled:
+            stream_prep = self._prepare_video_stream_reader(
+                input_video_path=input_video_path,
+                base_video_name=base_video_name,
+                is_dual_input=is_dual_input,
+                tile_num=tile_num,
+                update_info_callback=update_info_callback,
+                overlap=overlap,
+                original_input_blend_strength=original_input_blend_strength,
+                process_length=process_length,
+            )
+            if stream_prep is None:
+                return False, None
+            video_reader, num_frames_original, padded_H, padded_W, video_stream_info, fps = stream_prep
+        else:
+            prepared_inputs = self._prepare_video_inputs(
+                input_video_path=input_video_path,
+                base_video_name=base_video_name,
+                is_dual_input=is_dual_input,
+                frames_chunk=frames_chunk,
+                tile_num=tile_num,
+                update_info_callback=update_info_callback,
+                overlap=overlap,
+                original_input_blend_strength=original_input_blend_strength,
+                process_length=process_length
+            )
+
+            if prepared_inputs is None:
+                return False, None  # Preparation failed
+
+            (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
+            num_frames_original, padded_H, padded_W, video_stream_info, fps,
+            frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length) = prepared_inputs
+
         
-        # Unpack, ensuring all torch.Tensor return values are not None
-        (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
-        num_frames_original, padded_H, padded_W, video_stream_info, fps,
-        frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length) = prepared_inputs
-
         # 3. INPAINTING CHUNKS (The main loop)
         # This part of the loop remains the same, but the logic inside is simplified
         total_frames_to_process_actual = num_frames_original        
@@ -1573,6 +1796,10 @@ class InpaintingGUI(ThemedTk):
         # NOTE: If Hi-Res blending is enabled, we fall back to the original (non-streaming) path.
         stream_encode_enabled = not hires_data.get("is_hires_blend_enabled", False)
         results = []  # kept for non-streaming fallback
+        mask_unpadded_accum = [] if stream_input_enabled else None
+        warped_unpadded_accum = [] if stream_input_enabled else None
+        left_unpadded_accum = [] if (stream_input_enabled and (not is_dual_input)) else None
+
         previous_chunk_output_frames: Optional[torch.Tensor] = None
 
         ffmpeg_p = None
@@ -1607,8 +1834,20 @@ class InpaintingGUI(ThemedTk):
             
             # --- CHUNK SLICING AND PADDING LOGIC (Remains from your last correct version) ---
             end_idx_for_slicing = min(i + frames_chunk, total_frames_to_process_actual)
-            original_input_frames_slice = frames_warpped_padded[i:end_idx_for_slicing].clone()
-            mask_frames_slice = frames_mask_padded[i:end_idx_for_slicing].clone()
+            if stream_input_enabled:
+                (original_input_frames_slice, mask_frames_slice,
+                 warped_unpadded_slice, mask_unpadded_slice, left_unpadded_slice) = self._read_and_prepare_chunk_from_reader(
+                     vr=video_reader, start_idx=i, end_idx=end_idx_for_slicing,
+                     base_video_name=base_video_name, is_dual_input=is_dual_input, tile_num=tile_num
+                 )
+            else:
+                original_input_frames_slice = frames_warpped_padded[i:end_idx_for_slicing].clone()
+                mask_frames_slice = frames_mask_padded[i:end_idx_for_slicing].clone()
+                warped_unpadded_slice = frames_warpped_original_unpadded_normalized[i:end_idx_for_slicing]
+                mask_unpadded_slice = frames_mask_processed_unpadded_original_length[i:end_idx_for_slicing]
+                left_unpadded_slice = None
+                if not is_dual_input and frames_left_original_cropped is not None:
+                    left_unpadded_slice = frames_left_original_cropped[i:end_idx_for_slicing]
             actual_sliced_length = original_input_frames_slice.shape[0]
 
             # Skip useless tail chunks that would contribute no new frames (only overlap)
@@ -1632,8 +1871,8 @@ class InpaintingGUI(ThemedTk):
 
             if padding_needed_for_pipeline_input > 0:
                 logger.debug(f"Dynamically padding input for chunk starting at frame {i}: {actual_sliced_length} frames sliced, {padding_needed_for_pipeline_input} frames needed.")
-                last_original_frame_warpped = frames_warpped_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
-                last_original_frame_mask = frames_mask_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
+                last_original_frame_warpped = original_input_frames_slice[-1:].clone()
+                last_original_frame_mask = mask_frames_slice[-1:].clone()
                 repeated_warpped = last_original_frame_warpped.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
                 repeated_mask = last_original_frame_mask.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
                 input_frames_to_pipeline = torch.cat([original_input_frames_slice, repeated_warpped], dim=0)
@@ -1703,13 +1942,17 @@ class InpaintingGUI(ThemedTk):
                 # Crop to padded canvas
                 chunk_new = chunk_new[:, :, :padded_H, :padded_W]
 
-                # Slice matching mask/warped/left for per-chunk post-processing
-                global_end = global_start + chunk_new.shape[0]
-                mask_chunk = frames_mask_processed_unpadded_original_length[global_start:global_end]
-                warped_chunk = frames_warpped_original_unpadded_normalized[global_start:global_end]
-                left_chunk = None
-                if not is_dual_input:
-                    left_chunk = frames_left_original_cropped[global_start:global_end]
+                # Per-chunk unpadded tensors for post-processing (match emitted frames)
+                chunk_len = chunk_new.shape[0]
+                if i == 0:
+                    mask_chunk = mask_unpadded_slice[:chunk_len]
+                    warped_chunk = warped_unpadded_slice[:chunk_len]
+                    left_chunk = left_unpadded_slice[:chunk_len] if left_unpadded_slice is not None else None
+                else:
+                    start_off = overlap
+                    mask_chunk = mask_unpadded_slice[start_off:start_off + chunk_len]
+                    warped_chunk = warped_unpadded_slice[start_off:start_off + chunk_len]
+                    left_chunk = left_unpadded_slice[start_off:start_off + chunk_len] if left_unpadded_slice is not None else None
 
                 # Color transfer (chunk-wise)
                 if self.enable_color_transfer.get():
@@ -1753,8 +1996,19 @@ class InpaintingGUI(ThemedTk):
                     if left_chunk is None or left_chunk.numel() == 0:
                         raise RuntimeError("Missing left_chunk for SBS output in streaming mode")
                     # Ensure left is on CPU and matches
-                    left_cpu = left_chunk[:, :, :padded_H, :padded_W].cpu()
+                    left_cpu = left_chunk.cpu()
+                    # Pad/crop left to match padded canvas (tile_num>1 can increase padded size)
+                    if left_cpu.shape[2] != padded_H or left_cpu.shape[3] != padded_W:
+                        pad_bottom = max(0, padded_H - left_cpu.shape[2])
+                        pad_right = max(0, padded_W - left_cpu.shape[3])
+                        if pad_bottom > 0 or pad_right > 0:
+                            left_cpu = F.pad(left_cpu, (0, pad_right, 0, pad_bottom), mode="constant", value=0.0)
+                        left_cpu = left_cpu[:, :, :padded_H, :padded_W]
+                    else:
+                        left_cpu = left_cpu[:, :, :padded_H, :padded_W]
                     right_cpu = chunk_new.cpu()
+                    if right_cpu.shape[2] != padded_H or right_cpu.shape[3] != padded_W:
+                        right_cpu = right_cpu[:, :, :padded_H, :padded_W]
                     if left_cpu.shape[:3] != right_cpu.shape[:3]:
                         raise RuntimeError(f"SBS shape mismatch: left {left_cpu.shape} vs right {right_cpu.shape}")
                     out_chunk = torch.cat([left_cpu, right_cpu], dim=3)
@@ -1768,12 +2022,19 @@ class InpaintingGUI(ThemedTk):
             else:
                 # Non-streaming fallback: accumulate results in RAM
                 if i == 0:
-                    results.append(current_chunk_generated[:actual_sliced_length])
+                    new_frames = current_chunk_generated[:actual_sliced_length]
+                    offset = 0
                 else:
-                    results.append(current_chunk_generated[overlap:actual_sliced_length])
+                    new_frames = current_chunk_generated[overlap:actual_sliced_length]
+                    offset = overlap
+                results.append(new_frames)
 
-# --- END INPAINTING CHUNKS ---
-
+                # If we used streaming input (no full preload), also accumulate matching original tensors
+                if stream_input_enabled and warped_unpadded_accum is not None and mask_unpadded_accum is not None:
+                    warped_unpadded_accum.append(warped_unpadded_slice[offset:actual_sliced_length].detach().cpu())
+                    mask_unpadded_accum.append(mask_unpadded_slice[offset:actual_sliced_length].detach().cpu())
+                    if (not is_dual_input) and left_unpadded_accum is not None and left_unpadded_slice is not None:
+                        left_unpadded_accum.append(left_unpadded_slice[offset:actual_sliced_length].detach().cpu())
         # If streaming encoding is enabled, we have already written frames to ffmpeg as they were generated.
         if stream_encode_enabled and ffmpeg_p is not None and video_only_path is not None:
             if update_info_callback:
@@ -1805,7 +2066,17 @@ class InpaintingGUI(ThemedTk):
 
         frames_output_final = frames_output[:, :, :padded_H, :padded_W][:num_frames_original]
         
-        # 5. FINALIZATION (Hi-Res Upscale, Color Transfer, Blend, Concat)
+        
+        # If we did NOT preload (stream_input_enabled) and we're in the non-streaming fallback,
+        # reconstruct the full original tensors needed by _finalize_output_frames().
+        if stream_input_enabled:
+            if mask_unpadded_accum is not None and len(mask_unpadded_accum) > 0:
+                frames_mask_processed_unpadded_original_length = torch.cat(mask_unpadded_accum, dim=0)[:num_frames_original]
+            if warped_unpadded_accum is not None and len(warped_unpadded_accum) > 0:
+                frames_warpped_original_unpadded_normalized = torch.cat(warped_unpadded_accum, dim=0)[:num_frames_original]
+            if (not is_dual_input) and left_unpadded_accum is not None and len(left_unpadded_accum) > 0:
+                frames_left_original_cropped = torch.cat(left_unpadded_accum, dim=0)[:num_frames_original]
+# 5. FINALIZATION (Hi-Res Upscale, Color Transfer, Blend, Concat)
         final_output_frames_for_encoding = self._finalize_output_frames(
             inpainted_frames=frames_output_final,
             mask_frames=frames_mask_processed_unpadded_original_length,
