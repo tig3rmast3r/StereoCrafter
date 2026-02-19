@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage:
-#   chmod +x fix_mask_top_bottom_black.sh
-#   ./fix_mask_top_bottom_black.sh /path/in_dir /path/out_dir
+# Fix top/bottom padding zones on *binary* grayscale mask videos, preserving pixel-perfect values.
 #
-# Optional:
-#   PAD_TOP=14 PAD_BOTTOM=14 ./fix_mask_top_bottom_black.sh /in /out
+# Usage:
+#   chmod +x fix_mask_bars.sh
+#   ./fix_mask_bars.sh /path/in_dir /path/out_dir
+#
+# Optional env:
+#   PAD_TOP=14 PAD_BOTTOM=14 CODEC=ffv1 ./fix_mask_bars.sh /in /out
+#
+# This replicates the replace-mask export settings used in splatting_gui:
+#   - grayscale pipeline
+#   - lossless codec (default: ffv1)
+#   - pix_fmt gray
 
 IN_DIR="${1:?uso: $0 /folder_mask_in /folder_mask_out}"
 OUT_DIR="${2:?uso: $0 /folder_mask_in /folder_mask_out}"
 
 PAD_TOP="${PAD_TOP:-14}"
 PAD_BOTTOM="${PAD_BOTTOM:-14}"
+CODEC="${CODEC:-ffv1}"   # ffv1|huffyuv|utvideo|png
 
 mkdir -p "$OUT_DIR"
 shopt -s nullglob
@@ -43,15 +51,15 @@ for inpath in "$IN_DIR"/*.mkv; do
 
   y_bottom=$(( h - PAD_BOTTOM ))
 
-  echo "[FIX] $base (h=$h, top=$PAD_TOP, bottom=$PAD_BOTTOM, y_bottom=$y_bottom)"
+  echo "[FIX] $base (h=$h, top=$PAD_TOP, bottom=$PAD_BOTTOM, y_bottom=$y_bottom, codec=$CODEC)"
 
   ffmpeg -hide_banner -loglevel error -stats -y \
     -i "$inpath" \
+    -map 0:v:0 -an -sn -dn \
     -vf "format=gray,\
 drawbox=x=0:y=0:w=iw:h=${PAD_TOP}:color=black:t=fill,\
 drawbox=x=0:y=${y_bottom}:w=iw:h=${PAD_BOTTOM}:color=black:t=fill" \
-    -c:v libx264 -preset veryfast -qp 0 -pix_fmt gray \
-    -an \
+    -c:v "$CODEC" -pix_fmt gray \
     "$outpath"
 done
 
