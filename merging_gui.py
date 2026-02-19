@@ -147,6 +147,187 @@ def apply_shadow_blur(
         return torch.stack(processed_frames).to(mask.device)
 
 
+
+# --- COLOR TRANSFER (SAFE) HELPERS ---
+
+def _telea_inpaint_rgb_uint8(frame_rgb_u8: np.ndarray, mask_u8: np.ndarray, radius: int = 3) -> np.ndarray:
+    """
+    OpenCV inpaint helper (TELEA). frame_rgb_u8: HxWx3 RGB uint8, mask_u8: HxW uint8 0/255.
+    Returns RGB uint8.
+    """
+    try:
+        # cv2.inpaint expects 1-channel mask, non-zero indicates inpaint region
+        out_bgr = cv2.inpaint(cv2.cvtColor(frame_rgb_u8, cv2.COLOR_RGB2BGR), mask_u8, radius, cv2.INPAINT_TELEA)
+        return cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+    except Exception as e:
+        logger.error(f"Telea inpaint failed: {e}", exc_info=True)
+        return frame_rgb_u8
+
+
+def _make_stats_mask(
+    mask_1hw: torch.Tensor,
+    stats_region: str,
+    ring_width: int,
+    use_gpu: bool = False,
+) -> torch.Tensor:
+    """
+    Returns [H,W] float mask in {0,1} to be used as VALID region for stats.
+    stats_region: global|nonmask|ring
+    mask_1hw: [1,H,W] or [H,W] (values 0..1 where 1 indicates inpaint region)
+    """
+    m = mask_1hw
+    if m.dim() == 3 and m.shape[0] == 1:
+        m = m[0]
+    if m.dim() != 2:
+        raise ValueError("mask must be [H,W] or [1,H,W]")
+
+    if stats_region == "global":
+        return torch.ones_like(m)
+
+    inv = (1.0 - (m > 0.5).float())
+
+    if stats_region == "nonmask":
+        return inv
+
+    # ring
+    if ring_width <= 0:
+        return inv
+
+    # Dilate mask to get outer band: dilated(mask) - mask
+    mm = (m > 0.5).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    k = int(ring_width) * 2 + 1
+    pad = k // 2
+    if use_gpu:
+        dil = F.max_pool2d(mm, kernel_size=k, stride=1, padding=pad)
+    else:
+        # CPU path: use max_pool2d anyway; it's fine on CPU too
+        dil = F.max_pool2d(mm, kernel_size=k, stride=1, padding=pad)
+    ring = (dil[0,0] - mm[0,0]).clamp(0, 1)
+    # VALID stats region = ring (outside mask) by default; fall back to nonmask if empty
+    if ring.sum().item() < 1.0:
+        return inv
+    return ring
+
+
+def apply_color_transfer_safe(
+    source_frame: torch.Tensor,
+    target_frame: torch.Tensor,
+    *,
+    black_thresh: float = 8.0,
+    min_valid_ratio: float = 0.01,
+    min_valid: int = 300,
+    strength: float = 1.0,
+    clamp_scale_L: Tuple[float, float] = (0.7, 1.3),
+    clamp_scale_ab: Tuple[float, float] = (0.6, 1.4),
+    exclude_black_in_target: bool = False,
+    source_valid_mask: Optional[torch.Tensor] = None,
+    target_valid_mask: Optional[torch.Tensor] = None,
+    target_stats_frame: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Reinhard-like color transfer in LAB (float32, clamped), adapted from inpainting_gui.
+
+    - Expects [C,H,W] float [0,1] tensors.
+    - Stats are computed on valid masks (optional) and can be computed from a separate target_stats_frame.
+    - Scales are clamped to prevent extreme shifts on small crops.
+    """
+    try:
+        src_t = source_frame.detach().cpu().float()
+        tgt_t = target_frame.detach().cpu().float()
+
+        # Accept [1,3,H,W] by squeezing batch dim
+        if src_t.dim() == 4 and src_t.shape[0] == 1:
+            src_t = src_t[0]
+        if tgt_t.dim() == 4 and tgt_t.shape[0] == 1:
+            tgt_t = tgt_t[0]
+
+        if src_t.dim() != 3 or tgt_t.dim() != 3 or src_t.shape[0] != 3 or tgt_t.shape[0] != 3:
+            return target_frame
+
+        Hs, Ws = int(src_t.shape[1]), int(src_t.shape[2])
+        Ht, Wt = int(tgt_t.shape[1]), int(tgt_t.shape[2])
+        if Hs != Ht or Ws != Wt:
+            return target_frame
+
+        if target_stats_frame is None:
+            tstats_t = tgt_t
+        else:
+            tstats_t = target_stats_frame.detach().cpu().float()
+            if tstats_t.dim() == 4 and tstats_t.shape[0] == 1:
+                tstats_t = tstats_t[0]
+            if tstats_t.shape != tgt_t.shape:
+                return target_frame
+
+        src_np = torch.clamp(src_t, 0.0, 1.0).permute(1, 2, 0).contiguous().numpy().astype(np.float32)
+        tgt_np = torch.clamp(tgt_t, 0.0, 1.0).permute(1, 2, 0).contiguous().numpy().astype(np.float32)
+        tstats_np = torch.clamp(tstats_t, 0.0, 1.0).permute(1, 2, 0).contiguous().numpy().astype(np.float32)
+
+        thr = float(black_thresh) / 255.0
+        src_valid = (src_np.max(axis=2) > thr)
+
+        if exclude_black_in_target:
+            tgt_valid = (tstats_np.max(axis=2) > thr)
+        else:
+            tgt_valid = np.ones((Ht, Wt), dtype=bool)
+
+        def _merge_mask(valid: np.ndarray, m: torch.Tensor) -> np.ndarray:
+            mm = m.detach().cpu()
+            if mm.dim() == 3 and mm.shape[0] == 1:
+                mm = mm[0]
+            if mm.dim() == 2 and mm.shape[0] == Ht and mm.shape[1] == Wt:
+                return valid & (mm.numpy() > 0.5)
+            return valid
+
+        if source_valid_mask is not None:
+            src_valid = _merge_mask(src_valid, source_valid_mask)
+
+        if target_valid_mask is not None:
+            tgt_valid = _merge_mask(tgt_valid, target_valid_mask)
+
+        n_valid = int(src_valid.sum())
+        min_valid_eff = max(int(min_valid), int(min_valid_ratio * Hs * Ws))
+        if n_valid < min_valid_eff:
+            return target_frame
+
+        src_lab = cv2.cvtColor(src_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+        tgt_lab = cv2.cvtColor(tgt_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+        tstats_lab = cv2.cvtColor(tstats_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+        src_vals = src_lab[src_valid].reshape(-1, 3)
+        tgt_vals = tstats_lab[tgt_valid].reshape(-1, 3)
+        if tgt_vals.shape[0] == 0:
+            tgt_vals = tstats_lab.reshape(-1, 3)
+
+        src_mean = src_vals.mean(axis=0)
+        src_std = src_vals.std(axis=0)
+        tgt_mean = tgt_vals.mean(axis=0)
+        tgt_std = tgt_vals.std(axis=0)
+
+        src_std = np.clip(src_std, 1e-6, None)
+        tgt_std = np.clip(tgt_std, 1e-6, None)
+
+        scale = src_std / tgt_std
+        scale[0] = float(np.clip(scale[0], clamp_scale_L[0], clamp_scale_L[1]))
+        scale[1] = float(np.clip(scale[1], clamp_scale_ab[0], clamp_scale_ab[1]))
+        scale[2] = float(np.clip(scale[2], clamp_scale_ab[0], clamp_scale_ab[1]))
+
+        out_lab = (tgt_lab - tgt_mean) * scale + src_mean
+        out_rgb = cv2.cvtColor(out_lab.astype(np.float32), cv2.COLOR_LAB2RGB)
+        out_rgb = np.clip(out_rgb, 0.0, 1.0).astype(np.float32)
+        out_t = torch.from_numpy(out_rgb).permute(2, 0, 1).contiguous()
+
+        if strength >= 1.0:
+            return out_t
+        if strength <= 0.0:
+            return target_frame
+        return target_frame * (1.0 - strength) + out_t * strength
+
+    except Exception as e:
+        logger.error(f"Error during SAFE color transfer: {e}. Returning original target frame.", exc_info=True)
+        return target_frame
+
+# --- END COLOR TRANSFER (SAFE) HELPERS ---
+
 class MergingGUI(ThemedTk):
     # --- Centralized Default Settings ---
     APP_DEFAULTS = {
@@ -155,19 +336,34 @@ class MergingGUI(ThemedTk):
         "mask_folder": "./output_splatted/hires",
         "replace_mask_folder": "",  # optional; if empty uses splatted folder
         "output_folder": "./final_videos",
-        "use_replace_mask": False,
-        "mask_binarize_threshold": 0.3,
-        "mask_dilate_kernel_size": 3.0,
-        "mask_blur_kernel_size": 5.0,
-        "shadow_shift": 5.0,
-        "shadow_decay_gamma": 1.3,
-        "shadow_start_opacity": 0.87,
-        "shadow_opacity_decay": 0.08,
-        "shadow_min_opacity": 0.14,
-        "use_gpu": False,
+        "use_replace_mask": True,
+        "mask_binarize_threshold": -0.01,
+        "mask_dilate_kernel_size": 2,
+        "mask_blur_kernel_size": 4,
+        "shadow_shift": 1,
+        "shadow_decay_gamma": 1,
+        "shadow_start_opacity": 1,
+        "shadow_opacity_decay": 0.06,
+        "shadow_min_opacity": 0,
+        "use_gpu": True,
         "output_format": "Full SBS (Left-Right)",
         "pad_to_16_9": False,
         "enable_color_transfer": True,
+        "color_transfer_mode": "safe",  # safe | legacy
+        "ct_strength": 1.0,
+        "ct_black_thresh": 0.0,
+        "ct_min_valid_ratio": 0,
+        "ct_min_valid": 0,
+        "ct_clamp_L_min": 0.1,
+        "ct_clamp_L_max": 2,
+        "ct_clamp_ab_min": 0.1,
+        "ct_clamp_ab_max": 3,
+        "ct_exclude_black_in_target": True,
+        "ct_stats_region": "ring",  # global | nonmask | ring
+        "ct_ring_width": 40,
+        "ct_target_stats_source": "warped",  # warped | inpainted
+        "ct_reference_source": "warped_filled",  # left | warped_filled
+
         "batch_chunk_size": "20",
         "preview_size": "100%",
     }
@@ -316,7 +512,52 @@ class MergingGUI(ThemedTk):
             value=self.app_config.get(
                 "enable_color_transfer", self.APP_DEFAULTS["enable_color_transfer"]
             )
+                )
+
+        # --- Color Transfer (Safe) controls ---
+        self.color_transfer_mode_var = tk.StringVar(
+            value=self.app_config.get("color_transfer_mode", self.APP_DEFAULTS["color_transfer_mode"])
         )
+        self.ct_strength_var = tk.DoubleVar(
+            value=float(self.app_config.get("ct_strength", self.APP_DEFAULTS["ct_strength"]))
+        )
+        self.ct_black_thresh_var = tk.DoubleVar(
+            value=float(self.app_config.get("ct_black_thresh", self.APP_DEFAULTS["ct_black_thresh"]))
+        )
+        self.ct_min_valid_ratio_var = tk.DoubleVar(
+            value=float(self.app_config.get("ct_min_valid_ratio", self.APP_DEFAULTS["ct_min_valid_ratio"]))
+        )
+        self.ct_min_valid_var = tk.IntVar(
+            value=int(self.app_config.get("ct_min_valid", self.APP_DEFAULTS["ct_min_valid"]))
+        )
+        self.ct_clamp_L_min_var = tk.DoubleVar(
+            value=float(self.app_config.get("ct_clamp_L_min", self.APP_DEFAULTS["ct_clamp_L_min"]))
+        )
+        self.ct_clamp_L_max_var = tk.DoubleVar(
+            value=float(self.app_config.get("ct_clamp_L_max", self.APP_DEFAULTS["ct_clamp_L_max"]))
+        )
+        self.ct_clamp_ab_min_var = tk.DoubleVar(
+            value=float(self.app_config.get("ct_clamp_ab_min", self.APP_DEFAULTS["ct_clamp_ab_min"]))
+        )
+        self.ct_clamp_ab_max_var = tk.DoubleVar(
+            value=float(self.app_config.get("ct_clamp_ab_max", self.APP_DEFAULTS["ct_clamp_ab_max"]))
+        )
+        self.ct_exclude_black_in_target_var = tk.BooleanVar(
+            value=bool(self.app_config.get("ct_exclude_black_in_target", self.APP_DEFAULTS["ct_exclude_black_in_target"]))
+        )
+        self.ct_stats_region_var = tk.StringVar(
+            value=self.app_config.get("ct_stats_region", self.APP_DEFAULTS["ct_stats_region"])
+        )
+        self.ct_ring_width_var = tk.IntVar(
+            value=int(self.app_config.get("ct_ring_width", self.APP_DEFAULTS["ct_ring_width"]))
+        )
+        self.ct_target_stats_source_var = tk.StringVar(
+            value=self.app_config.get("ct_target_stats_source", self.APP_DEFAULTS["ct_target_stats_source"])
+        )
+        self.ct_reference_source_var = tk.StringVar(
+            value=self.app_config.get("ct_reference_source", self.APP_DEFAULTS["ct_reference_source"])
+        )
+        # --- END Color Transfer (Safe) controls ---
         self.debug_logging_var = tk.BooleanVar(
             value=self.app_config.get("debug_logging_enabled", False)
         )
@@ -693,90 +934,70 @@ class MergingGUI(ThemedTk):
     def create_widgets(self):
         self.create_menubar()
         # The main window will now be a simple vertical layout.
-        # We will pack frames directly into `self`.
-
-        # --- FOLDER FRAME ---
+        # We will pack frames directly into `self`.        # --- FOLDER FRAME ---
         folder_frame = ttk.LabelFrame(self, text="Folders", padding=10)
         folder_frame.pack(fill="x", padx=10, pady=5)
+
+        # Two-column layout to reduce vertical space
+        folder_frame.grid_columnconfigure(0, weight=1)
         folder_frame.grid_columnconfigure(1, weight=1)
 
+        left_paths = ttk.Frame(folder_frame)
+        right_paths = ttk.Frame(folder_frame)
+        left_paths.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        right_paths.grid(row=0, column=1, sticky="nsew")
+
+        left_paths.grid_columnconfigure(1, weight=1)
+        right_paths.grid_columnconfigure(1, weight=1)
+
+        # --- Left column (3 paths) ---
         # Inpainted Video Folder
-        ttk.Label(folder_frame, text="Inpainted Video Folder:").grid(
-            row=0, column=0, sticky="e", padx=5, pady=2
-        )
-        entry_inpaint = ttk.Entry(folder_frame, textvariable=self.inpainted_folder_var)
+        ttk.Label(left_paths, text="Inpainted Video Folder:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        entry_inpaint = ttk.Entry(left_paths, textvariable=self.inpainted_folder_var)
         entry_inpaint.grid(row=0, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_inpaint, "inpainted_folder")
-        btn_inpaint = ttk.Button(
-            folder_frame,
-            text="Browse",
-            command=lambda: self._browse_folder(self.inpainted_folder_var),
-        )
+        btn_inpaint = ttk.Button(left_paths, text="Browse", command=lambda: self._browse_folder(self.inpainted_folder_var))
         btn_inpaint.grid(row=0, column=2, padx=5)
         self.widgets_to_disable.append(entry_inpaint)
         self.widgets_to_disable.append(btn_inpaint)
 
         # Original Video Folder (for Left Eye)
-        ttk.Label(folder_frame, text="Original Video Folder:").grid(
-            row=1, column=0, sticky="e", padx=5, pady=2
-        )
-        entry_orig = ttk.Entry(folder_frame, textvariable=self.original_folder_var)
+        ttk.Label(left_paths, text="Original Video Folder:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        entry_orig = ttk.Entry(left_paths, textvariable=self.original_folder_var)
         entry_orig.grid(row=1, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_orig, "original_folder")
-        btn_orig = ttk.Button(
-            folder_frame,
-            text="Browse",
-            command=lambda: self._browse_folder(self.original_folder_var),
-        )
+        btn_orig = ttk.Button(left_paths, text="Browse", command=lambda: self._browse_folder(self.original_folder_var))
         btn_orig.grid(row=1, column=2, padx=5)
         self.widgets_to_disable.append(entry_orig)
         self.widgets_to_disable.append(btn_orig)
 
         # Splat Folder
-        ttk.Label(folder_frame, text="Splat Folder:").grid(
-            row=2, column=0, sticky="e", padx=5, pady=2
-        )
-        entry_mask = ttk.Entry(folder_frame, textvariable=self.mask_folder_var)
+        ttk.Label(left_paths, text="Splat Folder:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        entry_mask = ttk.Entry(left_paths, textvariable=self.mask_folder_var)
         entry_mask.grid(row=2, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_mask, "mask_folder")
-        btn_mask = ttk.Button(
-            folder_frame,
-            text="Browse",
-            command=lambda: self._browse_folder(self.mask_folder_var),
-        )
+        btn_mask = ttk.Button(left_paths, text="Browse", command=lambda: self._browse_folder(self.mask_folder_var))
         btn_mask.grid(row=2, column=2, padx=5)
         self.widgets_to_disable.append(entry_mask)
         self.widgets_to_disable.append(btn_mask)
 
-        
+        # --- Right column (2 paths) ---
         # Replace Mask Folder (optional)
-        ttk.Label(folder_frame, text="Replace Mask Folder (optional):").grid(
-            row=3, column=0, sticky="e", padx=5, pady=2
-        )
-        entry_rmask = ttk.Entry(folder_frame, textvariable=self.replace_mask_folder_var)
-        entry_rmask.grid(row=3, column=1, padx=5, sticky="ew")
-        btn_rmask = ttk.Button(
-            folder_frame,
-            text="Browse",
-            command=lambda: self._browse_folder(self.replace_mask_folder_var),
-        )
-        btn_rmask.grid(row=3, column=2, padx=5)
+        ttk.Label(right_paths, text="Replace Mask Folder (optional):").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        entry_rmask = ttk.Entry(right_paths, textvariable=self.replace_mask_folder_var)
+        entry_rmask.grid(row=0, column=1, padx=5, sticky="ew")
+        btn_rmask = ttk.Button(right_paths, text="Browse", command=lambda: self._browse_folder(self.replace_mask_folder_var))
+        btn_rmask.grid(row=0, column=2, padx=5)
         self.widgets_to_disable.append(entry_rmask)
         self.widgets_to_disable.append(btn_rmask)
 
-# Output Folder
-        ttk.Label(folder_frame, text="Output Folder:").grid(
-            row=4, column=0, sticky="e", padx=5, pady=2
-        )
-        entry_out = ttk.Entry(folder_frame, textvariable=self.output_folder_var)
-        entry_out.grid(row=4, column=1, padx=5, sticky="ew")
+        # Output Folder
+        ttk.Label(right_paths, text="Output Folder:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        entry_out = ttk.Entry(right_paths, textvariable=self.output_folder_var)
+        entry_out.grid(row=1, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_out, "output_folder")
-        btn_out = ttk.Button(
-            folder_frame,
-            text="Browse",
-            command=lambda: self._browse_folder(self.output_folder_var),
-        )
-        btn_out.grid(row=4, column=2, padx=5)
+        btn_out = ttk.Button(right_paths, text="Browse", command=lambda: self._browse_folder(self.output_folder_var))
+        btn_out.grid(row=1, column=2, padx=5)
         self.widgets_to_disable.append(entry_out)
         self.widgets_to_disable.append(btn_out)
 
@@ -804,10 +1025,16 @@ class MergingGUI(ThemedTk):
         self.previewer.pack(fill="both", expand=True, padx=10, pady=5)
 
         # --- MASK PROCESSING PARAMETERS ---
+        # Place Mask Processing and Color Transfer side-by-side to save vertical space
+        params_ct_row = ttk.Frame(self)
+        params_ct_row.pack(fill="x", padx=10, pady=5)
+        params_ct_row.grid_columnconfigure(0, weight=1)
+        params_ct_row.grid_columnconfigure(1, weight=1)
+
         param_frame = ttk.LabelFrame(
-            self, text="Mask Processing Parameters", padding=10
+            params_ct_row, text="Mask Processing Parameters", padding=10
         )
-        param_frame.pack(fill="x", padx=10, pady=5)
+        param_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         param_frame.grid_columnconfigure(1, weight=1)
 
         # def create_slider_with_label_updater(parent, text, var, from_, to, row, decimals=0) -> None:
@@ -922,7 +1149,140 @@ class MergingGUI(ThemedTk):
             step_size=0.01,
         )
 
-        # --- NEW: Option to use external replace-mask video instead of embedded mask ---
+        
+        # --- COLOR TRANSFER (SAFE) PARAMETERS ---
+        ct_frame = ttk.LabelFrame(params_ct_row, text="Color Transfer (Safe)", padding=10)
+        ct_frame.grid(row=0, column=1, sticky="nsew")
+        for _c in range(8):
+            ct_frame.grid_columnconfigure(_c, weight=1 if _c in (1,3,5,7) else 0)
+
+        # Mode / options row
+        ttk.Label(ct_frame, text="Mode:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        ct_mode_combo = ttk.Combobox(
+            ct_frame,
+            textvariable=self.color_transfer_mode_var,
+            values=["safe", "legacy"],
+            state="readonly",
+            width=10,
+        )
+        ct_mode_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(ct_mode_combo, "color_transfer_mode")
+        self.widgets_to_disable.append(ct_mode_combo)
+
+        ttk.Label(ct_frame, text="Stats Region:").grid(row=0, column=2, sticky="e", padx=5, pady=2)
+        ct_region_combo = ttk.Combobox(
+            ct_frame,
+            textvariable=self.ct_stats_region_var,
+            values=["global", "nonmask", "ring"],
+            state="readonly",
+            width=10,
+        )
+        ct_region_combo.grid(row=0, column=3, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(ct_region_combo, "ct_stats_region")
+        self.widgets_to_disable.append(ct_region_combo)
+
+        ttk.Label(ct_frame, text="Target Stats:").grid(row=0, column=4, sticky="e", padx=5, pady=2)
+        ct_tgtstats_combo = ttk.Combobox(
+            ct_frame,
+            textvariable=self.ct_target_stats_source_var,
+            values=["warped", "inpainted"],
+            state="readonly",
+            width=10,
+        )
+        ct_tgtstats_combo.grid(row=0, column=5, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(ct_tgtstats_combo, "ct_target_stats_source")
+        self.widgets_to_disable.append(ct_tgtstats_combo)
+
+        ttk.Label(ct_frame, text="Reference:").grid(row=0, column=6, sticky="e", padx=5, pady=2)
+        ct_ref_combo = ttk.Combobox(
+            ct_frame,
+            textvariable=self.ct_reference_source_var,
+            values=["left", "warped_filled"],
+            state="readonly",
+            width=12,
+        )
+        ct_ref_combo.grid(row=0, column=7, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(ct_ref_combo, "ct_reference_source")
+        self.widgets_to_disable.append(ct_ref_combo)
+
+        # Checkbox
+        ct_excl = ttk.Checkbutton(
+            ct_frame,
+            text="Exclude near-black in target stats",
+            variable=self.ct_exclude_black_in_target_var,
+        )
+        ct_excl.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self._create_hover_tooltip(ct_excl, "ct_exclude_black_in_target")
+        self.widgets_to_disable.append(ct_excl)
+
+                # Sliders (two columns) — keep preview updates on release
+        ct_sliders_row = ttk.Frame(ct_frame)
+        ct_sliders_row.grid(row=2, column=0, columnspan=8, sticky="ew", padx=0, pady=(6, 0))
+        ct_sliders_row.grid_columnconfigure(0, weight=1)
+        ct_sliders_row.grid_columnconfigure(1, weight=1)
+
+        ct_sliders_left = ttk.Frame(ct_sliders_row)
+        ct_sliders_right = ttk.Frame(ct_sliders_row)
+        ct_sliders_left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        ct_sliders_right.grid(row=0, column=1, sticky="nsew")
+
+        ct_sliders_left.grid_columnconfigure(1, weight=1)
+        ct_sliders_right.grid_columnconfigure(1, weight=1)
+
+        # Left column
+        create_single_slider_with_label_updater(
+            self, ct_sliders_left, "CT Strength:", self.ct_strength_var,
+            0.0, 1.0, 0, decimals=2, step_size=0.01
+        )
+        create_single_slider_with_label_updater(
+            self, ct_sliders_left, "Black Thresh (0..32):", self.ct_black_thresh_var,
+            0.0, 32.0, 1, decimals=1, step_size=1.0
+        )
+        create_single_slider_with_label_updater(
+            self, ct_sliders_left, "Min Valid Ratio:", self.ct_min_valid_ratio_var,
+            0.0, 0.10, 2, decimals=3, step_size=0.001
+        )
+        create_single_slider_with_label_updater(
+            self, ct_sliders_left, "Min Valid Pixels:", self.ct_min_valid_var,
+            0, 50000, 3, decimals=0, step_size=100
+        )
+        create_single_slider_with_label_updater(
+            self, ct_sliders_left, "Ring Width (px):", self.ct_ring_width_var,
+            0, 200, 4, decimals=0, step_size=1
+        )
+
+        # Right column
+        create_single_slider_with_label_updater(
+            self, ct_sliders_right, "Clamp L Min:", self.ct_clamp_L_min_var,
+            0.1, 2.0, 0, decimals=2, step_size=0.01
+        )
+        create_single_slider_with_label_updater(
+            self, ct_sliders_right, "Clamp L Max:", self.ct_clamp_L_max_var,
+            0.1, 2.0, 1, decimals=2, step_size=0.01
+        )
+        create_single_slider_with_label_updater(
+            self, ct_sliders_right, "Clamp ab Min:", self.ct_clamp_ab_min_var,
+            0.1, 3.0, 2, decimals=2, step_size=0.01
+        )
+        create_single_slider_with_label_updater(
+            self, ct_sliders_right, "Clamp ab Max:", self.ct_clamp_ab_max_var,
+            0.1, 3.0, 3, decimals=2, step_size=0.01
+        )
+        # Make comboboxes trigger preview refresh immediately on change
+        for _v in (
+            self.color_transfer_mode_var,
+            self.ct_stats_region_var,
+            self.ct_target_stats_source_var,
+            self.ct_reference_source_var,
+            self.ct_exclude_black_in_target_var,
+        ):
+            try:
+                _v.trace_add("write", lambda *args: self.on_slider_release(None))
+            except Exception:
+                pass
+        # --- END COLOR TRANSFER (SAFE) PARAMETERS ---
+
+# --- NEW: Option to use external replace-mask video instead of embedded mask ---
         replace_mask_check = ttk.Checkbutton(
             param_frame,
             text="Use Replace Mask (_replace_mask.mkv) instead of embedded mask",
@@ -933,20 +1293,47 @@ class MergingGUI(ThemedTk):
             row=8, column=0, columnspan=3, sticky="w", padx=5, pady=(8, 2)
         )
         self.widgets_to_disable.append(replace_mask_check)
+                # --- OPTIONS FRAME ---
+        # Dock Options beside the preview controls row (Preview Source / Prev/Next / Jump / Scale).
+        # The most reliable anchor is the parent frame that owns preview_source_combo.
+        options_parent = getattr(self.previewer, "preview_source_combo", None)
+        if options_parent is not None:
+            options_parent = options_parent.master
+        else:
+            options_parent = self  # fallback: keep the old vertical placement
 
-        # --- OPTIONS FRAME ---
-        options_frame = ttk.LabelFrame(self, text="Options", padding=10)
-        options_frame.pack(fill="x", padx=10, pady=5)
+        options_frame = ttk.LabelFrame(options_parent, text="Options", padding=10)
 
-        gpu_check = ttk.Checkbutton(
-            options_frame, text="Use GPU for Mask Processing", variable=self.use_gpu_var
-        )
+        def _parent_uses_grid(parent) -> bool:
+            try:
+                for w in parent.winfo_children():
+                    if w.winfo_manager() == "grid":
+                        return True
+            except Exception:
+                pass
+            return False
+
+        if options_parent is self:
+            options_frame.pack(fill="x", padx=10, pady=5)
+        else:
+            if _parent_uses_grid(options_parent):
+                # Place at the far right of the top controls row
+                try:
+                    cols, rows = options_parent.grid_size()
+                except Exception:
+                    cols, rows = (0, 0)
+                col = int(cols) if cols is not None else 0
+                options_parent.grid_columnconfigure(col, weight=0)
+                options_frame.grid(row=0, column=col, sticky="ne", padx=(10, 0), pady=0)
+            else:
+                options_frame.pack(side="right", padx=(10, 0), pady=0, anchor="ne")
+        gpu_check = ttk.Checkbutton(options_frame, text="Use GPU", variable=self.use_gpu_var)
         gpu_check.pack(side="left", padx=5)
         self._create_hover_tooltip(gpu_check, "use_gpu")
         self.widgets_to_disable.append(gpu_check)
 
-        # --- NEW: Output Format Dropdown ---
-        ttk.Label(options_frame, text="Output Format:").pack(side="left", padx=(15, 5))
+        # Output format dropdown
+        ttk.Label(options_frame, text="Output:").pack(side="left", padx=(10, 5))
         output_formats = [
             "Full SBS (Left-Right)",
             "Double SBS",
@@ -961,96 +1348,84 @@ class MergingGUI(ThemedTk):
             textvariable=self.output_format_var,
             values=output_formats,
             state="readonly",
-            width=28,
+            width=22,
         )
         output_format_combo.pack(side="left", padx=5)
         self._create_hover_tooltip(output_format_combo, "output_format")
         self.widgets_to_disable.append(output_format_combo)
-        # --- END NEW ---
 
         color_check = ttk.Checkbutton(
             options_frame,
-            text="Enable Color Transfer",
+            text="Color Transfer",
             variable=self.enable_color_transfer_var,
         )
         color_check.pack(side="left", padx=5)
         self._create_hover_tooltip(color_check, "enable_color_transfer")
         self.widgets_to_disable.append(color_check)
 
-        # --- NEW: Pad to 16:9 Checkbox ---
         pad_check = ttk.Checkbutton(
-            options_frame, text="Pad to 16:9", variable=self.pad_to_16_9_var
+            options_frame, text="Pad 16:9", variable=self.pad_to_16_9_var
         )
-        pad_check.pack(side="left", padx=(15, 5))
+        pad_check.pack(side="left", padx=(10, 5))
         self._create_hover_tooltip(pad_check, "pad_to_16_9")
         self.widgets_to_disable.append(pad_check)
 
-        # --- NEW: Add Borders checkbox ---
+        # Add Borders
         self.add_borders_var = tk.BooleanVar(value=True)
         self.add_borders_var.trace_add("write", self._on_add_borders_changed)
         borders_check = ttk.Checkbutton(
-            options_frame, text="Add Borders", variable=self.add_borders_var
+            options_frame, text="Borders", variable=self.add_borders_var
         )
-        borders_check.pack(side="left", padx=(15, 5))
+        borders_check.pack(side="left", padx=(10, 5))
         self._create_hover_tooltip(borders_check, "add_borders")
         self.widgets_to_disable.append(borders_check)
-        # --- END NEW ---
 
-        # --- NEW: Resume checkbox ---
+        # Resume
         self.resume_var = tk.BooleanVar(value=self.app_config.get("resume", False))
         self.resume_var.trace_add("write", self._on_resume_changed)
         resume_check = ttk.Checkbutton(
             options_frame, text="Resume", variable=self.resume_var
         )
-        resume_check.pack(side="left", padx=(15, 5))
+        resume_check.pack(side="left", padx=(10, 5))
         self._create_hover_tooltip(resume_check, "resume")
         self.widgets_to_disable.append(resume_check)
-        # --- END NEW ---
 
-        # Add Batch Chunk Size option
-        ttk.Label(options_frame, text="Batch Chunk Size:").pack(
-            side="left", padx=(20, 5)
-        )
-        entry_chunk = ttk.Entry(
-            options_frame, textvariable=self.batch_chunk_size_var, width=7
-        )
+        # Batch chunk size
+        ttk.Label(options_frame, text="Chunk:").pack(side="left", padx=(12, 5))
+        entry_chunk = ttk.Entry(options_frame, textvariable=self.batch_chunk_size_var, width=6)
         entry_chunk.pack(side="left")
         self._create_hover_tooltip(entry_chunk, "batch_chunk_size")
         self.widgets_to_disable.append(entry_chunk)
 
         # --- PROGRESS & BUTTONS ---
+
         progress_frame = ttk.LabelFrame(self, text="Progress", padding=10)
         progress_frame.pack(fill="x", padx=10, pady=5)
+
+        progress_frame.grid_columnconfigure(0, weight=1)
+        progress_frame.grid_columnconfigure(1, weight=0)
+
+        # Row 0: progress bar (left) + buttons (right)
         self.progress_bar = ttk.Progressbar(
             progress_frame, variable=self.progress_var, length=400, mode="determinate"
         )
-        self.progress_bar.pack(fill="x")
-        self.status_label_var = tk.StringVar(value="Ready")
-        self.status_label = ttk.Label(
-            progress_frame, textvariable=self.status_label_var
-        )
-        self.status_label.pack(pady=5)
+        self.progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 10), pady=(0, 5))
 
-        # --- Border Info ---
-        self.border_info_var = tk.StringVar(value="Borders: N/A")
-        self.border_info_label = ttk.Label(
-            progress_frame, textvariable=self.border_info_var
-        )
-        self.border_info_label.pack(pady=2)
+        buttons_frame = ttk.Frame(progress_frame)
+        buttons_frame.grid(row=0, column=1, sticky="e", pady=(0, 5))
 
-        buttons_frame = ttk.Frame(self, padding=10)
-        buttons_frame.pack(fill="x")
         self.start_button = ttk.Button(
             buttons_frame, text="Start Blending", command=self.start_processing
         )
-        self.start_button.pack(side="left", padx=5, expand=True)
+        self.start_button.grid(row=0, column=0, padx=5)
         self._create_hover_tooltip(self.start_button, "start_blending")
+        self.widgets_to_disable.append(self.start_button)  # disable during processing
+
         self.stop_button = ttk.Button(
             buttons_frame, text="Stop", command=self.stop_processing, state="disabled"
         )
-        self.widgets_to_disable.append(self.start_button)  # Add to disable list
         # Stop button is handled separately in _set_ui_processing_state
-        self.stop_button.pack(side="left", padx=5, expand=True)
+        self.stop_button.grid(row=0, column=1, padx=5)
         self._create_hover_tooltip(self.stop_button, "stop_blending")
 
         # --- NEW: Process Current Clip button ---
@@ -1059,11 +1434,20 @@ class MergingGUI(ThemedTk):
             text="Process Current Clip",
             command=self.process_current_clip,
         )
-        self.process_current_button.pack(side="left", padx=5, expand=True)
+        self.process_current_button.grid(row=0, column=2, padx=5)
         self._create_hover_tooltip(self.process_current_button, "process_current_clip")
         self.widgets_to_disable.append(self.process_current_button)
         # --- END NEW ---
 
+        # Row 1+: status text
+        self.status_label_var = tk.StringVar(value="Ready")
+        self.status_label = ttk.Label(progress_frame, textvariable=self.status_label_var)
+        self.status_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 2))
+
+        # --- Border Info ---
+        self.border_info_var = tk.StringVar(value="Borders: N/A")
+        self.border_info_label = ttk.Label(progress_frame, textvariable=self.border_info_var)
+        self.border_info_label.grid(row=2, column=0, columnspan=2, sticky="w")
     def _browse_folder(self, var: tk.StringVar):
         folder = filedialog.askdirectory(initialdir=var.get())
         if folder:
@@ -1416,6 +1800,21 @@ class MergingGUI(ThemedTk):
                 "output_format": self.output_format_var.get(),
                 "batch_chunk_size": int(self.batch_chunk_size_var.get()),
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
+                "color_transfer_mode": self.color_transfer_mode_var.get(),
+                "ct_strength": float(self.ct_strength_var.get()),
+                "ct_black_thresh": float(self.ct_black_thresh_var.get()),
+                "ct_min_valid_ratio": float(self.ct_min_valid_ratio_var.get()),
+                "ct_min_valid": int(self.ct_min_valid_var.get()),
+                "ct_clamp_L_min": float(self.ct_clamp_L_min_var.get()),
+                "ct_clamp_L_max": float(self.ct_clamp_L_max_var.get()),
+                "ct_clamp_ab_min": float(self.ct_clamp_ab_min_var.get()),
+                "ct_clamp_ab_max": float(self.ct_clamp_ab_max_var.get()),
+                "ct_exclude_black_in_target": bool(self.ct_exclude_black_in_target_var.get()),
+                "ct_stats_region": self.ct_stats_region_var.get(),
+                "ct_ring_width": int(self.ct_ring_width_var.get()),
+                "ct_target_stats_source": self.ct_target_stats_source_var.get(),
+                "ct_reference_source": self.ct_reference_source_var.get(),
+
                 "preview_size": self.preview_size_var.get(),
                 "preview_source": self.preview_source_var.get(),
                 "use_replace_mask": self.use_replace_mask_var.get(),
@@ -1463,6 +1862,13 @@ class MergingGUI(ThemedTk):
         This is the main logic that will run in a background thread.
         If single_video_path is provided, only process that one video.
         """
+
+        # Safety init for cleanup variables (must exist for any try/finally path)
+        inpainted_reader = None
+        splatted_reader = None
+        replace_mask_reader = None
+        original_reader = None
+        ffmpeg_process = None
         if settings is None:
             self.after(0, self.processing_done, True)
             return
@@ -1776,7 +2182,9 @@ class MergingGUI(ThemedTk):
                     splatted_np = splatted_reader.get_batch(frame_indices).asnumpy()
 
                     replace_mask_np = None
-                    if replace_mask_reader is not None:
+                    _rmr = locals().get('replace_mask_reader', None)
+                    if _rmr is not None:
+                        replace_mask_reader = _rmr
                         try:
                             replace_mask_np = (
                                 replace_mask_reader.get_batch(frame_indices).asnumpy()
@@ -1874,14 +2282,73 @@ class MergingGUI(ThemedTk):
                         )
 
                     if settings["enable_color_transfer"]:
-                        adjusted_frames = []
-                        for frame_idx in range(inpainted.shape[0]):
-                            adjusted_frame = apply_color_transfer(
-                                original_left[frame_idx].cpu(),
-                                inpainted[frame_idx].cpu(),
-                            )
-                            adjusted_frames.append(adjusted_frame.to(device))
-                        inpainted = torch.stack(adjusted_frames)
+                        mode = settings.get("color_transfer_mode", "safe")
+                        if mode == "legacy":
+                            adjusted_frames = []
+                            for frame_idx in range(inpainted.shape[0]):
+                                adjusted_frame = apply_color_transfer(
+                                    original_left[frame_idx].cpu(),
+                                    inpainted[frame_idx].cpu(),
+                                )
+                                adjusted_frames.append(adjusted_frame.to(device))
+                            inpainted = torch.stack(adjusted_frames)
+                        else:
+                            # SAFE mode: compute stats on a stable region (global/nonmask/ring) and clamp scales
+                            # Build a binary mask for stats (use binarize threshold if enabled)
+                            if settings["mask_binarize_threshold"] >= 0.0:
+                                mask_bin = (mask > settings["mask_binarize_threshold"]).float()
+                            else:
+                                mask_bin = (mask > 0.5).float()
+
+                            use_gpu_stats = False  # stats mask building is cheap on CPU
+                            adjusted_frames = []
+                            for frame_idx in range(inpainted.shape[0]):
+                                # stats region mask (VALID region)
+                                stats_valid = _make_stats_mask(
+                                    mask_bin[frame_idx],  # [1,H,W]
+                                    stats_region=settings.get("ct_stats_region", "nonmask"),
+                                    ring_width=int(settings.get("ct_ring_width", 20)),
+                                    use_gpu=use_gpu_stats,
+                                )
+                                # choose target stats frame
+                                if settings.get("ct_target_stats_source", "warped") == "warped":
+                                    tgt_stats = warped_original[frame_idx].cpu()
+                                else:
+                                    tgt_stats = inpainted[frame_idx].cpu()
+
+                                # choose reference
+                                if settings.get("ct_reference_source", "left") == "warped_filled":
+                                    # Fill inpaint region on warped to remove holes from stats
+                                    wf = warped_original[frame_idx].cpu()
+                                    wf_u8 = (torch.clamp(wf, 0, 1).permute(1,2,0).numpy() * 255).astype(np.uint8)
+                                    mm = (mask_bin[frame_idx].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                                    ref_u8 = _telea_inpaint_rgb_uint8(wf_u8, mm, radius=3)
+                                    ref = torch.from_numpy(ref_u8).permute(2,0,1).float() / 255.0
+                                else:
+                                    ref = original_left[frame_idx].cpu()
+
+                                adjusted_frame = apply_color_transfer_safe(
+                                    ref,
+                                    inpainted[frame_idx].cpu(),
+                                    black_thresh=float(settings.get("ct_black_thresh", 8.0)),
+                                    min_valid_ratio=float(settings.get("ct_min_valid_ratio", 0.01)),
+                                    min_valid=int(settings.get("ct_min_valid", 300)),
+                                    strength=float(settings.get("ct_strength", 1.0)),
+                                    clamp_scale_L=(
+                                        float(settings.get("ct_clamp_L_min", 0.7)),
+                                        float(settings.get("ct_clamp_L_max", 1.3)),
+                                    ),
+                                    clamp_scale_ab=(
+                                        float(settings.get("ct_clamp_ab_min", 0.6)),
+                                        float(settings.get("ct_clamp_ab_max", 1.4)),
+                                    ),
+                                    exclude_black_in_target=bool(settings.get("ct_exclude_black_in_target", False)),
+                                    source_valid_mask=stats_valid,
+                                    target_valid_mask=stats_valid,
+                                    target_stats_frame=tgt_stats,
+                                )
+                                adjusted_frames.append(adjusted_frame.to(device))
+                            inpainted = torch.stack(adjusted_frames)
 
                     processed_mask = mask.clone()
                     # --- NEW: Binarization as the first step ---
@@ -2039,13 +2506,15 @@ class MergingGUI(ThemedTk):
                     # Explicitly close video readers BEFORE attempting to move their files
                     del ffmpeg_process
                     if inpainted_reader:
-                        del inpainted_reader
+                        inpainted_reader = None
                     if splatted_reader:
-                        del splatted_reader
-                    if replace_mask_reader:
-                        del replace_mask_reader
+                        splatted_reader = None
+                    _rmr = locals().get('replace_mask_reader', None)
+                    if _rmr is not None:
+                        replace_mask_reader = _rmr
+                        replace_mask_reader = None
                     if original_reader:
-                        del original_reader
+                        original_reader = None
                     inpainted_reader, splatted_reader, original_reader = (
                         None,
                         None,
@@ -2095,11 +2564,13 @@ class MergingGUI(ThemedTk):
             except Exception as e:
                 # --- FIX: Ensure readers are closed on exception before the finally block ---
                 if splatted_reader:
-                    del splatted_reader
-                if replace_mask_reader:
-                    del replace_mask_reader
+                    splatted_reader = None
+                _rmr = locals().get('replace_mask_reader', None)
+                if _rmr is not None:
+                    replace_mask_reader = _rmr
+                    replace_mask_reader = None
                 if original_reader:
-                    del original_reader
+                    original_reader = None
                 inpainted_reader, splatted_reader, replace_mask_reader, original_reader = None, None, None, None
                 # --- END FIX ---
                 logger.error(f"Failed to process {base_name}: {e}", exc_info=True)
@@ -2117,13 +2588,15 @@ class MergingGUI(ThemedTk):
                 # Ensure readers are always cleaned up, even on error
                 # This is now a secondary safety net; the primary cleanup happens before file moves.
                 if inpainted_reader:
-                    del inpainted_reader
+                    inpainted_reader = None
                 if splatted_reader:
-                    del splatted_reader
-                if replace_mask_reader:
-                    del replace_mask_reader
+                    splatted_reader = None
+                _rmr = locals().get('replace_mask_reader', None)
+                if _rmr is not None:
+                    replace_mask_reader = _rmr
+                    replace_mask_reader = None
                 if original_reader:
-                    del original_reader
+                    original_reader = None
                 # --- END: CHUNK-BASED PROCESSING ---
 
             self.after(0, self.progress_var.set, i + 1)
@@ -2464,10 +2937,69 @@ class MergingGUI(ThemedTk):
 
             if params.get("enable_color_transfer", False):
                 if original_left is not None:
-                    logger.debug("Applying color transfer to preview frame...")
-                    inpainted = apply_color_transfer(
-                        original_left.cpu(), inpainted.cpu()
-                    ).to(device)
+                    mode = params.get("color_transfer_mode", "safe")
+                    if mode == "legacy":
+                        logger.debug("Applying LEGACY color transfer to preview frame...")
+                        inpainted = apply_color_transfer(
+                            original_left.cpu(), inpainted.cpu()
+                        ).to(device)
+                    else:
+                        logger.debug("Applying SAFE color transfer to preview frame...")
+                        # Build a binary mask for stats from the *processed* mask.
+                        # processed_mask here is [1,H,W] after squeeze(0) a few lines above.
+                        mask_bin = (processed_mask > 0.5).float()
+
+                        stats_valid = _make_stats_mask(
+                            mask_bin,
+                            stats_region=params.get("ct_stats_region", "nonmask"),
+                            ring_width=int(params.get("ct_ring_width", 20)),
+                            use_gpu=False,
+                        )
+                                                # choose target stats frame
+                        if params.get("ct_target_stats_source", "warped") == "warped":
+                            tgt_stats_raw = right_eye_original
+                        else:
+                            tgt_stats_raw = inpainted
+                        
+                        # Ensure 3D [3,H,W] CPU tensors for safe CT
+                        tgt_stats_3 = (tgt_stats_raw[0].cpu() if tgt_stats_raw is not None and tgt_stats_raw.dim() == 4 else tgt_stats_raw.cpu())
+                        tgt_inp_3 = (inpainted[0].cpu() if inpainted.dim() == 4 else inpainted.cpu())
+                        
+                        # choose reference
+                        if params.get("ct_reference_source", "left") == "warped_filled":
+                            wf = (right_eye_original[0].cpu() if right_eye_original.dim() == 4 else right_eye_original.cpu())
+                            wf_u8 = (torch.clamp(wf, 0, 1).permute(1,2,0).numpy() * 255).astype(np.uint8)
+                            mm = (mask_bin.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                            ref_u8 = _telea_inpaint_rgb_uint8(wf_u8, mm, radius=3)
+                            ref = torch.from_numpy(ref_u8).permute(2,0,1).float() / 255.0
+                        else:
+                            ref = (original_left[0].cpu() if original_left.dim() == 4 else original_left.cpu())
+                        
+                        out_3 = apply_color_transfer_safe(
+                            ref,
+                            tgt_inp_3,
+                            black_thresh=float(params.get("ct_black_thresh", 8.0)),
+                            min_valid_ratio=float(params.get("ct_min_valid_ratio", 0.01)),
+                            min_valid=int(params.get("ct_min_valid", 300)),
+                            strength=float(params.get("ct_strength", 1.0)),
+                            clamp_scale_L=(
+                                float(params.get("ct_clamp_L_min", 0.7)),
+                                float(params.get("ct_clamp_L_max", 1.3)),
+                            ),
+                            clamp_scale_ab=(
+                                float(params.get("ct_clamp_ab_min", 0.6)),
+                                float(params.get("ct_clamp_ab_max", 1.4)),
+                            ),
+                            exclude_black_in_target=bool(params.get("ct_exclude_black_in_target", False)),
+                            source_valid_mask=stats_valid,
+                            target_valid_mask=stats_valid,
+                            target_stats_frame=tgt_stats_3,
+                        )
+                        out_3 = out_3.to(device)
+                        if inpainted.dim() == 4:
+                            inpainted = out_3.unsqueeze(0)
+                        else:
+                            inpainted = out_3
 
             blended_frame = (
                 right_eye_original * (1 - processed_mask) + inpainted * processed_mask
