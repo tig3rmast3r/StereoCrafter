@@ -871,6 +871,10 @@ class InpaintingGUI(ThemedTk):
 
     def _process_mask_pipeline_direct(self, current_processed_mask: torch.Tensor, base_video_name: str) -> torch.Tensor:
         """Apply the same mask binarization/morph/dilate/blur pipeline used in _prepare_video_inputs()."""
+        if not self.enable_post_inpainting_blend.get():
+            logger.debug("Mask preprocessing skipped because post-inpainting blend is disabled.")
+            return current_processed_mask.clamp(0.0, 1.0)
+
         # 1) Binarization (Direct Thresholding)
         try:
             binarize_threshold = float(self.mask_initial_threshold_var.get())
@@ -1238,66 +1242,7 @@ class InpaintingGUI(ThemedTk):
         logger.debug(f"Mask: Initial grayscale (OpenCV, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
         self._save_debug_image(current_processed_mask, "02_mask_initial_grayscale", base_video_name, 0)
 
-        # --- Granular Mask Processing Steps (Direct Binarization Pipeline) ---
-
-       # 1. Binarization (Direct Thresholding)
-        try:
-            binarize_threshold = float(self.mask_initial_threshold_var.get())
-            if binarize_threshold != 0.0: # Step enabled if threshold is not 0
-                if not (0.0 <= binarize_threshold <= 1.0):
-                    logger.warning(f"Invalid binarize threshold ({binarize_threshold}). Using default 0.1.")
-                    binarize_threshold = 0.1
-                current_processed_mask = (current_processed_mask > binarize_threshold).float()
-                logger.debug(f"Mask: Binarized (threshold > {binarize_threshold}, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
-                self._save_debug_image(current_processed_mask, "03_mask_binarized", base_video_name, 0)
-            else:
-                logger.debug("Mask: Binarization step skipped (threshold is 0). Using grayscale (might be unsuitable for subsequent steps).")
-        except ValueError:
-            logger.error(f"Invalid value for binarize threshold: {self.mask_initial_threshold_var.get()}. Falling back to 0.1.", exc_info=True)
-            current_processed_mask = (current_processed_mask > 0.1).float() # Fallback to default behavior if error
-
-        # 2. Morphological Closing
-        try:
-            morph_kernel_size = int(float(self.mask_morph_kernel_size_var.get()))
-            if morph_kernel_size != 0: # Step enabled if kernel size is not 0
-                current_processed_mask = self._apply_morphological_closing(current_processed_mask, morph_kernel_size)
-                logger.debug(f"Mask: After morphological closing (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
-                self._save_debug_image(current_processed_mask, "04_mask_morph_closed", base_video_name, 0)
-            else:
-                logger.debug("Mask: Morphological closing step skipped (kernel size is 0).")
-        except ValueError:
-            logger.error(f"Invalid value for mask_morph_kernel_size: {self.mask_morph_kernel_size_var.get()}. Skipping morphological closing.", exc_info=True)
-        except Exception as e:
-            logger.error(f"Error during morphological closing step: {e}. Skipping.", exc_info=True)
-
-        # 3. Mask Dilation
-        try:
-            dilate_kernel_size = int(self.mask_dilate_kernel_size_var.get())
-            if dilate_kernel_size != 0: # Step enabled if kernel size is not 0
-                current_processed_mask = self._apply_mask_dilation(current_processed_mask, dilate_kernel_size)
-                logger.debug(f"Mask: After dilation (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
-                self._save_debug_image(current_processed_mask, "05_mask_dilated", base_video_name, 0)
-            else:
-                logger.debug("Mask: Dilation step skipped (kernel size is 0).")
-        except ValueError:
-            logger.error(f"Invalid value for mask_dilate_kernel_size: {self.mask_dilate_kernel_size_var.get()}. Skipping dilation.", exc_info=True)
-        except Exception as e:
-            logger.error(f"Error during mask dilation step: {e}. Skipping.", exc_info=True)
-
-        # 4. Mask Gaussian Blur
-        try:
-            blur_kernel_size = int(self.mask_blur_kernel_size_var.get()) # NEW: Parse blur kernel size
-            if blur_kernel_size != 0: # Step enabled if kernel size is not 0
-                current_processed_mask = self._apply_gaussian_blur(current_processed_mask, blur_kernel_size) # NEW: Pass kernel size
-                logger.debug(f"Mask: After blur (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
-                self._save_debug_image(current_processed_mask, "06_mask_final_blurred", base_video_name, 0)
-            else:
-                logger.debug("Mask: Gaussian blur step skipped (kernel size is 0).")
-        except ValueError:
-            logger.error(f"Invalid value for mask_blur_kernel_size: {self.mask_blur_kernel_size_var.get()}. Skipping blur.", exc_info=True)
-        except Exception as e:
-            logger.error(f"Error during mask blur step: {e}. Skipping.", exc_info=True)
-        # --- END NEW Granular Mask Processing Steps ---
+        current_processed_mask = self._process_mask_pipeline_direct(current_processed_mask, base_video_name)
 
         # --- Store original-length, unpadded versions for post-blending ---
         frames_warpped_original_unpadded_normalized = frames_warpped_normalized[:num_frames_original].clone()
