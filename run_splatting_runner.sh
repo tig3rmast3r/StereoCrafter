@@ -7,8 +7,8 @@ set -euo pipefail
 
 PYTHON="${PYTHON:-python3}"
 
-RUNNER="batch_splatting_bm_runner.py"
-GUI_SCRIPT="splatting_bm_gui.py"
+RUNNER="batch_splatting_runner.py"
+GUI_SCRIPT="splatting_gui.py"
 
 INPUT_SOURCE_CLIPS="./work/seg/"
 INPUT_DEPTH_MAPS="./work/depthmap/upscaled/"

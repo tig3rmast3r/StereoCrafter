@@ -90,6 +90,30 @@ from dependency.video_previewer import VideoPreviewer
 GUI_VERSION = "26-02-07.1"
 
 
+# ----------------------------------------------------------------------
+# Staircase smoothing (post-warp) defaults (used by GUI + processing)
+# ----------------------------------------------------------------------
+SPLAT_STAIR_SMOOTH_ENABLED = False
+SPLAT_BLUR_KERNEL = 3
+SPLAT_STAIR_EDGE_X_OFFSET = 2
+SPLAT_STAIR_STRIP_PX = 3
+SPLAT_STAIR_STRENGTH = 1.0
+SPLAT_STAIR_DEBUG_MASK = False
+
+# ----------------------------------------------------------------------
+# Replace mask
+# Produces a binary mask (white=replace, black=keep) aligned to right view.
+# ----------------------------------------------------------------------
+REPLACE_MASK_ENABLED = True
+MASK_OUTPUT = "./work/mask/"
+REPLACE_MASK_SCALE = 1.0
+REPLACE_MASK_MIN_PX = 1
+REPLACE_MASK_MAX_PX = 32
+REPLACE_MASK_GAP_TOL = 0
+REPLACE_MASK_CODEC = "ffv1"
+REPLACE_MASK_DRAW_EDGE = True
+
+
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
 from core.splatting import FusionSidecarGenerator
 
@@ -105,6 +129,11 @@ from core.splatting import (
 )
 from core.splatting.depth_processing import DEPTH_VIS_TV10_BLACK_NORM, DEPTH_VIS_TV10_WHITE_NORM, _infer_depth_bit_depth
 from core.splatting.config_manager import ConfigManager
+from core.splatting.post_warp import (
+    apply_staircase_smooth_bgside,
+    build_replace_mask_edge_hole_run,
+    left_black_run_mask_from_rgb,
+)
 
 # [REFACTORED] Video I/O and Theme functions replaced with core imports
 from core.common import ThemeManager
@@ -278,6 +307,49 @@ class SplatterGUI(ThemedTk):
         self.auto_border_R_var = tk.StringVar(value=defaults["AUTO_BORDER_R"])
         self.preview_source_var = tk.StringVar(value="Splat Result")
         self.preview_size_var = tk.StringVar(value="75%")
+        self.splat_stair_smooth_enabled_var = tk.BooleanVar(
+            value=bool(self.app_config.get("splat_stair_smooth_enabled", SPLAT_STAIR_SMOOTH_ENABLED))
+        )
+        self.splat_blur_kernel_var = tk.StringVar(
+            value=str(self.app_config.get("splat_blur_kernel", SPLAT_BLUR_KERNEL))
+        )
+        self.splat_stair_edge_x_offset_var = tk.StringVar(
+            value=str(self.app_config.get("splat_stair_edge_x_offset", SPLAT_STAIR_EDGE_X_OFFSET))
+        )
+        self.splat_stair_strip_px_var = tk.StringVar(
+            value=str(self.app_config.get("splat_stair_strip_px", SPLAT_STAIR_STRIP_PX))
+        )
+        self.splat_stair_strength_var = tk.StringVar(
+            value=str(self.app_config.get("splat_stair_strength", SPLAT_STAIR_STRENGTH))
+        )
+        self.splat_stair_debug_mask_var = tk.BooleanVar(
+            value=bool(self.app_config.get("splat_stair_debug_mask", SPLAT_STAIR_DEBUG_MASK))
+        )
+        self.replace_mask_enabled_var = tk.BooleanVar(
+            value=bool(self.app_config.get("replace_mask_enabled", REPLACE_MASK_ENABLED))
+        )
+        self.replace_mask_dir_var = tk.StringVar(value=str(self.app_config.get("replace_mask_dir", MASK_OUTPUT)))
+        self.replace_mask_scale_var = tk.StringVar(
+            value=str(self.app_config.get("replace_mask_scale", REPLACE_MASK_SCALE))
+        )
+        self.replace_mask_min_px_var = tk.StringVar(
+            value=str(self.app_config.get("replace_mask_min_px", REPLACE_MASK_MIN_PX))
+        )
+        self.replace_mask_max_px_var = tk.StringVar(
+            value=str(self.app_config.get("replace_mask_max_px", REPLACE_MASK_MAX_PX))
+        )
+        self.replace_mask_gap_tol_var = tk.StringVar(
+            value=str(self.app_config.get("replace_mask_gap_tol", REPLACE_MASK_GAP_TOL))
+        )
+        self.replace_mask_codec_var = tk.StringVar(
+            value=str(self.app_config.get("replace_mask_codec", REPLACE_MASK_CODEC))
+        )
+        self.replace_mask_draw_edge_var = tk.BooleanVar(
+            value=bool(self.app_config.get("replace_mask_draw_edge", REPLACE_MASK_DRAW_EDGE))
+        )
+        self.replace_mask_preview_var = tk.BooleanVar(
+            value=bool(self.app_config.get("replace_mask_preview", False))
+        )
 
         # --- NEW Sync from ConfigManager ---
         self.config_manager.sync_to_tk_vars(self.__dict__)
@@ -524,6 +596,75 @@ class SplatterGUI(ThemedTk):
             return float(val)
         except (ValueError, TypeError, tk.TclError):
             return default
+
+    def _get_staircase_settings(self) -> dict:
+        """Parse staircase-smoothing controls with safe defaults."""
+        try:
+            kernel = int(float(self.splat_blur_kernel_var.get()))
+        except Exception:
+            kernel = int(SPLAT_BLUR_KERNEL)
+        if kernel not in (3, 5, 7, 9):
+            kernel = min((3, 5, 7, 9), key=lambda k: abs(k - kernel))
+
+        try:
+            edge_off = int(float(self.splat_stair_edge_x_offset_var.get()))
+        except Exception:
+            edge_off = int(SPLAT_STAIR_EDGE_X_OFFSET)
+
+        try:
+            strip_px = int(float(self.splat_stair_strip_px_var.get()))
+        except Exception:
+            strip_px = int(SPLAT_STAIR_STRIP_PX)
+        strip_px = max(0, strip_px)
+
+        try:
+            strength = float(self.splat_stair_strength_var.get())
+        except Exception:
+            strength = float(SPLAT_STAIR_STRENGTH)
+        strength = max(0.0, min(1.0, strength))
+
+        return {
+            "enabled": bool(self.splat_stair_smooth_enabled_var.get()),
+            "blur_kernel": int(kernel),
+            "edge_x_offset": int(edge_off),
+            "strip_px": int(strip_px),
+            "strength": float(strength),
+            "debug_mask": bool(self.splat_stair_debug_mask_var.get()),
+        }
+
+    def _get_replace_mask_settings(self) -> dict:
+        """Parse replace-mask controls with safe defaults."""
+        try:
+            scale = float(self.replace_mask_scale_var.get())
+        except Exception:
+            scale = float(REPLACE_MASK_SCALE)
+        if scale <= 0:
+            scale = float(REPLACE_MASK_SCALE)
+
+        def _safe_int(value_var: tk.Variable, fallback: int, minv: Optional[int] = None) -> int:
+            try:
+                v = int(float(value_var.get()))
+            except Exception:
+                v = int(fallback)
+            if minv is not None:
+                v = max(int(minv), v)
+            return v
+
+        codec = str(self.replace_mask_codec_var.get() or REPLACE_MASK_CODEC).strip().lower()
+        if codec not in {"ffv1", "huffyuv", "utvideo", "png"}:
+            codec = str(REPLACE_MASK_CODEC)
+
+        return {
+            "enabled": bool(self.replace_mask_enabled_var.get()),
+            "dir": str(self.replace_mask_dir_var.get() or "").strip(),
+            "scale": float(scale),
+            "min_px": _safe_int(self.replace_mask_min_px_var, REPLACE_MASK_MIN_PX, minv=1),
+            "max_px": _safe_int(self.replace_mask_max_px_var, REPLACE_MASK_MAX_PX, minv=1),
+            "gap_tol": _safe_int(self.replace_mask_gap_tol_var, REPLACE_MASK_GAP_TOL, minv=0),
+            "codec": codec,
+            "draw_edge": bool(self.replace_mask_draw_edge_var.get()),
+            "preview": bool(self.replace_mask_preview_var.get()),
+        }
 
     def _compute_clip_global_depth_stats(self, depth_map_path: str, chunk_size: int = 100) -> Tuple[float, float]:
         """
@@ -2005,6 +2146,156 @@ class SplatterGUI(ThemedTk):
         self.depth_pop_checkbox.pack(side="left", padx=(24, 0))
         self._create_hover_tooltip(self.depth_pop_checkbox, "depth_pop_readout")
 
+        stair_row = ttk.Frame(self.depth_all_settings_frame)
+        stair_row.grid(row=all_settings_row + 1, column=0, columnspan=3, sticky="ew", padx=5, pady=(2, 0))
+
+        self.splat_stair_enabled_checkbox = ttk.Checkbutton(
+            stair_row,
+            text="Stair Smooth",
+            variable=self.splat_stair_smooth_enabled_var,
+            command=self.on_slider_release,
+            takefocus=False,
+        )
+        self.splat_stair_enabled_checkbox.pack(side="left", padx=(0, 10))
+
+        ttk.Label(stair_row, text="Kernel:").pack(side="left")
+        self.splat_blur_kernel_combo = ttk.Combobox(
+            stair_row,
+            textvariable=self.splat_blur_kernel_var,
+            values=["3", "5", "7", "9"],
+            width=3,
+            state="readonly",
+        )
+        self.splat_blur_kernel_combo.pack(side="left", padx=(2, 10))
+        self.splat_blur_kernel_combo.bind("<<ComboboxSelected>>", self.on_slider_release)
+
+        ttk.Label(stair_row, text="X off:").pack(side="left")
+        self.splat_stair_edge_x_offset_entry = ttk.Entry(stair_row, textvariable=self.splat_stair_edge_x_offset_var, width=4)
+        self.splat_stair_edge_x_offset_entry.pack(side="left", padx=(2, 10))
+        self.splat_stair_edge_x_offset_entry.bind("<Return>", self.on_slider_release)
+        self.splat_stair_edge_x_offset_entry.bind("<FocusOut>", self.on_slider_release)
+
+        ttk.Label(stair_row, text="Strip:").pack(side="left")
+        self.splat_stair_strip_entry = ttk.Entry(stair_row, textvariable=self.splat_stair_strip_px_var, width=4)
+        self.splat_stair_strip_entry.pack(side="left", padx=(2, 10))
+        self.splat_stair_strip_entry.bind("<Return>", self.on_slider_release)
+        self.splat_stair_strip_entry.bind("<FocusOut>", self.on_slider_release)
+
+        ttk.Label(stair_row, text="Strength:").pack(side="left")
+        self.splat_stair_strength_entry = ttk.Entry(stair_row, textvariable=self.splat_stair_strength_var, width=4)
+        self.splat_stair_strength_entry.pack(side="left", padx=(2, 10))
+        self.splat_stair_strength_entry.bind("<Return>", self.on_slider_release)
+        self.splat_stair_strength_entry.bind("<FocusOut>", self.on_slider_release)
+
+        self.splat_stair_debug_checkbox = ttk.Checkbutton(
+            stair_row,
+            text="Mask",
+            variable=self.splat_stair_debug_mask_var,
+            command=self.on_slider_release,
+            takefocus=False,
+        )
+        self.splat_stair_debug_checkbox.pack(side="left")
+        all_settings_row += 1
+
+        rep_frame = ttk.Frame(self.depth_all_settings_frame)
+        rep_frame.grid(row=all_settings_row + 1, column=0, columnspan=3, sticky="ew", padx=5, pady=(2, 0))
+
+        rep_row1 = ttk.Frame(rep_frame)
+        rep_row1.pack(side="top", fill="x", expand=True)
+
+        self.replace_mask_enabled_checkbox = ttk.Checkbutton(
+            rep_row1,
+            text="ReplaceMask",
+            variable=self.replace_mask_enabled_var,
+            command=self.on_slider_release,
+            takefocus=False,
+        )
+        self.replace_mask_enabled_checkbox.pack(side="left", padx=(0, 8))
+
+        ttk.Label(rep_row1, text="Dir:").pack(side="left")
+        self.replace_mask_dir_entry = ttk.Entry(rep_row1, textvariable=self.replace_mask_dir_var, width=28)
+        self.replace_mask_dir_entry.pack(side="left", padx=(2, 2), fill="x", expand=True)
+        self.replace_mask_dir_entry.bind("<Return>", self.on_slider_release)
+        self.replace_mask_dir_entry.bind("<FocusOut>", self.on_slider_release)
+
+        self.btn_browse_replace_mask_dir = ttk.Button(
+            rep_row1,
+            text="...",
+            width=3,
+            command=lambda: self._browse_folder(self.replace_mask_dir_var),
+        )
+        self.btn_browse_replace_mask_dir.pack(side="left", padx=(2, 10))
+
+        ttk.Label(rep_row1, text="Codec:").pack(side="left")
+        self.replace_mask_codec_combo = ttk.Combobox(
+            rep_row1,
+            textvariable=self.replace_mask_codec_var,
+            values=["ffv1", "huffyuv", "utvideo", "png"],
+            width=8,
+            state="readonly",
+        )
+        self.replace_mask_codec_combo.pack(side="left", padx=(2, 10))
+        self.replace_mask_codec_combo.bind("<<ComboboxSelected>>", self.on_slider_release)
+
+        self.replace_mask_preview_checkbox = ttk.Checkbutton(
+            rep_row1,
+            text="Preview",
+            variable=self.replace_mask_preview_var,
+            command=self.on_slider_release,
+            takefocus=False,
+        )
+        self.replace_mask_preview_checkbox.pack(side="left")
+
+        rep_row2 = ttk.Frame(rep_frame)
+        rep_row2.pack(side="top", fill="x", expand=True, pady=(2, 0))
+
+        ttk.Label(rep_row2, text="Scale:").pack(side="left")
+        self.replace_mask_scale_entry = ttk.Entry(rep_row2, textvariable=self.replace_mask_scale_var, width=5)
+        self.replace_mask_scale_entry.pack(side="left", padx=(2, 10))
+        self.replace_mask_scale_entry.bind("<Return>", self.on_slider_release)
+        self.replace_mask_scale_entry.bind("<FocusOut>", self.on_slider_release)
+
+        ttk.Label(rep_row2, text="Min:").pack(side="left")
+        self.replace_mask_min_px_entry = ttk.Entry(rep_row2, textvariable=self.replace_mask_min_px_var, width=5)
+        self.replace_mask_min_px_entry.pack(side="left", padx=(2, 10))
+        self.replace_mask_min_px_entry.bind("<Return>", self.on_slider_release)
+        self.replace_mask_min_px_entry.bind("<FocusOut>", self.on_slider_release)
+
+        ttk.Label(rep_row2, text="Max:").pack(side="left")
+        self.replace_mask_max_px_entry = ttk.Entry(rep_row2, textvariable=self.replace_mask_max_px_var, width=5)
+        self.replace_mask_max_px_entry.pack(side="left", padx=(2, 10))
+        self.replace_mask_max_px_entry.bind("<Return>", self.on_slider_release)
+        self.replace_mask_max_px_entry.bind("<FocusOut>", self.on_slider_release)
+
+        ttk.Label(rep_row2, text="Gap:").pack(side="left")
+        self.replace_mask_gap_tol_entry = ttk.Entry(rep_row2, textvariable=self.replace_mask_gap_tol_var, width=5)
+        self.replace_mask_gap_tol_entry.pack(side="left", padx=(2, 10))
+        self.replace_mask_gap_tol_entry.bind("<Return>", self.on_slider_release)
+        self.replace_mask_gap_tol_entry.bind("<FocusOut>", self.on_slider_release)
+
+        self.replace_mask_draw_edge_checkbox = ttk.Checkbutton(
+            rep_row2,
+            text="Edge",
+            variable=self.replace_mask_draw_edge_var,
+            command=self.on_slider_release,
+            takefocus=False,
+        )
+        self.replace_mask_draw_edge_checkbox.pack(side="left")
+
+        self.widgets_to_disable.extend(
+            [
+                self.replace_mask_enabled_checkbox,
+                self.replace_mask_dir_entry,
+                self.btn_browse_replace_mask_dir,
+                self.replace_mask_codec_combo,
+                self.replace_mask_preview_checkbox,
+                self.replace_mask_scale_entry,
+                self.replace_mask_min_px_entry,
+                self.replace_mask_max_px_entry,
+                self.replace_mask_gap_tol_entry,
+                self.replace_mask_draw_edge_checkbox,
+            ]
+        )
         all_settings_row += 1
 
         current_row = 0  # Reset for next frame
@@ -2543,6 +2834,8 @@ class SplatterGUI(ThemedTk):
     def _get_processing_settings(self):
         """Converts current GUI configuration to BatchProcessor settings object."""
         config = self._get_current_config()
+        stair = self._get_staircase_settings()
+        rep = self._get_replace_mask_settings()
         return ProcessingSettings(
             input_source_clips=config["input_source_clips"],
             input_depth_maps=config["input_depth_maps"],
@@ -2587,6 +2880,20 @@ class SplatterGUI(ThemedTk):
                 getattr(self, "track_dp_total_true_on_render_var", None)
                 and self.track_dp_total_true_on_render_var.get()
             ),
+            stair_smooth_enabled=stair["enabled"],
+            stair_blur_kernel=stair["blur_kernel"],
+            stair_edge_x_offset=stair["edge_x_offset"],
+            stair_strip_px=stair["strip_px"],
+            stair_strength=stair["strength"],
+            stair_debug_mask=stair["debug_mask"],
+            replace_mask_enabled=rep["enabled"],
+            replace_mask_dir=rep["dir"],
+            replace_mask_scale=rep["scale"],
+            replace_mask_min_px=rep["min_px"],
+            replace_mask_max_px=rep["max_px"],
+            replace_mask_gap_tol=rep["gap_tol"],
+            replace_mask_codec=rep["codec"],
+            replace_mask_draw_edge=rep["draw_edge"],
         )
 
     def get_current_preview_settings(self) -> dict:
@@ -3772,12 +4079,39 @@ class SplatterGUI(ThemedTk):
         except Exception:
             pass
 
+        stair = self._get_staircase_settings()
+        rep = self._get_replace_mask_settings()
+        disp_out_winner = None
+
         with torch.no_grad():
             # Use the potentially resized Left Eye
             right_eye_tensor_raw, occlusion_mask = stereo_projector(left_eye_tensor_resized, disp_map_tensor)
-
-            # Apply low-res specific post-processing
             right_eye_tensor = right_eye_tensor_raw
+
+            needs_disp_winner = bool(stair["enabled"]) or bool(stair["debug_mask"]) or bool(rep["preview"])
+            if needs_disp_winner:
+                _maxd = float(actual_max_disp_pixels) if float(actual_max_disp_pixels) != 0.0 else 1.0
+                disp_norm_rgb = (disp_map_tensor / (2.0 * _maxd) + 0.5).clamp(0.0, 1.0).repeat(1, 3, 1, 1)
+                right_disp_norm_rgb, _ = stereo_projector(disp_norm_rgb, disp_map_tensor)
+                disp_out_winner = (right_disp_norm_rgb[:, 0:1] - 0.5) * (2.0 * _maxd)
+
+            if stair["enabled"] or stair["debug_mask"]:
+                right_eye_tensor = apply_staircase_smooth_bgside(
+                    right_eye_tensor,
+                    occlusion_mask,
+                    disp_out_winner if disp_out_winner is not None else disp_map_tensor,
+                    max_disp=float(actual_max_disp_pixels),
+                    edge_mode="pos",
+                    grad_thr_px=1.0,
+                    strip_px=int(stair["strip_px"]),
+                    strength=float(stair["strength"]),
+                    right_margin_extra=0,
+                    debug_mask=bool(stair["debug_mask"]),
+                    exclude_near_holes=True,
+                    hole_dilate=8,
+                    edge_x_offset=int(stair["edge_x_offset"]),
+                    blur_kernel=int(stair["blur_kernel"]),
+                )
 
         # --- Apply black borders for Anaglyph and Wigglegram ---
         if preview_source in ["Anaglyph 3D", "Dubois Anaglyph", "Optimized Anaglyph", "Wigglegram"]:
@@ -3884,6 +4218,33 @@ class SplatterGUI(ThemedTk):
             return None
         else:
             final_tensor = right_eye_tensor.cpu()
+
+        if rep["preview"]:
+            try:
+                with torch.no_grad():
+                    _maxd_rm = float(actual_max_disp_pixels) if float(actual_max_disp_pixels) != 0.0 else 1.0
+                    disp_out_winner_rm = disp_out_winner
+                    if disp_out_winner_rm is None:
+                        disp_norm_rgb_rm = (disp_map_tensor / (2.0 * _maxd_rm) + 0.5).clamp(0.0, 1.0).repeat(1, 3, 1, 1)
+                        right_disp_norm_rgb_rm, _ = stereo_projector(disp_norm_rgb_rm, disp_map_tensor)
+                        disp_out_winner_rm = (right_disp_norm_rgb_rm[:, 0:1] - 0.5) * (2.0 * _maxd_rm)
+
+                    rep_mask = build_replace_mask_edge_hole_run(
+                        disp_out_winner_rm,
+                        occlusion_mask > 0.5,
+                        grad_thr_px=1.0,
+                        min_px=int(rep["min_px"]),
+                        max_px=int(rep["max_px"]),
+                        scale=float(rep["scale"]),
+                        gap_tol=int(rep["gap_tol"]),
+                        draw_edge=bool(rep["draw_edge"]),
+                    )
+                    eff_max = max(1, int(round(int(rep["max_px"]) * float(rep["scale"]))))
+                    left_run = left_black_run_mask_from_rgb(right_eye_tensor, tol=0.0, max_px=eff_max)
+                    rep_mask = rep_mask | left_run
+                    final_tensor = rep_mask.float().repeat(1, 3, 1, 1).cpu()
+            except Exception as e:
+                logger.debug(f"Replace-mask preview build failed: {e}")
 
         pil_img = Image.fromarray((final_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8))
 

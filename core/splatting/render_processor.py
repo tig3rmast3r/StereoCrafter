@@ -9,6 +9,7 @@ import os
 import time
 import logging
 import queue
+import subprocess
 import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -25,6 +26,11 @@ from dependency.stereocrafter_util import (
 )
 from .forward_warp import ForwardWarpStereo
 from .depth_processing import process_depth_batch
+from .post_warp import (
+    apply_staircase_smooth_bgside,
+    build_replace_mask_edge_hole_run,
+    left_black_run_mask_from_rgb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +86,20 @@ class RenderProcessor:
         color_tags_mode: str = "Auto",
         is_test_mode: bool = False,
         test_target_frame_idx: Optional[int] = None,
+        stair_smooth_enabled: bool = False,
+        stair_blur_kernel: int = 3,
+        stair_edge_x_offset: int = 2,
+        stair_strip_px: int = 3,
+        stair_strength: float = 1.0,
+        stair_debug_mask: bool = False,
+        replace_mask_enabled: bool = False,
+        replace_mask_dir: str = "./work/mask/",
+        replace_mask_scale: float = 1.0,
+        replace_mask_min_px: int = 1,
+        replace_mask_max_px: int = 32,
+        replace_mask_gap_tol: int = 0,
+        replace_mask_codec: str = "ffv1",
+        replace_mask_draw_edge: bool = True,
     ) -> bool:
         """Core splatting render loop.
 
@@ -152,6 +172,17 @@ class RenderProcessor:
                 return False
             
             self._compare_encoding_flags(ffmpeg_process, task_name)
+
+        replace_mask_proc = None
+        replace_mask_path = None
+        if replace_mask_enabled and not is_test_mode:
+            out_dir = str(replace_mask_dir or "").strip()
+            if not out_dir:
+                out_dir = os.path.dirname(final_output_video_path)
+            os.makedirs(out_dir, exist_ok=True)
+            base_no_ext = os.path.splitext(os.path.basename(final_output_video_path))[0]
+            replace_mask_path = os.path.join(out_dir, f"{base_no_ext}_replace_mask.mkv")
+            logger.info(f"==> Replace-mask export enabled: {replace_mask_path}")
 
         max_expected_raw_value = self._get_max_expected_raw_depth(depth_stream_info)
         logger.debug(f"[DEPTH] Max expected raw value: {max_expected_raw_value}, assume_raw_input: {assume_raw_input}, global_depth_min: {global_depth_min:.2f}, global_depth_max: {global_depth_max:.2f}")
@@ -263,7 +294,68 @@ class RenderProcessor:
                     max_disp=max_disp,
                     zero_disparity_anchor_val=zero_disparity_anchor_val,
                     input_bias=input_bias,
+                    stair_smooth_enabled=stair_smooth_enabled,
+                    stair_blur_kernel=stair_blur_kernel,
+                    stair_edge_x_offset=stair_edge_x_offset,
+                    stair_strip_px=stair_strip_px,
+                    stair_strength=stair_strength,
+                    stair_debug_mask=stair_debug_mask,
+                    replace_mask_enabled=replace_mask_enabled,
+                    replace_mask_scale=replace_mask_scale,
+                    replace_mask_min_px=replace_mask_min_px,
+                    replace_mask_max_px=replace_mask_max_px,
+                    replace_mask_gap_tol=replace_mask_gap_tol,
+                    replace_mask_draw_edge=replace_mask_draw_edge,
                 )
+
+                if replace_mask_enabled and replace_mask_path:
+                    if replace_mask_proc is None:
+                        codec = str(replace_mask_codec or "ffv1").strip().lower()
+                        allowed_codecs = {"ffv1", "huffyuv", "utvideo", "png"}
+                        if codec not in allowed_codecs:
+                            codec = "ffv1"
+                        first_mask = None
+                        for _res in batch_processed_frames:
+                            if "replace_mask" in _res:
+                                first_mask = _res["replace_mask"]
+                                break
+                        if first_mask is not None:
+                            mask_h, mask_w = first_mask.shape[:2]
+                            cmd = [
+                                "ffmpeg",
+                                "-y",
+                                "-hide_banner",
+                                "-loglevel",
+                                "error",
+                                "-f",
+                                "rawvideo",
+                                "-pix_fmt",
+                                "gray",
+                                "-s",
+                                f"{mask_w}x{mask_h}",
+                                "-r",
+                                str(processed_fps),
+                                "-i",
+                                "-",
+                                "-an",
+                                "-c:v",
+                                codec,
+                                "-pix_fmt",
+                                "gray",
+                                replace_mask_path,
+                            ]
+                            replace_mask_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                            logger.info(f"==> Replace-mask ffmpeg started: {replace_mask_path}")
+                    if replace_mask_proc is not None and replace_mask_proc.stdin is not None:
+                        for _res in batch_processed_frames:
+                            mask_u8 = _res.get("replace_mask")
+                            if mask_u8 is None:
+                                continue
+                            if mask_u8.ndim == 3:
+                                mask_u8 = mask_u8[..., 0]
+                            if mask_u8.dtype != np.uint8:
+                                mask_u8 = mask_u8.astype(np.uint8)
+                            replace_mask_proc.stdin.write(mask_u8.tobytes())
 
                 # 5. Handle results (diag tests or FFmpeg write)
                 if is_test_mode and test_target_frame_idx is not None:
@@ -286,10 +378,23 @@ class RenderProcessor:
         finally:
             if ffmpeg_process:
                 try:
-                    ffmpeg_process.stdin.close()
+                    if ffmpeg_process.stdin:
+                        ffmpeg_process.stdin.close()
                     ffmpeg_process.wait(timeout=30)
                 except Exception as e:
                     logger.warning(f"Error closing FFmpeg: {e}")
+
+            if replace_mask_proc:
+                try:
+                    if replace_mask_proc.stdin:
+                        replace_mask_proc.stdin.close()
+                    replace_mask_proc.wait(timeout=30)
+                    if replace_mask_proc.returncode not in (0, None):
+                        logger.warning(
+                            f"Replace-mask ffmpeg exited with code {replace_mask_proc.returncode}: {replace_mask_path}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Error closing replace-mask FFmpeg: {e}")
             
             del stereo_projector
             release_cuda_memory()
@@ -376,6 +481,18 @@ class RenderProcessor:
         max_disp: float,
         zero_disparity_anchor_val: float,
         input_bias: float,
+        stair_smooth_enabled: bool = False,
+        stair_blur_kernel: int = 3,
+        stair_edge_x_offset: int = 2,
+        stair_strip_px: int = 3,
+        stair_strength: float = 1.0,
+        stair_debug_mask: bool = False,
+        replace_mask_enabled: bool = False,
+        replace_mask_scale: float = 1.0,
+        replace_mask_min_px: int = 1,
+        replace_mask_max_px: int = 32,
+        replace_mask_gap_tol: int = 0,
+        replace_mask_draw_edge: bool = True,
     ) -> List[np.ndarray]:
         """Process GPU splatting on normalized depth maps.
         
@@ -431,21 +548,71 @@ class RenderProcessor:
         # Forward warp
         with torch.no_grad():
             right_eye_raw, occlusion_mask = stereo_projector(source_tensor, disp_map)
+
+            disp_out_winner = None
+            if stair_smooth_enabled or stair_debug_mask or replace_mask_enabled:
+                maxd = float(actual_max_disp_pixels) if float(actual_max_disp_pixels) != 0.0 else 1.0
+                disp_norm_rgb = (disp_map / (2.0 * maxd) + 0.5).clamp(0.0, 1.0).repeat(1, 3, 1, 1)
+                right_disp_norm_rgb, _ = stereo_projector(disp_norm_rgb, disp_map)
+                disp_out_winner = (right_disp_norm_rgb[:, 0:1] - 0.5) * (2.0 * maxd)
+
+            right_eye_processed = right_eye_raw
+            if stair_smooth_enabled or stair_debug_mask:
+                right_eye_processed = apply_staircase_smooth_bgside(
+                    right_eye_processed,
+                    occlusion_mask,
+                    disp_out_winner if disp_out_winner is not None else disp_map,
+                    max_disp=float(actual_max_disp_pixels),
+                    edge_mode="pos",
+                    grad_thr_px=1.0,
+                    strip_px=int(stair_strip_px),
+                    strength=float(stair_strength),
+                    right_margin_extra=0,
+                    debug_mask=bool(stair_debug_mask),
+                    exclude_near_holes=True,
+                    hole_dilate=8,
+                    edge_x_offset=int(stair_edge_x_offset),
+                    blur_kernel=int(stair_blur_kernel),
+                )
+
+            replace_mask_u8 = None
+            if replace_mask_enabled and disp_out_winner is not None:
+                hole_bool = occlusion_mask > 0.5
+                rep = build_replace_mask_edge_hole_run(
+                    disp_out_winner,
+                    hole_bool,
+                    grad_thr_px=1.0,
+                    min_px=int(replace_mask_min_px),
+                    max_px=int(replace_mask_max_px),
+                    scale=float(replace_mask_scale),
+                    gap_tol=int(replace_mask_gap_tol),
+                    draw_edge=bool(replace_mask_draw_edge),
+                )
+                try:
+                    eff_max = max(1, int(round(int(replace_mask_max_px) * float(replace_mask_scale))))
+                    left_run = left_black_run_mask_from_rgb(right_eye_processed, tol=0.0, max_px=eff_max)
+                    rep = rep | left_run
+                except Exception:
+                    pass
+                replace_mask_u8 = (rep[:, 0].to(torch.uint8) * 255).contiguous().cpu().numpy()
         
         # CPU conversion
         left_cpu = source_tensor.cpu().numpy()
-        right_cpu = right_eye_raw.cpu().numpy()
+        right_cpu = right_eye_processed.cpu().numpy()
         occl_cpu = occlusion_mask.cpu().numpy()
         depth_cpu = depth_tensor.cpu().numpy()
 
         results = []
         for j in range(len(batch_video_numpy)):
-            results.append({
+            item = {
                 "left": (np.clip(left_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
                 "right": (np.clip(right_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
                 "occlusion": (np.clip(occl_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
                 "depth": (np.clip(depth_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
-            })
+            }
+            if replace_mask_u8 is not None:
+                item["replace_mask"] = replace_mask_u8[j]
+            results.append(item)
         return results
 
 
@@ -494,4 +661,3 @@ class RenderProcessor:
             top_row = np.concatenate([left, depth], axis=1)
             bot_row = np.concatenate([occlusion, right], axis=1)
             return np.concatenate([top_row, bot_row], axis=0)
-

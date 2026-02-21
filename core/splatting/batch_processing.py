@@ -138,6 +138,20 @@ class ProcessingSettings:
     sidecar_ext: str = ".fssidecar"
     sidecar_folder: str = ""
     track_dp_total_true_on_render: bool = False
+    stair_smooth_enabled: bool = False
+    stair_blur_kernel: int = 3
+    stair_edge_x_offset: int = 2
+    stair_strip_px: int = 3
+    stair_strength: float = 1.0
+    stair_debug_mask: bool = False
+    replace_mask_enabled: bool = False
+    replace_mask_dir: str = "./work/mask/"
+    replace_mask_scale: float = 1.0
+    replace_mask_min_px: int = 1
+    replace_mask_max_px: int = 32
+    replace_mask_gap_tol: int = 0
+    replace_mask_codec: str = "ffv1"
+    replace_mask_draw_edge: bool = True
 
 
 @dataclass
@@ -444,6 +458,20 @@ class BatchProcessor:
                 color_tags_mode=settings.color_tags_mode,
                 is_test_mode=settings.is_test_mode,
                 test_target_frame_idx=settings.test_target_frame_idx,
+                stair_smooth_enabled=settings.stair_smooth_enabled,
+                stair_blur_kernel=settings.stair_blur_kernel,
+                stair_edge_x_offset=settings.stair_edge_x_offset,
+                stair_strip_px=settings.stair_strip_px,
+                stair_strength=settings.stair_strength,
+                stair_debug_mask=settings.stair_debug_mask,
+                replace_mask_enabled=settings.replace_mask_enabled,
+                replace_mask_dir=settings.replace_mask_dir,
+                replace_mask_scale=settings.replace_mask_scale,
+                replace_mask_min_px=settings.replace_mask_min_px,
+                replace_mask_max_px=settings.replace_mask_max_px,
+                replace_mask_gap_tol=settings.replace_mask_gap_tol,
+                replace_mask_codec=settings.replace_mask_codec,
+                replace_mask_draw_edge=settings.replace_mask_draw_edge,
             )
             processed_count += 1
             # Note: RenderProcessor already puts 'processed' events, but maybe we should synchronize here?
