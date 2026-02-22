@@ -54,6 +54,8 @@ class HeadlessInpainting(igs.InpaintingGUI):
         output_folder: str,
         input_folder: str = "",
         hires_blend_folder: str = "",
+        replace_mask_folder: str = "",
+        use_replace_mask: bool = False,
         debug_mode: bool = False,
         enable_color_transfer: bool = True,
         enable_post_inpainting_blend: bool = False,
@@ -66,6 +68,8 @@ class HeadlessInpainting(igs.InpaintingGUI):
         self.output_folder_var = _Var(output_folder)
         self.input_folder_var = _Var(input_folder)
         self.hires_blend_folder_var = _Var(hires_blend_folder)
+        self.replace_mask_folder_var = _Var(replace_mask_folder)
+        self.use_replace_mask_var = _Var(bool(use_replace_mask))
 
         self.debug_mode_var = _Var(bool(debug_mode))
         self.enable_color_transfer = _Var(bool(enable_color_transfer))
@@ -410,6 +414,8 @@ def run_batch(args):
         output_folder=args.output_dir,
         input_folder=(args.input_dir or (os.path.dirname(args.input_video) if args.input_video else "")),
         hires_blend_folder=args.hires_blend_folder or "",
+        replace_mask_folder=args.replace_mask_folder or "",
+        use_replace_mask=args.use_replace_mask,
         debug_mode=args.debug,
         enable_color_transfer=not args.disable_color_transfer,
         enable_post_inpainting_blend=args.enable_post_inpainting_blend,
@@ -707,6 +713,10 @@ def main():
                    help="Matches GUI offload_type")
 
     p.add_argument("--hires_blend_folder", type=str, default="", help="Optional hires folder (same as GUI)")
+    p.add_argument("--use_replace_mask", action="store_true",
+                   help="Use external replace-mask files (<splatted_stem>_replace_mask.*). Fast-fail if missing/invalid.")
+    p.add_argument("--replace_mask_folder", type=str, default="",
+                   help="Folder containing external replace-mask files. Empty => input video folder.")
 
     p.add_argument("--mask_initial_threshold", type=float, default=0.3)
     p.add_argument("--mask_morph_kernel_size", type=float, default=0.0)
@@ -737,6 +747,8 @@ def main():
         args.input_video = os.path.abspath(args.input_video)
     if args.input_dir:
         args.input_dir = os.path.abspath(args.input_dir)
+    if args.replace_mask_folder:
+        args.replace_mask_folder = os.path.abspath(args.replace_mask_folder)
     args.output_dir = os.path.abspath(args.output_dir)
 
     return run_batch(args)

@@ -8,6 +8,8 @@ OUTPUT_DIR="./work/output/"
 GLOB="*.mp4"
 
 HIRES_BLEND_FOLDER=""                # optional
+REPLACE_MASK_FOLDER=""               # optional; folder with <splatted_stem>_replace_mask.*
+USE_REPLACE_MASK=0                   # 1 => use external replace mask (fast-fail if missing/mismatch)
 OFFLOAD_TYPE="model"                 # none | model | sequential
 
 TILE_NUM=2
@@ -63,6 +65,7 @@ CMD+=(--output_dir "$OUTPUT_DIR"
      --process_length "$PROCESS_LENGTH"
      --offload_type "$OFFLOAD_TYPE"
      --hires_blend_folder "$HIRES_BLEND_FOLDER"
+     --replace_mask_folder "$REPLACE_MASK_FOLDER"
      --mask_initial_threshold "$MASK_INITIAL_THRESHOLD"
      --mask_morph_kernel_size "$MASK_MORPH_KERNEL_SIZE"
      --mask_dilate_kernel_size "$MASK_DILATE_KERNEL_SIZE"
@@ -81,6 +84,7 @@ else
 fi
 
 if [[ "$ENABLE_POST_INPAINTING_BLEND" == "1" ]]; then CMD+=(--enable_post_inpainting_blend); fi
+if [[ "$USE_REPLACE_MASK" == "1" ]]; then CMD+=(--use_replace_mask); fi
 if [[ "$DISABLE_COLOR_TRANSFER" == "1" ]]; then CMD+=(--disable_color_transfer); fi
 if [[ "$SKIP_EXISTING" == "1" ]]; then CMD+=(--skip_existing); fi
 if [[ "$MOVE_FAILED" == "1" ]]; then CMD+=(--move_failed); fi

@@ -96,6 +96,8 @@ class InpaintingGUI(ThemedTk):
         self.process_length_var = tk.StringVar(value=str(self.app_config.get("process_length", -1)))
         self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "model"))
         self.hires_blend_folder_var = tk.StringVar(value=self.app_config.get("hires_blend_folder", "./output_splatted_hires"))
+        self.replace_mask_folder_var = tk.StringVar(value=self.app_config.get("replace_mask_folder", ""))
+        self.use_replace_mask_var = tk.BooleanVar(value=self.app_config.get("use_replace_mask", False))
         
         # --- NEW: Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
         self.mask_initial_threshold_var = tk.StringVar(value=str(self.app_config.get("mask_initial_threshold", 0.3)))
@@ -494,6 +496,11 @@ class InpaintingGUI(ThemedTk):
         if folder:
             self.hires_blend_folder_var.set(folder)
 
+    def _browse_replace_mask_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.replace_mask_folder_var.get() or self.input_folder_var.get())
+        if folder:
+            self.replace_mask_folder_var.set(folder)
+
     def _browse_input(self):
         folder = filedialog.askdirectory(initialdir=self.input_folder_var.get())
         if folder:
@@ -503,6 +510,72 @@ class InpaintingGUI(ThemedTk):
         folder = filedialog.askdirectory(initialdir=self.output_folder_var.get())
         if folder:
             self.output_folder_var.set(folder)
+
+    def _find_replace_mask_for_splatted(self, splatted_path: str, replace_mask_folder: str = "") -> Optional[str]:
+        """
+        Find external replace-mask video for a splatted input path.
+        Expected naming: <splatted_stem>_replace_mask.<ext>
+        """
+        folder = (replace_mask_folder or "").strip() or os.path.dirname(splatted_path)
+        stem, _ = os.path.splitext(os.path.basename(splatted_path))
+        candidates = [
+            f"{stem}_replace_mask.mkv",
+            f"{stem}_replace_mask.mp4",
+            f"{stem}_replace_mask.webm",
+            f"{stem}_replace_mask.avi",
+            f"{stem}_replace_mask.*",
+        ]
+        for cand in candidates:
+            hits = glob.glob(os.path.join(folder, cand))
+            if hits:
+                hits.sort()
+                return hits[0]
+        return None
+
+    def _replace_mask_numpy_to_gray(
+        self,
+        replace_mask_np: np.ndarray,
+        expected_h: int,
+        expected_w: int,
+        base_video_name: str,
+        frame_idx: int,
+    ) -> torch.Tensor:
+        """
+        Convert replace-mask numpy batch to torch grayscale mask [T,1,H,W] in [0,1].
+        Raises ValueError on shape mismatch (fast-fail behavior).
+        """
+        if replace_mask_np.ndim == 4:
+            # (T, H, W, C)
+            if replace_mask_np.shape[3] >= 3:
+                rm_gray = replace_mask_np[..., :3].mean(axis=3)
+            elif replace_mask_np.shape[3] == 1:
+                rm_gray = replace_mask_np[..., 0]
+            else:
+                raise ValueError(
+                    f"Replace mask has invalid channel count: {replace_mask_np.shape[3]} for {base_video_name}"
+                )
+        elif replace_mask_np.ndim == 3:
+            # (T, H, W)
+            rm_gray = replace_mask_np
+        else:
+            raise ValueError(
+                f"Replace mask has invalid rank {replace_mask_np.ndim} for {base_video_name}"
+            )
+
+        if rm_gray.shape[1] != expected_h or rm_gray.shape[2] != expected_w:
+            raise ValueError(
+                f"Replace mask size mismatch for {base_video_name}: "
+                f"got {rm_gray.shape[2]}x{rm_gray.shape[1]}, expected {expected_w}x{expected_h}"
+            )
+
+        rm_gray = rm_gray.astype(np.float32, copy=False)
+        if rm_gray.size > 0 and float(np.nanmax(rm_gray)) > 1.5:
+            rm_gray = rm_gray / 255.0
+        rm_gray = np.clip(rm_gray, 0.0, 1.0)
+
+        mask_gray = torch.from_numpy(rm_gray).float().unsqueeze(1)  # [T,1,H,W]
+        self._save_debug_image(mask_gray, "01_mask_raw_replace_gray", base_video_name, frame_idx)
+        return mask_gray
 
     def _create_1d_gaussian_kernel(self, kernel_size: int, sigma: float) -> torch.Tensor:
         """
@@ -841,6 +914,8 @@ class InpaintingGUI(ThemedTk):
             "input_folder": self.input_folder_var.get(),
             "output_folder": self.output_folder_var.get(),
             "hires_blend_folder": self.hires_blend_folder_var.get(),
+            "replace_mask_folder": self.replace_mask_folder_var.get(),
+            "use_replace_mask": self.use_replace_mask_var.get(),
 
             # GUI State Configurations
             "dark_mode_enabled": self.dark_mode_var.get(),
@@ -1026,6 +1101,7 @@ class InpaintingGUI(ThemedTk):
         base_video_name: str,
         is_dual_input: bool,
         tile_num: int,
+        replace_mask_vr: Optional[VideoReader] = None,
     ):
         """Read [start_idx:end_idx) from decord and prepare (warped_padded, mask_padded, warped_unpadded, mask_unpadded, left_unpadded)."""
         idxs = list(range(start_idx, end_idx))
@@ -1040,6 +1116,7 @@ class InpaintingGUI(ThemedTk):
             half_w = Wfull // 2
             frames_mask_raw = frames[:, :, :, :half_w]
             frames_warped_raw = frames[:, :, :, half_w:]
+            expected_mask_h, expected_mask_w = Hfull, half_w
         else:
             half_h = Hfull // 2
             half_w = Wfull // 2
@@ -1047,16 +1124,32 @@ class InpaintingGUI(ThemedTk):
             left_unpadded = frames[:, :, :half_h, :half_w].float() / 255.0
             frames_mask_raw = frames[:, :, half_h:, :half_w]
             frames_warped_raw = frames[:, :, half_h:, half_w:]
+            expected_mask_h, expected_mask_w = half_h, half_w
 
         # Warped normalized [0,1]
         warped_unpadded = frames_warped_raw.float() / 255.0
 
-        # Mask grayscale in torch (avoid per-frame OpenCV loop)
-        mask_rgb = frames_mask_raw.float() / 255.0  # [T,3,H,W]
-        if mask_rgb.shape[1] == 3:
-            mask_gray = (0.2989 * mask_rgb[:, 0:1] + 0.5870 * mask_rgb[:, 1:2] + 0.1140 * mask_rgb[:, 2:3]).clamp(0.0, 1.0)
+        if replace_mask_vr is not None:
+            try:
+                replace_mask_np = replace_mask_vr.get_batch(idxs).asnumpy()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to read replace mask for {base_video_name} frames {start_idx}-{end_idx}: {e}"
+                ) from e
+            mask_gray = self._replace_mask_numpy_to_gray(
+                replace_mask_np=replace_mask_np,
+                expected_h=expected_mask_h,
+                expected_w=expected_mask_w,
+                base_video_name=base_video_name,
+                frame_idx=start_idx,
+            )
         else:
-            mask_gray = mask_rgb[:, 0:1].clamp(0.0, 1.0)
+            # Mask grayscale in torch (avoid per-frame OpenCV loop)
+            mask_rgb = frames_mask_raw.float() / 255.0  # [T,3,H,W]
+            if mask_rgb.shape[1] == 3:
+                mask_gray = (0.2989 * mask_rgb[:, 0:1] + 0.5870 * mask_rgb[:, 1:2] + 0.1140 * mask_rgb[:, 2:3]).clamp(0.0, 1.0)
+            else:
+                mask_gray = mask_rgb[:, 0:1].clamp(0.0, 1.0)
 
         self._save_debug_image(mask_gray, "02_mask_initial_grayscale", base_video_name, start_idx)
 
@@ -1078,7 +1171,8 @@ class InpaintingGUI(ThemedTk):
         update_info_callback: Optional[Callable],
         overlap: int, # Needed for display, not logic here
         original_input_blend_strength: float,
-        process_length: int = -1
+        process_length: int = -1,
+        replace_mask_vr: Optional[VideoReader] = None,
     ) -> Optional[Tuple[
         torch.Tensor,                  # frames_warpped_padded
         torch.Tensor,                  # frames_mask_padded
@@ -1224,21 +1318,38 @@ class InpaintingGUI(ThemedTk):
         self._save_debug_image(frames_warpped_normalized, "01a_warped_input", base_video_name, 0)
         # --- END FIX ---
 
-        processed_masks_grayscale = []
-        for t in range(frames_mask_raw.shape[0]):
-            # --- FIX: Convert float tensor (0-1) to uint8 (0-255) for OpenCV ---
-            frame_np_rgb = frames_mask_raw[t].permute(1, 2, 0).cpu().numpy()
-            self._save_debug_image(frame_np_rgb.astype(np.float32) / 255.0, "01_mask_raw_color", base_video_name, t)
-            # --- END FIX ---
-            frame_np_gray = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2GRAY)
-            frame_tensor_gray = torch.from_numpy(frame_np_gray).float() / 255.0
-            # --- FIX: Ensure the grayscale tensor has a channel dimension ---
-            # The output from cvtColor is (H, W), but we need (1, H, W) for stacking.
-            if frame_tensor_gray.dim() == 2:
-                frame_tensor_gray = frame_tensor_gray.unsqueeze(0)
-            # --- END FIX ---
-            processed_masks_grayscale.append(frame_tensor_gray)
-        current_processed_mask = torch.stack(processed_masks_grayscale).to(frames_mask_raw.device)
+        if replace_mask_vr is not None:
+            idxs = list(range(num_frames_original))
+            try:
+                replace_mask_np = replace_mask_vr.get_batch(idxs).asnumpy()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to read replace mask for {base_video_name}: {e}"
+                ) from e
+
+            current_processed_mask = self._replace_mask_numpy_to_gray(
+                replace_mask_np=replace_mask_np,
+                expected_h=output_display_h,
+                expected_w=output_display_w,
+                base_video_name=base_video_name,
+                frame_idx=0,
+            ).to(frames_mask_raw.device)
+        else:
+            processed_masks_grayscale = []
+            for t in range(frames_mask_raw.shape[0]):
+                # --- FIX: Convert float tensor (0-1) to uint8 (0-255) for OpenCV ---
+                frame_np_rgb = frames_mask_raw[t].permute(1, 2, 0).cpu().numpy()
+                self._save_debug_image(frame_np_rgb.astype(np.float32) / 255.0, "01_mask_raw_color", base_video_name, t)
+                # --- END FIX ---
+                frame_np_gray = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2GRAY)
+                frame_tensor_gray = torch.from_numpy(frame_np_gray).float() / 255.0
+                # --- FIX: Ensure the grayscale tensor has a channel dimension ---
+                # The output from cvtColor is (H, W), but we need (1, H, W) for stacking.
+                if frame_tensor_gray.dim() == 2:
+                    frame_tensor_gray = frame_tensor_gray.unsqueeze(0)
+                # --- END FIX ---
+                processed_masks_grayscale.append(frame_tensor_gray)
+            current_processed_mask = torch.stack(processed_masks_grayscale).to(frames_mask_raw.device)
         logger.debug(f"Mask: Initial grayscale (OpenCV, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
         self._save_debug_image(current_processed_mask, "02_mask_initial_grayscale", base_video_name, 0)
 
@@ -1458,6 +1569,21 @@ class InpaintingGUI(ThemedTk):
         ttk.Entry(folder_frame, textvariable=self.hires_blend_folder_var, width=40).grid(row=current_row, column=1, padx=5, sticky="ew")
         ttk.Button(folder_frame, text="Browse", command=self._browse_hires_folder).grid(row=current_row, column=2, padx=5)
         current_row += 1
+
+        replace_mask_label = ttk.Label(folder_frame, text="Replace Mask Folder:")
+        replace_mask_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(replace_mask_label, "Optional external mask folder. Expects <splatted_stem>_replace_mask.*")
+        ttk.Entry(folder_frame, textvariable=self.replace_mask_folder_var, width=40).grid(row=current_row, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self._browse_replace_mask_folder).grid(row=current_row, column=2, padx=5)
+        current_row += 1
+
+        replace_mask_check = ttk.Checkbutton(
+            folder_frame,
+            text="Use Replace Mask (fast-fail if missing/mismatch)",
+            variable=self.use_replace_mask_var,
+        )
+        replace_mask_check.grid(row=current_row, column=1, columnspan=2, sticky="w", padx=5, pady=(0, 4))
+        current_row += 1
         
         # Output Folder
         output_label = ttk.Label(folder_frame, text="Output Folder:")
@@ -1672,6 +1798,25 @@ class InpaintingGUI(ThemedTk):
         base_video_name = os.path.basename(input_video_path)
         video_name_without_ext = os.path.splitext(base_video_name)[0]
         is_dual_input = video_name_without_ext.endswith("_splatted2")
+        replace_mask_vr = None
+        if self.use_replace_mask_var.get():
+            replace_mask_path = self._find_replace_mask_for_splatted(
+                splatted_path=input_video_path,
+                replace_mask_folder=self.replace_mask_folder_var.get(),
+            )
+            if not replace_mask_path:
+                logger.error(
+                    f"Replace mask enabled but not found for {base_video_name}. "
+                    f"Expected '{video_name_without_ext}_replace_mask.*' in "
+                    f"'{self.replace_mask_folder_var.get() or os.path.dirname(input_video_path)}'."
+                )
+                return False, None
+            try:
+                replace_mask_vr = VideoReader(replace_mask_path, ctx=cpu(0))
+                logger.info(f"Using external replace mask: {os.path.basename(replace_mask_path)}")
+            except Exception as e:
+                logger.error(f"Failed to open replace mask '{replace_mask_path}': {e}")
+                return False, None
 
         # 1. SETUP & HI-RES DETECTION
         # output_video_path is str (guaranteed), hires_data is dict (guaranteed)
@@ -1710,6 +1855,12 @@ class InpaintingGUI(ThemedTk):
             if stream_prep is None:
                 return False, None
             video_reader, num_frames_original, padded_H, padded_W, video_stream_info, fps = stream_prep
+            if replace_mask_vr is not None and len(replace_mask_vr) < num_frames_original:
+                logger.error(
+                    f"Replace mask has fewer frames than input for {base_video_name}: "
+                    f"mask={len(replace_mask_vr)} input={num_frames_original}"
+                )
+                return False, None
         else:
             prepared_inputs = self._prepare_video_inputs(
                 input_video_path=input_video_path,
@@ -1720,7 +1871,8 @@ class InpaintingGUI(ThemedTk):
                 update_info_callback=update_info_callback,
                 overlap=overlap,
                 original_input_blend_strength=original_input_blend_strength,
-                process_length=process_length
+                process_length=process_length,
+                replace_mask_vr=replace_mask_vr,
             )
 
             if prepared_inputs is None:
@@ -1777,13 +1929,20 @@ class InpaintingGUI(ThemedTk):
                 logger.info(f"Stopping processing of {input_video_path}")
                 return False, None
             
-            # --- CHUNK SLICING AND PADDING LOGIC (Remains from your last correct version) ---
-            end_idx_for_slicing = min(i + frames_chunk, total_frames_to_process_actual)
+            # --- CHUNK SLICING AND PADDING LOGIC ---
+            # Guard-frame policy:
+            # - Non-last chunk: read one extra REAL frame and discard it from output.
+            # - Last chunk: append one DUPLICATED tail frame and discard it from output.
+            next_chunk_start = i + stride
+            is_last_chunk = next_chunk_start >= total_frames_to_process_actual
+            guard_extra_real = 0 if is_last_chunk else 1
+            end_idx_for_slicing = min(i + frames_chunk + guard_extra_real, total_frames_to_process_actual)
             if stream_input_enabled:
                 (original_input_frames_slice, mask_frames_slice,
                  warped_unpadded_slice, mask_unpadded_slice, left_unpadded_slice) = self._read_and_prepare_chunk_from_reader(
                      vr=video_reader, start_idx=i, end_idx=end_idx_for_slicing,
-                     base_video_name=base_video_name, is_dual_input=is_dual_input, tile_num=tile_num
+                     base_video_name=base_video_name, is_dual_input=is_dual_input, tile_num=tile_num,
+                     replace_mask_vr=replace_mask_vr,
                  )
             else:
                 original_input_frames_slice = frames_warpped_padded[i:end_idx_for_slicing].clone()
@@ -1794,37 +1953,55 @@ class InpaintingGUI(ThemedTk):
                 if not is_dual_input and frames_left_original_cropped is not None:
                     left_unpadded_slice = frames_left_original_cropped[i:end_idx_for_slicing]
             actual_sliced_length = original_input_frames_slice.shape[0]
+            emit_sliced_length = actual_sliced_length if is_last_chunk else max(0, actual_sliced_length - 1)
+
+            if emit_sliced_length <= 0:
+                logger.debug(f"Skipping empty chunk at frame {i} (actual_sliced_length={actual_sliced_length}).")
+                break
 
             # Skip useless tail chunks that would contribute no new frames (only overlap)
-            if i > 0 and overlap > 0 and actual_sliced_length <= overlap:
+            if i > 0 and overlap > 0 and emit_sliced_length <= overlap:
                 logger.debug(
-                    f"Skipping tail chunk {i}-{end_idx_for_slicing} (length {actual_sliced_length}) "
+                    f"Skipping tail chunk {i}-{end_idx_for_slicing} (length {emit_sliced_length}) "
                     f"because it contributes no new frames (overlap={overlap})."
                 )
                 break
+
+            input_frames_to_pipeline = original_input_frames_slice
+            mask_frames_i = mask_frames_slice
+
+            if is_last_chunk:
+                logger.debug(
+                    f"Applying last-chunk guard duplication at frame {i} "
+                    f"(emit_sliced_length={emit_sliced_length})."
+                )
+                last_original_frame_warpped = input_frames_to_pipeline[-1:].clone()
+                last_original_frame_mask = mask_frames_i[-1:].clone()
+                input_frames_to_pipeline = torch.cat([input_frames_to_pipeline, last_original_frame_warpped], dim=0)
+                mask_frames_i = torch.cat([mask_frames_i, last_original_frame_mask], dim=0)
             
             padding_needed_for_pipeline_input = 0
             # Overlap-aware tail padding: ensure at least (overlap + 3) frames (and at least 6 total) for pipeline stability
             min_tail_frames = 3
             target_length = max(6, overlap + min_tail_frames)
-            if actual_sliced_length < target_length:
-                padding_needed_for_pipeline_input = target_length - actual_sliced_length
+            if input_frames_to_pipeline.shape[0] < target_length:
+                padding_needed_for_pipeline_input = target_length - input_frames_to_pipeline.shape[0]
                 logger.debug(
-                    f"End-of-video optimization: Short tail chunk ({actual_sliced_length} frames) "
+                    f"End-of-video optimization: Short tail chunk ({input_frames_to_pipeline.shape[0]} frames) "
                     f"padded to minimum {target_length} (overlap={overlap})."
                 )
 
             if padding_needed_for_pipeline_input > 0:
-                logger.debug(f"Dynamically padding input for chunk starting at frame {i}: {actual_sliced_length} frames sliced, {padding_needed_for_pipeline_input} frames needed.")
-                last_original_frame_warpped = original_input_frames_slice[-1:].clone()
-                last_original_frame_mask = mask_frames_slice[-1:].clone()
+                logger.debug(
+                    f"Dynamically padding input for chunk starting at frame {i}: "
+                    f"{input_frames_to_pipeline.shape[0]} input frames, +{padding_needed_for_pipeline_input}."
+                )
+                last_original_frame_warpped = input_frames_to_pipeline[-1:].clone()
+                last_original_frame_mask = mask_frames_i[-1:].clone()
                 repeated_warpped = last_original_frame_warpped.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
                 repeated_mask = last_original_frame_mask.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
-                input_frames_to_pipeline = torch.cat([original_input_frames_slice, repeated_warpped], dim=0)
-                mask_frames_i = torch.cat([mask_frames_slice, repeated_mask], dim=0)
-            else:
-                input_frames_to_pipeline = original_input_frames_slice
-                mask_frames_i = mask_frames_slice
+                input_frames_to_pipeline = torch.cat([input_frames_to_pipeline, repeated_warpped], dim=0)
+                mask_frames_i = torch.cat([mask_frames_i, repeated_mask], dim=0)
             # --- END CHUNK SLICING AND PADDING LOGIC ---
 
             # --- INPUT-LEVEL BLENDING (Remains from your last correct version) ---
@@ -1871,15 +2048,15 @@ class InpaintingGUI(ThemedTk):
 
             # Emit only the "new" frames
             if i == 0:
-                chunk_new = current_chunk_generated[:actual_sliced_length]
+                chunk_new = current_chunk_generated[:emit_sliced_length]
                 global_start = 0
             else:
-                chunk_new = current_chunk_generated[overlap:actual_sliced_length]
+                chunk_new = current_chunk_generated[overlap:emit_sliced_length]
                 global_start = i + overlap
 
             # Keep only overlap tail (on CPU) for the next chunk to reduce VRAM growth
-            if overlap > 0 and current_chunk_generated.shape[0] >= overlap:
-                previous_chunk_output_frames = current_chunk_generated[-overlap:].detach().cpu()
+            if overlap > 0 and emit_sliced_length >= overlap:
+                previous_chunk_output_frames = current_chunk_generated[emit_sliced_length - overlap:emit_sliced_length].detach().cpu()
             else:
                 previous_chunk_output_frames = None
 
@@ -1967,19 +2144,19 @@ class InpaintingGUI(ThemedTk):
             else:
                 # Non-streaming fallback: accumulate results in RAM
                 if i == 0:
-                    new_frames = current_chunk_generated[:actual_sliced_length]
                     offset = 0
                 else:
-                    new_frames = current_chunk_generated[overlap:actual_sliced_length]
                     offset = overlap
+                new_frames = chunk_new
                 results.append(new_frames)
 
                 # If we used streaming input (no full preload), also accumulate matching original tensors
                 if stream_input_enabled and warped_unpadded_accum is not None and mask_unpadded_accum is not None:
-                    warped_unpadded_accum.append(warped_unpadded_slice[offset:actual_sliced_length].detach().cpu())
-                    mask_unpadded_accum.append(mask_unpadded_slice[offset:actual_sliced_length].detach().cpu())
+                    end_off = offset + new_frames.shape[0]
+                    warped_unpadded_accum.append(warped_unpadded_slice[offset:end_off].detach().cpu())
+                    mask_unpadded_accum.append(mask_unpadded_slice[offset:end_off].detach().cpu())
                     if (not is_dual_input) and left_unpadded_accum is not None and left_unpadded_slice is not None:
-                        left_unpadded_accum.append(left_unpadded_slice[offset:actual_sliced_length].detach().cpu())
+                        left_unpadded_accum.append(left_unpadded_slice[offset:end_off].detach().cpu())
         # If streaming encoding is enabled, we have already written frames to ffmpeg as they were generated.
         if stream_encode_enabled and ffmpeg_p is not None and video_only_path is not None:
             if update_info_callback:
@@ -2113,6 +2290,9 @@ class InpaintingGUI(ThemedTk):
         # Set default values for all your configuration variables
         self.input_folder_var.set("./output_splatted")
         self.output_folder_var.set("./completed_output")
+        self.hires_blend_folder_var.set("./output_splatted_hires")
+        self.replace_mask_folder_var.set("")
+        self.use_replace_mask_var.set(False)
         self.num_inference_steps_var.set("5")
         self.tile_num_var.set("2")
         self.frames_chunk_var.set("23")
