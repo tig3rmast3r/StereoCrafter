@@ -164,6 +164,10 @@ def _resume_state_path(output_dir: str) -> str:
     return os.path.join(output_dir, ".resume_state.json")
 
 
+def _current_job_state_path(output_dir: str) -> str:
+    return os.path.join(output_dir, ".current_job.json")
+
+
 def _load_resume_state(path: str):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -185,6 +189,79 @@ def _clear_resume_state(path: str):
             os.remove(path)
     except Exception:
         pass
+
+
+def _load_current_job_state(path: str):
+    return _load_resume_state(path)
+
+
+def _save_current_job_state(path: str, data: dict):
+    _save_resume_state(path, data)
+
+
+def _clear_current_job_state(path: str):
+    _clear_resume_state(path)
+
+
+def _recover_interrupted_current_job(current_job_path: str):
+    state = _load_current_job_state(current_job_path)
+    if not isinstance(state, dict):
+        return
+
+    input_path = str(state.get("input_path") or "")
+    output_path = str(state.get("output_path") or "")
+    process_length = state.get("process_length", -1)
+
+    try:
+        if not output_path:
+            print("[RECOVER] current-job marker found without output_path. Clearing marker.")
+            return
+
+        if not os.path.exists(output_path):
+            print(f"[RECOVER] current-job output not found (already absent): {output_path}")
+            return
+
+        if input_path and os.path.exists(input_path):
+            if _is_output_complete(input_path, output_path, process_length):
+                print(f"[RECOVER] interrupted job output already complete, keeping: {output_path}")
+            else:
+                print(f"[RECOVER] interrupted job output incomplete, deleting: {output_path}")
+                _cleanup_outputs(output_path)
+            return
+
+        # Input missing: fallback to basic readability probe.
+        try:
+            _ffprobe_nb_frames(output_path)
+            print(f"[RECOVER] input missing for interrupted job; output decodes, keeping: {output_path}")
+        except Exception:
+            print(f"[RECOVER] interrupted job output unreadable, deleting: {output_path}")
+            _cleanup_outputs(output_path)
+    finally:
+        _clear_current_job_state(current_job_path)
+
+
+def _default_stop_marker_path(output_dir: str) -> str:
+    return os.path.join(output_dir, ".stop_after_current")
+
+
+def _stop_marker_exists(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        return os.path.exists(path)
+    except Exception:
+        return False
+
+
+def _clear_stop_marker(path: str) -> None:
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
 
 def _is_output_complete(input_path: str, output_path: str, process_length: int, tol_frames: int = 1) -> bool:
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
@@ -314,12 +391,12 @@ def _steps_from_sharpness(val: float) -> int:
     except Exception:
         return 5
 
-    if v <= 500:
+    if v <= 1000:
         return 5
 
-    steps = 5 + int(v // 500)
-    if steps > 12:
-        steps = 12
+    steps = 5 + int(v // 1000)
+    if steps > 11:
+        steps = 11
     return steps
 
 
@@ -363,6 +440,12 @@ def run_batch(args):
         return 2
 
     resume_path = _resume_state_path(args.output_dir)
+    current_job_path = _current_job_state_path(args.output_dir)
+    stop_marker_path = (
+        os.path.abspath(args.stop_marker)
+        if args.stop_marker
+        else _default_stop_marker_path(args.output_dir)
+    )
     resume = _load_resume_state(resume_path)
     fast_resume_start = None
     if resume and resume.get("mode") == "planned_restart":
@@ -374,6 +457,9 @@ def run_batch(args):
             _clear_resume_state(resume_path)
     elif resume:
         _clear_resume_state(resume_path)
+
+    # Recover interrupted per-file work from a previous crash/restart.
+    _recover_interrupted_current_job(current_job_path)
 
 
     stop_event = threading.Event()
@@ -403,6 +489,11 @@ def run_batch(args):
         chunk_map = {}
 
     for idx, video_path in enumerate(videos, 1):
+        if _stop_marker_exists(stop_marker_path):
+            print(f"[STOP] marker detected, stopping before next file: {stop_marker_path}")
+            _clear_stop_marker(stop_marker_path)
+            return 0
+
         i = idx - 1
         if fast_resume_start is not None and i < fast_resume_start:
             continue
@@ -411,6 +502,7 @@ def run_batch(args):
 
         out_path = ""
         hi_res_input_path = None
+        current_job_marked = False
 
         try:
             # Ensure GUI vars are consistent for hi-res matching safety checks
@@ -492,6 +584,16 @@ def run_batch(args):
                 print(f"[WARN] overlap={overlap} >= frames_chunk={frames_chunk}; clamping overlap -> {new_overlap}")
                 overlap = new_overlap
 
+            _save_current_job_state(current_job_path, {
+                "mode": "active_job",
+                "idx": idx,
+                "total": len(videos),
+                "input_path": video_path,
+                "output_path": out_path,
+                "process_length": int(args.process_length),
+            })
+            current_job_marked = True
+
             completed, hi_res_input_path = runner.process_single_video(
                 pipeline=pipeline,
                 input_video_path=video_path,
@@ -510,6 +612,9 @@ def run_batch(args):
 
 
             if completed and _is_output_complete(video_path, out_path, args.process_length):
+                if current_job_marked:
+                    _clear_current_job_state(current_job_path)
+                    current_job_marked = False
                 print(f"[OK] wrote: {out_path}")
                 processed_this_run += 1
                 if fast_resume_start is not None and i >= fast_resume_start:
@@ -534,12 +639,18 @@ def run_batch(args):
                 else:
                     print("[FAIL] processing returned incomplete")
                 _cleanup_outputs(out_path)
+                if current_job_marked:
+                    _clear_current_job_state(current_job_path)
+                    current_job_marked = False
                 if args.move_failed:
                     _move_to_subfolder(video_path, args.failed_subdir)
 
         except torch.OutOfMemoryError as e:
             print(f"[OOM] {e}")
             _cleanup_outputs(out_path)
+            if current_job_marked:
+                _clear_current_job_state(current_job_path)
+                current_job_marked = False
             if args.move_failed:
                 _move_to_subfolder(video_path, args.failed_subdir)
             _safe_release_cuda()
@@ -547,6 +658,9 @@ def run_batch(args):
         except Exception as e:
             print(f"[ERR] {type(e).__name__}: {e}")
             _cleanup_outputs(out_path)
+            if current_job_marked:
+                _clear_current_job_state(current_job_path)
+                current_job_marked = False
             if args.move_failed:
                 _move_to_subfolder(video_path, args.failed_subdir)
             _safe_release_cuda()
@@ -554,6 +668,10 @@ def run_batch(args):
         finally:
             # keep VRAM stable between files
             _safe_release_cuda()
+
+    if _stop_marker_exists(stop_marker_path):
+        print(f"[STOP] marker detected at end of batch, clearing: {stop_marker_path}")
+        _clear_stop_marker(stop_marker_path)
 
     return 0
 
@@ -605,6 +723,12 @@ def main():
     p.add_argument("--finished_subdir", type=str, default="finished")
 
     p.add_argument("--debug", action="store_true", help="Enable debug image saving (uses GUI code)")
+    p.add_argument(
+        "--stop_marker",
+        type=str,
+        default="",
+        help="Path to a marker file used for graceful stop-after-current-file behavior",
+    )
 
     args = p.parse_args()
 

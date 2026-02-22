@@ -42,6 +42,7 @@ FINISHED_SUBDIR="finished"
 DISABLE_DYNAMIC_CHUNK=1
 
 DEBUG=0
+STOP_MARKER="${STOP_MARKER:-$OUTPUT_DIR/.stop_after_current}"
 
 # --- runner command (edit freely) ---
 CMD=(python3 batch_inpainting_runner.py)
@@ -53,6 +54,7 @@ else
 fi
 
 CMD+=(--output_dir "$OUTPUT_DIR"
+     --stop_marker "$STOP_MARKER"
      --tile_num "$TILE_NUM"
      --frames_chunk "$FRAMES_CHUNK"
      --overlap "$OVERLAP"
@@ -88,21 +90,176 @@ if [[ "$DISABLE_DYNAMIC_CHUNK" == "1" ]]; then CMD+=(--no_dynamic_chunk); fi
 
 echo "[CMD] ${CMD[*]}"
 
-# Retry on ANY non-zero exit (ignore specific crash codes).
+# Retry/Watchdog policy.
 # Set MAX_RETRIES=0 for infinite restarts.
-MAX_RETRIES=0
+MAX_RETRIES="${MAX_RETRIES:-0}"
+RETRY_SLEEP_SEC="${RETRY_SLEEP_SEC:-2}"
+WATCHDOG_POLL_SEC="${WATCHDOG_POLL_SEC:-20}"
+WATCHDOG_IDLE_SEC="${WATCHDOG_IDLE_SEC:-600}"
+WATCHDOG_TERM_GRACE_SEC="${WATCHDOG_TERM_GRACE_SEC:-15}"
+STOP_REQUESTED=0
+FORCE_STOP=0
+CURRENT_CHILD_PID=""
+CURRENT_CHILD_PGID=""
+
+if [[ -f "$STOP_MARKER" ]]; then
+  echo "[INFO] removing stale stop marker: $STOP_MARKER"
+  rm -f -- "$STOP_MARKER" || true
+fi
+
+_latest_mp4_in_output() {
+  find "$OUTPUT_DIR" -type f -name "*.mp4" -printf '%T@|%p\n' 2>/dev/null \
+    | sort -t'|' -nr -k1,1 \
+    | head -n1 \
+    | cut -d'|' -f2-
+}
+
+_ffprobe_quick_ok() {
+  local f="$1"
+  [[ -n "$f" && -f "$f" ]] || return 1
+  ffprobe -v error \
+    -select_streams v:0 \
+    -show_entries stream=codec_name,width,height,avg_frame_rate,nb_frames \
+    -show_entries format=duration \
+    -of default=nw=1:nk=1 \
+    "$f" >/dev/null 2>&1
+}
+
+_cleanup_unreadable_latest_output() {
+  local last_mp4
+  last_mp4="$(_latest_mp4_in_output)"
+  if [[ -z "$last_mp4" ]]; then
+    echo "[CHECK] no output mp4 found to validate."
+    return 0
+  fi
+
+  if _ffprobe_quick_ok "$last_mp4"; then
+    echo "[CHECK] last output readable: $last_mp4"
+    return 0
+  fi
+
+  echo "[CHECK] last output unreadable, removing before restart: $last_mp4"
+  rm -f -- "$last_mp4" || true
+}
+
+_latest_output_token() {
+  find "$OUTPUT_DIR" -type f -printf '%T@|%s|%p\n' 2>/dev/null \
+    | sort -t'|' -nr -k1,1 \
+    | head -n1
+}
+
+_kill_child_group() {
+  local pid="$1"
+  local pgid="$2"
+
+  if [[ -n "$pgid" ]]; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+  else
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
+
+  sleep "$WATCHDOG_TERM_GRACE_SEC"
+
+  if kill -0 "$pid" 2>/dev/null; then
+    if [[ -n "$pgid" ]]; then
+      kill -KILL -- "-$pgid" 2>/dev/null || true
+    fi
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+}
+
+_request_stop_signal() {
+  if [[ "$STOP_REQUESTED" -eq 0 ]]; then
+    STOP_REQUESTED=1
+    local marker_dir
+    marker_dir="$(dirname "$STOP_MARKER")"
+    mkdir -p "$marker_dir" 2>/dev/null || true
+    : > "$STOP_MARKER"
+    echo "[STOP] graceful stop requested. Finishing current file before exiting."
+    return 0
+  fi
+
+  FORCE_STOP=1
+  echo "[STOP] force stop requested. Killing runner immediately."
+  if [[ -n "$CURRENT_CHILD_PID" ]] && kill -0 "$CURRENT_CHILD_PID" 2>/dev/null; then
+    _kill_child_group "$CURRENT_CHILD_PID" "$CURRENT_CHILD_PGID"
+  fi
+}
+
+trap _request_stop_signal INT TERM
+
+_run_once_with_watchdog() {
+  local child_pid child_pgid
+  local last_token current_token
+  local last_activity_ts now idle_sec
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${CMD[@]}" &
+  else
+    "${CMD[@]}" &
+  fi
+  child_pid=$!
+  child_pgid="$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d '[:space:]')"
+  CURRENT_CHILD_PID="$child_pid"
+  CURRENT_CHILD_PGID="$child_pgid"
+
+  last_token="$(_latest_output_token)"
+  last_activity_ts=$(date +%s)
+
+  while kill -0 "$child_pid" 2>/dev/null; do
+    sleep "$WATCHDOG_POLL_SEC"
+
+    current_token="$(_latest_output_token)"
+    if [[ -n "$current_token" && "$current_token" != "$last_token" ]]; then
+      last_token="$current_token"
+      last_activity_ts=$(date +%s)
+      continue
+    fi
+
+    now=$(date +%s)
+    idle_sec=$((now - last_activity_ts))
+    if (( idle_sec >= WATCHDOG_IDLE_SEC )); then
+      echo "[WATCHDOG] no output activity for ${idle_sec}s. Killing runner pid=$child_pid pgid=${child_pgid:-n/a}"
+      _kill_child_group "$child_pid" "$child_pgid"
+      wait "$child_pid" 2>/dev/null || true
+      CURRENT_CHILD_PID=""
+      CURRENT_CHILD_PGID=""
+      return 124
+    fi
+  done
+
+  wait "$child_pid"
+  local rc=$?
+  CURRENT_CHILD_PID=""
+  CURRENT_CHILD_PGID=""
+  return $rc
+}
+
 attempt=1
 while true; do
   set +e
-  "${CMD[@]}"
+  _run_once_with_watchdog
   rc=$?
   set -e
+
+  if [[ "$FORCE_STOP" -eq 1 ]]; then
+    rm -f -- "$STOP_MARKER" 2>/dev/null || true
+    echo "[STOP] forced stop completed."
+    exit 130
+  fi
+
+  if [[ "$STOP_REQUESTED" -eq 1 ]]; then
+    rm -f -- "$STOP_MARKER" 2>/dev/null || true
+    echo "[STOP] graceful stop completed (last rc=$rc)."
+    exit 0
+  fi
 
   if [[ $rc -eq 0 ]]; then
     exit 0
   fi
 
   echo "[WARN] runner exited with rc=$rc (attempt $attempt). Restarting..."
+  _cleanup_unreadable_latest_output
 
   if [[ $MAX_RETRIES -ne 0 && $attempt -ge $MAX_RETRIES ]]; then
     echo "[ERR] reached MAX_RETRIES=$MAX_RETRIES, giving up (last rc=$rc)"
@@ -110,5 +267,5 @@ while true; do
   fi
 
   attempt=$((attempt+1))
-  sleep 2
+  sleep "$RETRY_SLEEP_SEC"
 done
