@@ -12,6 +12,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from decord import VideoReader, cpu
+from dependency.stereocrafter_util import get_video_stream_info
+from .depth_processing import (
+    DEPTH_VIS_TV10_BLACK_NORM,
+    DEPTH_VIS_TV10_WHITE_NORM,
+    _infer_depth_bit_depth,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +75,91 @@ class ConvergenceEstimatorWrapper:
             True if model is loaded, False otherwise
         """
         return self._estimator is not None and self._estimator.model is not None
+
+    @staticmethod
+    def _to_gray_depth(frame_raw: np.ndarray) -> np.ndarray:
+        """Convert a decoded depth frame to a single-channel array."""
+        if frame_raw.ndim == 2:
+            return frame_raw
+        if frame_raw.ndim == 3:
+            return frame_raw.mean(axis=2)
+        raise ValueError(f"Unsupported depth frame shape: {frame_raw.shape}")
+
+    @staticmethod
+    def _normalize_depth_to_0_1(depth: np.ndarray) -> np.ndarray:
+        """Normalize depth arrays from common code ranges to 0..1."""
+        d = depth.astype(np.float32, copy=False)
+        if d.size == 0:
+            return d
+        maxv = float(np.max(d))
+        if maxv > 1.5:
+            if maxv <= 256.0:
+                d = d / 255.0
+            elif maxv <= 1024.0:
+                d = d / 1023.0
+            elif maxv <= 4096.0:
+                d = d / 4095.0
+            elif maxv <= 65536.0:
+                d = d / 65535.0
+            else:
+                d = d / maxv
+        return np.clip(d, 0.0, 1.0)
+
+    @staticmethod
+    def _build_convergence_grid(conv_min: float, conv_max: float, conv_step: float) -> np.ndarray:
+        """Build a clipped, stable convergence search grid in [0,1]."""
+        mn = max(0.0, min(1.0, float(conv_min)))
+        mx = max(0.0, min(1.0, float(conv_max)))
+        if mx < mn:
+            mn, mx = mx, mn
+        st = max(1e-6, float(conv_step))
+        vals = np.arange(mn, mx + 0.5 * st, st, dtype=np.float32)
+        vals = np.clip(vals, 0.0, 1.0)
+        vals = np.unique(np.round(vals, 6))
+        return vals
+
+    @staticmethod
+    def _edge_runs_from_dest(dest_x: np.ndarray, width: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute left/right uncovered run lengths from destination x map."""
+        x0 = np.floor(dest_x).astype(np.int32)
+        x1 = x0 + 1
+
+        valid0 = (x0 >= 0) & (x0 < width)
+        valid1 = (x1 >= 0) & (x1 < width)
+
+        first0 = np.min(np.where(valid0, x0, width), axis=1)
+        first1 = np.min(np.where(valid1, x1, width), axis=1)
+        first = np.minimum(first0, first1)
+
+        last0 = np.max(np.where(valid0, x0, -1), axis=1)
+        last1 = np.max(np.where(valid1, x1, -1), axis=1)
+        last = np.maximum(last0, last1)
+
+        has_occ = (first < width) & (last >= 0)
+        left_run = np.where(has_occ, first, width).astype(np.int32)
+        right_run = np.where(has_occ, (width - 1 - last), width).astype(np.int32)
+        return left_run, right_run
+
+    @staticmethod
+    def _get_tv_compensation(depth_path: str, mode: str = "auto") -> float:
+        """Return disparity compensation for 10-bit TV-range depth maps."""
+        mode_l = str(mode).strip().lower()
+        if mode_l == "off":
+            return 1.0
+        tv_factor = 1.0 / (DEPTH_VIS_TV10_WHITE_NORM - DEPTH_VIS_TV10_BLACK_NORM)
+        if mode_l == "on":
+            return tv_factor
+        if mode_l != "auto":
+            return 1.0
+        try:
+            info = get_video_stream_info(depth_path)
+            if _infer_depth_bit_depth(info) > 8:
+                color_range = str((info or {}).get("color_range", "unknown")).lower()
+                if color_range == "tv":
+                    return tv_factor
+        except Exception:
+            pass
+        return 1.0
 
     def estimate_convergence(
         self,
@@ -217,7 +308,108 @@ class ConvergenceEstimatorWrapper:
             self.logger.error(
                 f"Auto convergence determination failed: {e}", exc_info=True
             )
-            return fallback_value, fallback_value
+            return fallback_value, fallback_value, None, None
+
+    def estimate_min_borders_convergence(
+        self,
+        depth_path: str,
+        process_length: int = -1,
+        sample_stride: int = 6,
+        max_disp: float = 20.0,
+        gamma: float = 1.0,
+        fallback_value: float = 0.5,
+        stop_event: Optional[threading.Event] = None,
+        conv_min: float = 0.0,
+        conv_max: float = 1.0,
+        conv_step: float = 0.02,
+        tv_comp_mode: str = "auto",
+    ) -> float:
+        """Estimate convergence by minimizing mean border void area.
+
+        Uses only the depth video and the same disparity mapping used by render:
+            disp_px = (depth - conv) * 2 * actual_max_disp_pixels
+        """
+        if not depth_path or not os.path.exists(depth_path):
+            self.logger.warning("MinBorders: depth path not found, using fallback.")
+            return float(fallback_value)
+
+        conv_values = self._build_convergence_grid(conv_min, conv_max, conv_step)
+        if conv_values.size == 0:
+            self.logger.warning("MinBorders: empty convergence grid, using fallback.")
+            return float(fallback_value)
+
+        try:
+            vr_depth = VideoReader(depth_path, ctx=cpu(0))
+            total_frames = len(vr_depth)
+            if total_frames <= 0:
+                self.logger.warning("MinBorders: empty depth video, using fallback.")
+                return float(fallback_value)
+
+            if process_length > 0:
+                total_frames = min(total_frames, int(process_length))
+            step = max(1, int(sample_stride))
+            indices = list(range(0, total_frames, step))
+            if not indices:
+                indices = [0]
+
+            first = vr_depth[0].asnumpy()
+            h, w = first.shape[:2]
+            width = int(w)
+            height = int(h)
+            if width <= 0 or height <= 0:
+                return float(fallback_value)
+
+            tv_comp = self._get_tv_compensation(depth_path, mode=tv_comp_mode)
+            actual_max_disp_pixels = (float(max_disp) / 20.0 / 100.0) * float(width) * float(tv_comp)
+            shift_scale = 2.0 * float(actual_max_disp_pixels)
+            x_coords = np.arange(width, dtype=np.float32)[None, :]
+            frame_area = float(width * height)
+            gamma_f = float(gamma) if gamma else 1.0
+
+            sums_left = np.zeros(len(conv_values), dtype=np.float64)
+            sums_right = np.zeros(len(conv_values), dtype=np.float64)
+            sampled = 0
+
+            self.logger.info(
+                f"MinBorders: Sampling {len(indices)} frames from {os.path.basename(depth_path)}..."
+            )
+
+            for idx in indices:
+                if stop_event and stop_event.is_set():
+                    self.logger.info("MinBorders scan cancelled.")
+                    break
+
+                raw = vr_depth[int(idx)].asnumpy()
+                depth = self._to_gray_depth(raw)
+                depth = self._normalize_depth_to_0_1(depth)
+                if gamma_f != 1.0:
+                    depth = 1.0 - np.power((1.0 - depth).clip(0.0, 1.0), gamma_f)
+                    depth = np.clip(depth, 0.0, 1.0)
+
+                dest_base = x_coords + (depth * shift_scale)
+                for k, conv in enumerate(conv_values):
+                    dest_x = dest_base - (float(conv) * shift_scale)
+                    left_run, right_run = self._edge_runs_from_dest(dest_x, width=width)
+                    sums_left[k] += float(np.sum(left_run))
+                    sums_right[k] += float(np.sum(right_run))
+
+                sampled += 1
+
+            if sampled <= 0:
+                return float(fallback_value)
+
+            mean_total = (sums_left + sums_right) / float(sampled)
+            best_idx = int(np.argmin(mean_total))
+            best_conv = float(conv_values[best_idx])
+            best_void_pct = float((mean_total[best_idx] / frame_area) * 100.0) if frame_area > 0.0 else 0.0
+            self.logger.info(
+                f"MinBorders result: conv={best_conv:.3f}, mean_void={best_void_pct:.3f}%"
+            )
+            return best_conv
+
+        except Exception as e:
+            self.logger.error(f"MinBorders convergence failed: {e}", exc_info=True)
+            return float(fallback_value)
 
     def calculate_hybrid_value(
         self, avg_value: float, peak_value: float
@@ -253,6 +445,8 @@ class ConvergenceEstimatorWrapper:
             return cache.get("Average", fallback)
         elif mode == "Peak":
             return cache.get("Peak", fallback)
+        elif mode == "MinBorders":
+            return cache.get("MinBorders", fallback)
         elif mode == "Hybrid":
             avg = cache.get("Average", fallback)
             peak = cache.get("Peak", fallback)

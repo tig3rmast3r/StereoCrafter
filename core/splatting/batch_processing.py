@@ -89,7 +89,7 @@ class ProcessingSettings:
         depth_blur_size_y: Vertical blur size
         depth_dilate_left: Left eye dilation
         depth_blur_left: Left eye blur
-        auto_convergence_mode: Auto-convergence mode ("Off", "Average", "Peak", "Hybrid")
+        auto_convergence_mode: Auto-convergence mode ("Off", "Average", "Peak", "Hybrid", "MinBorders")
         enable_sidecar_gamma: Whether sidecar controls gamma
         enable_sidecar_blur_dilate: Whether sidecar controls blur/dilate
         single_finished_source_folder: Optional finished folder for single-file mode
@@ -201,6 +201,7 @@ class BatchProcessor:
 
         self.sidecar_manager = sidecar_manager
         self.logger = logging.getLogger(__name__)
+        self._convergence_estimator: Optional[ConvergenceEstimatorWrapper] = None
 
     def setup_batch_processing(
         self, settings: ProcessingSettings
@@ -407,8 +408,18 @@ class BatchProcessor:
 
         # 2. Auto-Convergence
         conv_val = vid_settings["convergence_plane"]
-        if settings.auto_convergence_mode != "Off" and vid_settings["anchor_source"] != "Sidecar":
-            conv_val = self._handle_auto_convergence(video_path, vid_settings["actual_depth_map_path"], settings)
+        if (
+            settings.auto_convergence_mode != "Off"
+            and vid_settings.get("anchor_source") not in ("Sidecar", "CSV")
+        ):
+            conv_val = self._handle_auto_convergence(
+                video_path=video_path,
+                depth_path=vid_settings["actual_depth_map_path"],
+                settings=settings,
+                fallback_anchor=float(vid_settings["convergence_plane"]),
+                max_disp=float(vid_settings["max_disparity_percentage"]),
+                gamma=float(vid_settings["depth_gamma"]),
+            )
 
         # 3. Tasks Loop
         tasks = self.get_defined_tasks(settings)
@@ -535,10 +546,74 @@ class BatchProcessor:
         if os.path.exists(c_npz): return c_npz
         return None
 
-    def _handle_auto_convergence(self, video_path: str, depth_path: str, settings: ProcessingSettings) -> float:
-        # Placeholder for auto-convergence integration
-        # In actual implementation, initialize ConvergenceEstimatorWrapper and call estimate_convergence
-        return settings.zero_disparity_anchor
+    def _handle_auto_convergence(
+        self,
+        video_path: str,
+        depth_path: str,
+        settings: ProcessingSettings,
+        fallback_anchor: float,
+        max_disp: float,
+        gamma: float,
+    ) -> float:
+        """Compute per-clip auto-convergence according to selected mode."""
+        mode = str(settings.auto_convergence_mode or "Off")
+        if mode == "Off":
+            return float(fallback_anchor)
+        if mode == "Manual":
+            return float(fallback_anchor)
+
+        try:
+            if self._convergence_estimator is None:
+                self._convergence_estimator = ConvergenceEstimatorWrapper()
+            estimator = self._convergence_estimator
+
+            if mode == "MinBorders":
+                conv_val = estimator.estimate_min_borders_convergence(
+                    depth_path=depth_path,
+                    process_length=int(settings.process_length),
+                    sample_stride=6,
+                    max_disp=float(max_disp),
+                    gamma=float(gamma),
+                    fallback_value=float(fallback_anchor),
+                    stop_event=self.stop_event,
+                )
+                self.logger.info(
+                    f"Auto-Convergence[{mode}] {os.path.basename(video_path)} -> {float(conv_val):.4f}"
+                )
+                return float(conv_val)
+
+            avg_val, peak_val, _, _ = estimator.estimate_convergence(
+                rgb_path=video_path,
+                depth_path=depth_path,
+                process_length=int(settings.process_length),
+                gamma=float(gamma),
+                fallback_value=float(fallback_anchor),
+                stop_event=self.stop_event,
+                scan_borders=False,
+            )
+
+            if mode == "Average":
+                conv_val = float(avg_val)
+            elif mode == "Peak":
+                conv_val = float(peak_val)
+            elif mode == "Hybrid":
+                conv_val = float(0.5 * (avg_val + peak_val))
+            else:
+                # Unsupported mode in batch path: fail closed to fallback
+                self.logger.warning(
+                    f"Unsupported auto-convergence mode '{mode}', using fallback."
+                )
+                conv_val = float(fallback_anchor)
+
+            self.logger.info(
+                f"Auto-Convergence[{mode}] {os.path.basename(video_path)} -> {conv_val:.4f}"
+            )
+            return conv_val
+        except Exception as e:
+            self.logger.error(
+                f"Auto-convergence failed for {os.path.basename(video_path)}: {e}"
+            )
+            return float(fallback_anchor)
 
     def _initialize_readers(self, video_path: str, depth_path: str, settings: ProcessingSettings, task: ProcessingTask) -> Optional[dict]:
         try:

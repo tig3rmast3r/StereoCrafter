@@ -225,7 +225,7 @@ class SplatterGUI(ThemedTk):
         self._auto_pass_csv_path = None
 
         # --- NEW CACHE AND STATE ---
-        self._auto_conv_cache = {"Average": None, "Peak": None}
+        self._auto_conv_cache = {"Average": None, "Peak": None, "MinBorders": None}
         self._auto_conv_cached_path = None
         self._is_auto_conv_running = False
         self._preview_debounce_timer = None
@@ -496,22 +496,48 @@ class SplatterGUI(ThemedTk):
         # 3. Handle window geometry adjustment
         self.update_idletasks()
 
-    def _auto_converge_worker(self, rgb_path, depth_map_path, process_length, batch_size, fallback_value, gamma, mode):
+    def _auto_converge_worker(
+        self,
+        rgb_path,
+        depth_map_path,
+        process_length,
+        batch_size,
+        fallback_value,
+        gamma,
+        mode,
+        max_disp,
+    ):
         """Worker thread for running the Auto-Convergence calculation."""
 
-        # Use the extracted ConvergenceEstimatorWrapper
-        # Now returns average, peak, and (NEW) max_edge_l, max_edge_r
-        res = self.convergence_estimator.estimate_convergence(
-            rgb_path=rgb_path,
-            depth_path=depth_map_path,
-            process_length=int(process_length),
-            gamma=float(gamma),
-            fallback_value=float(fallback_value),
-            stop_event=self.stop_event,
-            scan_borders=True,  # Enable combined scan
-        )
+        new_anchor_avg = float(fallback_value)
+        new_anchor_peak = float(fallback_value)
+        new_anchor_min = None
+        max_edge_l = None
+        max_edge_r = None
 
-        new_anchor_avg, new_anchor_peak, max_edge_l, max_edge_r = res
+        if mode == "MinBorders":
+            new_anchor_min = self.convergence_estimator.estimate_min_borders_convergence(
+                depth_path=depth_map_path,
+                process_length=int(process_length),
+                sample_stride=6,
+                max_disp=float(max_disp),
+                gamma=float(gamma),
+                fallback_value=float(fallback_value),
+                stop_event=self.stop_event,
+            )
+        else:
+            # Use the extracted ConvergenceEstimatorWrapper.
+            # Returns average, peak, and optional edge maxima.
+            res = self.convergence_estimator.estimate_convergence(
+                rgb_path=rgb_path,
+                depth_path=depth_map_path,
+                process_length=int(process_length),
+                gamma=float(gamma),
+                fallback_value=float(fallback_value),
+                stop_event=self.stop_event,
+                scan_borders=True,  # Enable combined scan
+            )
+            new_anchor_avg, new_anchor_peak, max_edge_l, max_edge_r = res
 
         # Determine TV range compensation for border calculation
         # This is fast if called here (usually cached or metadata-only)
@@ -527,14 +553,21 @@ class SplatterGUI(ThemedTk):
         self.after(
             0,
             lambda: self._complete_auto_converge_update(
-                new_anchor_avg, new_anchor_peak, max_edge_l, max_edge_r, fallback_value, mode, depth_map_path
+                new_anchor_avg,
+                new_anchor_peak,
+                max_edge_l,
+                max_edge_r,
+                fallback_value,
+                mode,
+                depth_map_path,
+                new_anchor_min,
             ),
         )
 
     def _on_clip_navigate_with_cache_clear(self):
         """Callback for clip navigation that clears auto-convergence cache and saves sidecar."""
         # Clear auto-convergence cache when switching clips
-        self._auto_conv_cache = {"Average": None, "Peak": None}
+        self._auto_conv_cache = {"Average": None, "Peak": None, "MinBorders": None}
         self._auto_conv_cached_path = None
 
         # Clear processing information display
@@ -1272,6 +1305,7 @@ class SplatterGUI(ThemedTk):
         fallback_value: float,
         mode: str,
         depth_map_path: str = None,
+        new_anchor_minborders: Optional[float] = None,
     ):
         """
         Safely updates the GUI and preview after Auto-Convergence worker is done.
@@ -1290,11 +1324,19 @@ class SplatterGUI(ThemedTk):
             self.stop_event.clear()
             return
 
-        # Check if EITHER calculation yielded a result different from the fallback
-        if new_anchor_avg != fallback_value or new_anchor_peak != fallback_value:
-            # 1. Cache BOTH results
-            self._auto_conv_cache["Average"] = new_anchor_avg
-            self._auto_conv_cache["Peak"] = new_anchor_peak
+        # Check if any calculation yielded a result different from fallback.
+        has_avg_peak = (new_anchor_avg != fallback_value) or (new_anchor_peak != fallback_value)
+        has_min_borders = (
+            new_anchor_minborders is not None
+            and float(new_anchor_minborders) != float(fallback_value)
+        )
+        if has_avg_peak or has_min_borders:
+            # 1. Cache computed results for this clip.
+            if has_avg_peak:
+                self._auto_conv_cache["Average"] = new_anchor_avg
+                self._auto_conv_cache["Peak"] = new_anchor_peak
+            if has_min_borders:
+                self._auto_conv_cache["MinBorders"] = float(new_anchor_minborders)
 
             # CRITICAL: Store the path of the file that was just scanned
             current_index = self.previewer.current_video_index
@@ -1307,6 +1349,12 @@ class SplatterGUI(ThemedTk):
                 anchor_to_apply = new_anchor_avg
             elif mode == "Peak":
                 anchor_to_apply = new_anchor_peak
+            elif mode == "MinBorders":
+                anchor_to_apply = (
+                    float(new_anchor_minborders)
+                    if new_anchor_minborders is not None
+                    else fallback_value
+                )
             elif mode == "Hybrid":
                 anchor_to_apply = (new_anchor_avg + new_anchor_peak) / 2.0
             else:
@@ -1367,15 +1415,24 @@ class SplatterGUI(ThemedTk):
                 except Exception as e:
                     logger.error(f"Error calculating auto-borders in combined scan: {e}")
 
+            cache_parts = []
+            if self._auto_conv_cache.get("Average") is not None:
+                cache_parts.append(f"Avg {float(self._auto_conv_cache['Average']):.2f}")
+            if self._auto_conv_cache.get("Peak") is not None:
+                cache_parts.append(f"Peak {float(self._auto_conv_cache['Peak']):.2f}")
+            if self._auto_conv_cache.get("MinBorders") is not None:
+                cache_parts.append(f"MinBorders {float(self._auto_conv_cache['MinBorders']):.2f}")
+            cache_txt = ", ".join(cache_parts) if cache_parts else "No cache"
+
             self.status_label.config(
-                text=f"Auto-Converge: Avg Cached at {new_anchor_avg:.2f}, Peak Cached at {new_anchor_peak:.2f}. Applied: {mode} ({anchor_to_apply:.2f}){border_info_text}"
+                text=f"Auto-Converge: Cached {cache_txt}. Applied: {mode} ({anchor_to_apply:.2f}){border_info_text}"
             )
 
             # 4. Immediately trigger a preview update to show the change
             self.on_slider_release(None)
 
         else:
-            # Calculation failed (both returned fallback)
+            # Calculation failed (returned fallback)
             self.status_label.config(
                 text=f"Auto-Converge: Failed to find a valid anchor. Value remains {fallback_value:.2f}"
             )
@@ -1757,7 +1814,7 @@ class SplatterGUI(ThemedTk):
         self.auto_convergence_combo = ttk.Combobox(
             self.auto_conv_frame,
             textvariable=self.auto_convergence_mode_var,
-            values=["Off", "Manual", "Average", "Peak", "Hybrid"],
+            values=["Off", "Manual", "Average", "Peak", "Hybrid", "MinBorders"],
             state="readonly",
             width=10,
         )
@@ -2661,6 +2718,42 @@ class SplatterGUI(ThemedTk):
             logger.error(f"Auto-convergence determination failed for {os.path.basename(rgb_path)}: {e}")
             return fallback_anchor, fallback_anchor
 
+    def _determine_min_borders_convergence(
+        self,
+        depth_path: str,
+        process_length: int,
+        fallback_anchor: float,
+        max_disp: float,
+        gamma: float = 1.0,
+    ) -> float:
+        """Determine convergence via border-void minimization using depth only."""
+        if not hasattr(self, "convergence_estimator") or self.convergence_estimator is None:
+            logger.error("Convergence estimator not initialized")
+            return float(fallback_anchor)
+
+        try:
+            logger.debug(
+                f"_determine_min_borders_convergence: Processing {os.path.basename(depth_path)}..."
+            )
+            conv_val = self.convergence_estimator.estimate_min_borders_convergence(
+                depth_path=depth_path,
+                process_length=int(process_length),
+                sample_stride=6,
+                max_disp=float(max_disp),
+                gamma=float(gamma),
+                fallback_value=float(fallback_anchor),
+                stop_event=self.stop_event,
+            )
+            logger.debug(
+                f"_determine_min_borders_convergence: {os.path.basename(depth_path)} -> conv={float(conv_val):.4f}"
+            )
+            return float(conv_val)
+        except Exception as e:
+            logger.error(
+                f"MinBorders auto-convergence failed for {os.path.basename(depth_path)}: {e}"
+            )
+            return float(fallback_anchor)
+
     def exit_app(self):
         """Handles application exit, including stopping the processing thread."""
         self._save_config()
@@ -3518,7 +3611,7 @@ class SplatterGUI(ThemedTk):
         mode = self.auto_convergence_mode_var.get()
 
         if mode == "Off":
-            # self._auto_conv_cache = {"Average": None, "Peak": None} # Clear cache on Off
+            # self._auto_conv_cache = {"Average": None, "Peak": None, "MinBorders": None} # Clear cache on Off
             return
 
         if self._is_auto_conv_running:
@@ -4527,7 +4620,8 @@ class SplatterGUI(ThemedTk):
             if force_run:  # This should be caught by the cache check, but as a safeguard
                 return
             messagebox.showwarning(
-                "Auto-Converge Preview", "Auto-Convergence Mode must be set to 'Average', 'Peak', or 'Hybrid'."
+                "Auto-Converge Preview",
+                "Auto-Convergence Mode must be set to 'Average', 'Peak', 'Hybrid', or 'MinBorders'.",
             )
             return
 
@@ -4537,15 +4631,17 @@ class SplatterGUI(ThemedTk):
 
         # --- NEW: Check if calculation is already done for a different mode/path ---
         is_path_mismatch = single_depth_path != self._auto_conv_cached_path
-        is_cache_complete = (self._auto_conv_cache["Average"] is not None) or (
-            self._auto_conv_cache["Peak"] is not None
+        is_cache_complete = (
+            self._auto_conv_cache["Average"] is not None
+            or self._auto_conv_cache["Peak"] is not None
+            or self._auto_conv_cache["MinBorders"] is not None
         )
 
         # If running from the combo box (force_run=True) AND the cache is incomplete
         # BUT the path has changed, we must clear the cache and run.
         if force_run and is_path_mismatch and is_cache_complete:
             logger.info("New video detected. Clearing Auto-Converge cache.")
-            self._auto_conv_cache = {"Average": None, "Peak": None}
+            self._auto_conv_cache = {"Average": None, "Peak": None, "MinBorders": None}
             self._auto_conv_cached_path = None
 
         # Validate paths
@@ -4567,6 +4663,7 @@ class SplatterGUI(ThemedTk):
             current_anchor = float(self.zero_disparity_anchor_var.get())
             process_length = int(self.process_length_var.get())
             batch_size = int(self.batch_size_var.get())
+            max_disp = self._safe_float(self.max_disp_var, 20.0)
             gamma = self._safe_float(self.depth_gamma_var, 1.0)
         except ValueError as e:
             messagebox.showerror("Auto-Converge Preview Error", f"Invalid input for slider or process length: {e}")
@@ -4585,7 +4682,16 @@ class SplatterGUI(ThemedTk):
 
         # Start the calculation in a new thread
         # Start the calculation in a new thread
-        worker_args = (single_video_path, single_depth_path, process_length, batch_size, current_anchor, gamma, mode)
+        worker_args = (
+            single_video_path,
+            single_depth_path,
+            process_length,
+            batch_size,
+            current_anchor,
+            gamma,
+            mode,
+            max_disp,
+        )
         self.auto_converge_thread = threading.Thread(target=self._auto_converge_worker, args=worker_args)
         self.auto_converge_thread.start()
 
@@ -5456,7 +5562,7 @@ class SplatterGUI(ThemedTk):
             # 1) AUTO-CONVERGENCE / MANUAL
             # "Off" - preserve existing sidecar values (don't touch convergence_plane or max_disparity)
             # "Manual" - write current slider values
-            # "Average"/"Peak"/"Hybrid" - calculate and write auto-convergence values
+            # "Average"/"Peak"/"Hybrid"/"MinBorders" - calculate and write auto-convergence values
             conv_val = None  # Will be set if we're not in "Off" mode
             if auto_conv_mode == "Off":
                 # Don't touch convergence_plane or max_disparity - preserve from sidecar
@@ -5468,18 +5574,32 @@ class SplatterGUI(ThemedTk):
             else:
                 # Calculate auto-convergence
                 logger.debug(f"AUTO-PASS: Calculating convergence for {os.path.basename(rgb_path)}...")
-                avg_val, peak_val = self._determine_auto_convergence(
-                    rgb_path, depth_path, process_length, batch_size, fallback_anchor, gamma=gamma
-                )
-                logger.debug(f"AUTO-PASS: {os.path.basename(rgb_path)} - avg={avg_val:.4f}, peak={peak_val:.4f}")
-                if auto_conv_mode == "Average":
-                    conv_val = avg_val
-                elif auto_conv_mode == "Peak":
-                    conv_val = peak_val
-                elif auto_conv_mode == "Hybrid":
-                    conv_val = 0.5 * (avg_val + peak_val)
+                if auto_conv_mode == "MinBorders":
+                    conv_val = self._determine_min_borders_convergence(
+                        depth_path=depth_path,
+                        process_length=process_length,
+                        fallback_anchor=fallback_anchor,
+                        max_disp=max_disp,
+                        gamma=gamma,
+                    )
+                    logger.debug(
+                        f"AUTO-PASS: {os.path.basename(rgb_path)} - minborders={float(conv_val):.4f}"
+                    )
                 else:
-                    conv_val = avg_val
+                    avg_val, peak_val = self._determine_auto_convergence(
+                        rgb_path, depth_path, process_length, batch_size, fallback_anchor, gamma=gamma
+                    )
+                    logger.debug(
+                        f"AUTO-PASS: {os.path.basename(rgb_path)} - avg={avg_val:.4f}, peak={peak_val:.4f}"
+                    )
+                    if auto_conv_mode == "Average":
+                        conv_val = avg_val
+                    elif auto_conv_mode == "Peak":
+                        conv_val = peak_val
+                    elif auto_conv_mode == "Hybrid":
+                        conv_val = 0.5 * (avg_val + peak_val)
+                    else:
+                        conv_val = avg_val
 
                 # Apply GUI snapshot for non-convergence settings (preserves overlap/bias)
                 # but remove convergence_plane so it doesn't overwrite our calculated value

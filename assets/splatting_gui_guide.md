@@ -37,6 +37,7 @@ These parameters configure the core splatting and output encoding process.
   - **Average:** Simple auto-convergence derived from the temporal average of the center 75% depth region.
   - **Peak:** Simple auto-convergence derived from the temporal maximum of the center 75% depth region.
   - **Hybrid:** Combines Average and Peak (50/50 blend).
+  - **MinBorders:** Depth-only search that chooses the convergence value minimizing average left+right border void area.
 - **Output CRF (Full / Low):** Constant Rate Factor for video encoding. Lower values mean higher quality. You can now set different quality levels for the Full Resolution and Low Resolution outputs independently.
 - **Color Tags:** Metadata-only tags written into the output file headers (e.g., BT.709, BT.2020). This does not affect the splatting math but helps players/editors interpret the color space correctly.
 
@@ -62,7 +63,7 @@ Settings here apply to both Full and Low-resolution outputs.
 ### 6. Preview Controls
 
 - **Load/Refresh List:** Scans the input folders for matching video/depth map pairs.
-- **Preview Auto-Converge (Button):** Runs a scan of the current clip to calculate **Average** and **Peak** depth.
+- **Preview Auto-Converge (Button):** Runs a scan of the current clip to calculate convergence for the selected mode (Average/Peak/Hybrid/MinBorders).
 - **< Prev / Next >:** Navigate between loaded video clips.
 - **Update Sidecar:** Saves current GUI slider values to the `.fssidecar` file.
 - **Preview Source:** Selects the display mode (e.g., Splat Result, Occlusion Mask, Anaglyph, Wigglegram, Depth Map Color).

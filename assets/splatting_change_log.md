@@ -3,6 +3,9 @@ All notable changes to the splatting GUI and related components.
 ## [Unreleased]
 ### Added
 - **Manual Mode for Auto-Convergence:** New "Manual" mode writes current slider values to sidecars during AUTO-PASS without calculating auto-convergence.
+- **MinBorders Auto-Convergence Mode:** New mode available in GUI/preview/AUTO-PASS and batch processing, using depth-only border-void minimization.
+- **Runner Sidecar Safety Policy:** `batch_splatting_runner.py` can now warn/prompt/delete existing sidecars before processing.
+- **Runner CSV Convergence Overrides:** Optional CSV import for per-clip convergence values (fill-missing or override-all policy).
 - **Sidecar Migration Menu Items:** Two new File menu options to move sidecars between folders:
   - "Sidecars: Depth → Source (remove _depth)" - moves sidecars from depth folder to source folder
   - "Sidecars: Source → Depth (add _depth)" - moves sidecars from source folder to depth folder
