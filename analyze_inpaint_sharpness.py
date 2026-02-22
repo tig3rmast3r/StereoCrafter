@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
 import argparse
+import concurrent.futures
 import csv
 import glob
+import multiprocessing as mp
 import os
-import concurrent.futures
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import av
-import numpy as np
 import cv2
+import numpy as np
+
+try:
+    from concurrent.futures.process import BrokenProcessPool
+except Exception:
+    BrokenProcessPool = RuntimeError
 
 
-@dataclass
-class Result:
-    path: str
-    sharp_raw: float
-    sharp_pct: float
-    samples_used: int
-    roi_cov_pct: float
-
+# -------------------------
+# RECOMMENDED DEFAULTS
+# -------------------------
+DEFAULT_GLOB = "*.mp4"
+DEFAULT_OUT_CSV = "sharpness.csv"
+DEFAULT_SAMPLE_FRAMES = 48
+DEFAULT_THR = 100
+DEFAULT_MASK_DILATE_K = 0
+DEFAULT_MASK_DILATE_ITER = 0
+DEFAULT_BAND_MODE = "match_run"  # match_run | fixed
+DEFAULT_BAND_PX = 10
+DEFAULT_BAND_GAP_PX = 0
+DEFAULT_MIN_ROI_PIXELS = 250
+DEFAULT_WORKERS = min(8, max(1, os.cpu_count() or 1))
 
 
 def find_mask_for_video(mask_dir: str, video_basename: str) -> Optional[str]:
@@ -36,24 +47,63 @@ def find_mask_for_video(mask_dir: str, video_basename: str) -> Optional[str]:
     matches = sorted(glob.glob(patt))
     return matches[0] if matches else None
 
+
 def tenengrad(gray: np.ndarray) -> np.ndarray:
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     return gx * gx + gy * gy
 
 
-def make_roi(mask_gray: np.ndarray, thr: int, dilate_k: int, dilate_iter: int, shift_x: int) -> Tuple[np.ndarray, np.ndarray]:
-    _, m = cv2.threshold(mask_gray, thr, 255, cv2.THRESH_BINARY)
+def make_right_band_roi(
+    mask_gray: np.ndarray,
+    thr: int,
+    band_mode: str,
+    band_px: int,
+    band_gap_px: int,
+) -> np.ndarray:
+    """
+    Build a dynamic ROI immediately to the right of each white run in the mask.
 
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_k, dilate_k))
-    base = cv2.dilate(m, k, iterations=dilate_iter)
+    For each row:
+      - find each contiguous white block in the binary mask
+      - for each block right edge x_r, mark [x_r + 1 + gap, x_r + 1 + gap + band_px)
+    """
+    _, m = cv2.threshold(mask_gray, int(thr), 255, cv2.THRESH_BINARY)
+    base = m.astype(np.uint8)
 
     h, w = base.shape
-    M = np.float32([[1, 0, shift_x], [0, 1, 0]])
-    shifted = cv2.warpAffine(base, M, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
+    roi = np.zeros((h, w), dtype=np.uint8)
 
-    roi = cv2.bitwise_and(shifted, cv2.bitwise_not(base))
-    return base, roi
+    if band_mode not in ("match_run", "fixed"):
+        band_mode = "match_run"
+    if band_mode == "fixed" and band_px <= 0:
+        return roi
+
+    row_has = np.any(base > 0, axis=1)
+    for y in np.where(row_has)[0]:
+        row = base[y] > 0
+
+        # Run starts/ends.
+        starts = np.where(row & np.r_[True, ~row[:-1]])[0]
+        ends = np.where(row & np.r_[~row[1:], True])[0]
+        if starts.size == 0 or ends.size == 0:
+            continue
+
+        for xs, xe in zip(starts, ends):
+            run_len = int(xe - xs + 1)
+            width = run_len if band_mode == "match_run" else int(band_px)
+            if width <= 0:
+                continue
+
+            x0 = int(xe) + 1 + int(band_gap_px)
+            if x0 >= w:
+                continue
+            x1 = min(w, x0 + width)
+            roi[y, x0:x1] = 255
+
+    # Ensure ROI excludes original mask pixels.
+    roi = cv2.bitwise_and(roi, cv2.bitwise_not(base))
+    return roi
 
 
 def compute_file_sharpness(
@@ -61,9 +111,11 @@ def compute_file_sharpness(
     mask_path: Optional[str],
     sample_frames: int,
     thr: int,
-    dilate_k: int,
-    dilate_iter: int,
-    shift_x: int,
+    mask_dilate_k: int,
+    mask_dilate_iter: int,
+    band_mode: str,
+    band_px: int,
+    band_gap_px: int,
     min_roi_pixels: int,
 ) -> Tuple[float, int, float]:
     container = av.open(path)
@@ -108,57 +160,48 @@ def compute_file_sharpness(
             continue
 
         half = w // 2
-        mask = img[:, :half, :]
-        warped = img[:, half:half + half, :]
-
+        mask_embedded = img[:, :half, :]
+        warped = img[:, half : half + half, :]
         warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
 
         if mask_iter is not None:
-            # External replace-mask is already binary; use it as BASE mask,
-            # then build ROI by shifting it (so we do not analyze "holes").
+            # External replace-mask.
             try:
                 m = mframe.to_ndarray(format="gray")
-                mask_gray_ext = m if m.ndim == 2 else m[:, :, 0]
+                mask_gray = m if m.ndim == 2 else m[:, :, 0]
             except Exception:
                 mbgr = mframe.to_ndarray(format="bgr24")
-                mask_gray_ext = cv2.cvtColor(mbgr, cv2.COLOR_BGR2GRAY)
+                mask_gray = cv2.cvtColor(mbgr, cv2.COLOR_BGR2GRAY)
 
-            # Ensure BASE mask matches warped size (H x W_right).
-            mh, mw = mask_gray_ext.shape[:2]
+            # Ensure mask matches warped size (H x W_right).
+            mh, mw = mask_gray.shape[:2]
             wh, ww = warped_gray.shape[:2]
             if (mh, mw) != (wh, ww):
-                # If mask is wider (e.g. full width), keep the right-most ww pixels.
                 if mh == wh and mw > ww:
-                    mask_gray_ext = mask_gray_ext[:, -ww:]
-                    mh, mw = mask_gray_ext.shape[:2]
+                    mask_gray = mask_gray[:, -ww:]
+                    mh, mw = mask_gray.shape[:2]
                 if (mh, mw) != (wh, ww):
                     continue
-
-            base = (mask_gray_ext > 0).astype(np.uint8) * 255
-
-            h2, w2 = base.shape
-            M = np.float32([[1, 0, shift_x], [0, 1, 0]])
-            shifted = cv2.warpAffine(base, M, (w2, h2), flags=cv2.INTER_NEAREST, borderValue=0)
-            roi = cv2.bitwise_and(shifted, cv2.bitwise_not(base))
         else:
-            mask_gray = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-            _, roi = make_roi(mask_gray, thr, dilate_k, dilate_iter, shift_x)
+            mask_gray = cv2.cvtColor(mask_embedded, cv2.COLOR_BGR2GRAY)
 
+        # Optional dilation on mask before building right-band ROI.
+        if int(mask_dilate_k) > 0 and int(mask_dilate_iter) > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(mask_dilate_k), int(mask_dilate_k)))
+            mask_gray = cv2.dilate(mask_gray, k, iterations=int(mask_dilate_iter))
+
+        roi = make_right_band_roi(
+            mask_gray=mask_gray,
+            thr=thr,
+            band_mode=band_mode,
+            band_px=band_px,
+            band_gap_px=band_gap_px,
+        )
         roi_pixels = int(np.count_nonzero(roi))
-        if roi_pixels < min_roi_pixels:
-            if mask_iter is not None:
-                continue
-            _, base = cv2.threshold(mask_gray, thr, 255, cv2.THRESH_BINARY)
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_k, dilate_k))
-            dil = cv2.dilate(base, k, iterations=dilate_iter)
-            ero = cv2.erode(base, k, iterations=max(1, dilate_iter))
-            roi = cv2.bitwise_and(dil, cv2.bitwise_not(ero))
-            roi_pixels = int(np.count_nonzero(roi))
-            if roi_pixels < min_roi_pixels:
-                continue
+        if roi_pixels < int(min_roi_pixels):
+            continue
 
         E = tenengrad(warped_gray)
-
         m = roi.astype(bool)
         val = float(np.mean(E[m]))
         sharp_vals.append(val)
@@ -205,7 +248,6 @@ def load_existing_csv(path: str) -> Dict[str, Tuple[float, int, float]]:
     cache: Dict[str, Tuple[float, int, float]] = {}
     with open(path, "r", newline="") as f:
         r = csv.DictReader(f)
-        # expected headers: file, sharpness_raw, sharpness_pct, samples_used, roi_coverage_pct
         for row in r:
             try:
                 name = row.get("file") or ""
@@ -221,21 +263,33 @@ def load_existing_csv(path: str) -> Dict[str, Tuple[float, int, float]]:
 
 
 def _worker_compute(job):
-    """Worker job for parallel execution."""
-    (p, mask_dir, sample_frames, thr, dilate_k, dilate_iter, shift_x, min_roi_pixels) = job
+    (
+        p,
+        mask_dir,
+        sample_frames,
+        thr,
+        mask_dilate_k,
+        mask_dilate_iter,
+        band_mode,
+        band_px,
+        band_gap_px,
+        min_roi_pixels,
+    ) = job
     bn = os.path.basename(p)
     try:
         mask_path = find_mask_for_video(mask_dir, bn) if mask_dir else None
         if mask_dir and not mask_path:
             return (bn, 0.0, 0, 0.0, "MISS_MASK")
         sharp_raw, n, cov = compute_file_sharpness(
-            p,
-            mask_path,
+            path=p,
+            mask_path=mask_path,
             sample_frames=sample_frames,
             thr=thr,
-            dilate_k=dilate_k,
-            dilate_iter=dilate_iter,
-            shift_x=shift_x,
+            mask_dilate_k=mask_dilate_k,
+            mask_dilate_iter=mask_dilate_iter,
+            band_mode=band_mode,
+            band_px=band_px,
+            band_gap_px=band_gap_px,
             min_roi_pixels=min_roi_pixels,
         )
         return (bn, float(sharp_raw), int(n), float(cov), "OK")
@@ -243,19 +297,46 @@ def _worker_compute(job):
         return (bn, 0.0, 0, 0.0, f"ERR:{type(e).__name__}")
 
 
+def _print_status(bn: str, raw: float, n: int, cov: float, status: str, mask_dir: Optional[str]) -> None:
+    if status == "MISS_MASK":
+        print(f"[MISS MASK] {bn}  (looked for: {mask_dir}/{os.path.splitext(bn)[0]}_replace_mask.*)")
+    elif status.startswith("ERR:"):
+        print(f"[ERR]  {bn}  {status}")
+    else:
+        print(f"[OK]   {bn}  raw={raw:.2f}  samples={n}  roi_cov={cov:.2f}%")
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description=(
+            "Analyze sharpness on a dynamic right-side band next to each mask run "
+            "(per-row, no fixed global shift)."
+        )
+    )
     ap.add_argument("in_dir")
     ap.add_argument("mask_dir", nargs="?", default=None)
-    ap.add_argument("--glob", default="*.mp4")
-    ap.add_argument("--out_csv", default="sharpness.csv")
-    ap.add_argument("--sample_frames", type=int, default=30)
-    ap.add_argument("--thr", type=int, default=100)
-    ap.add_argument("--dilate_k", type=int, default=9)
-    ap.add_argument("--dilate_iter", type=int, default=2)
-    ap.add_argument("--shift_x", type=int, default=20)
-    ap.add_argument("--min_roi_pixels", type=int, default=500)
-    ap.add_argument("--workers", type=int, default=8, help="Parallel workers (processes). 1 = sequential")
+    ap.add_argument("--glob", default=DEFAULT_GLOB)
+    ap.add_argument("--out_csv", default=DEFAULT_OUT_CSV)
+    ap.add_argument("--sample_frames", type=int, default=DEFAULT_SAMPLE_FRAMES)
+    ap.add_argument("--thr", type=int, default=DEFAULT_THR)
+    ap.add_argument("--mask_dilate_k", type=int, default=DEFAULT_MASK_DILATE_K)
+    ap.add_argument("--mask_dilate_iter", type=int, default=DEFAULT_MASK_DILATE_ITER)
+    ap.add_argument(
+        "--band_mode",
+        type=str,
+        default=DEFAULT_BAND_MODE,
+        choices=["match_run", "fixed"],
+        help="Right band width policy: match each mask-run width, or fixed width",
+    )
+    ap.add_argument("--band_px", type=int, default=DEFAULT_BAND_PX, help="Right-side analysis band width in pixels")
+    ap.add_argument("--band_gap_px", type=int, default=DEFAULT_BAND_GAP_PX, help="Gap from mask edge before band")
+    ap.add_argument("--min_roi_pixels", type=int, default=DEFAULT_MIN_ROI_PIXELS)
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help="Parallel workers (processes). 1 = sequential",
+    )
     args = ap.parse_args()
 
     in_dir = os.path.abspath(args.in_dir)
@@ -266,14 +347,11 @@ def main():
     out_csv = os.path.abspath(args.out_csv)
     existing = load_existing_csv(out_csv)
 
-    tmp: List[Tuple[str, float, int, float]] = []  # (basename, raw, samples, cov)
-
-    # Build results in a stable order (same order as `paths`)
     reused = 0
     computed = 0
-    results: Dict[str, Tuple[float, int, float]] = {}  # bn -> (raw, n, cov)
+    results: Dict[str, Tuple[float, int, float]] = {}
 
-    # First reuse from existing CSV
+    # Reuse from existing CSV
     for p in paths:
         bn = os.path.basename(p)
         if bn in existing:
@@ -282,44 +360,76 @@ def main():
             results[bn] = (raw, n, cov)
             print(f"[SKIP] {bn}  raw={raw:.2f}  samples={n}  roi_cov={cov:.2f}%  (from CSV)")
 
-    # Jobs to compute
     mask_dir = os.path.abspath(args.mask_dir) if args.mask_dir else None
     jobs = []
     for p in paths:
         bn = os.path.basename(p)
         if bn in results:
             continue
-        jobs.append((p, mask_dir, args.sample_frames, args.thr, args.dilate_k, args.dilate_iter, args.shift_x, args.min_roi_pixels))
+        jobs.append(
+            (
+                p,
+                mask_dir,
+                args.sample_frames,
+                args.thr,
+                args.mask_dilate_k,
+                args.mask_dilate_iter,
+                args.band_mode,
+                args.band_px,
+                args.band_gap_px,
+                args.min_roi_pixels,
+            )
+        )
 
     # Compute (sequential or parallel)
     if args.workers <= 1 or len(jobs) <= 1:
         for job in jobs:
             bn, raw, n, cov, status = _worker_compute(job)
-            if status == "MISS_MASK":
-                print(f"[MISS MASK] {bn}  (looked for: {mask_dir}/{os.path.splitext(bn)[0]}_replace_mask.*)")
-            elif status.startswith("ERR:"):
-                print(f"[ERR]  {bn}  {status}")
-            else:
-                print(f"[OK]   {bn}  raw={raw:.2f}  samples={n}  roi_cov={cov:.2f}%")
+            _print_status(bn, raw, n, cov, status, mask_dir)
             results[bn] = (raw, n, cov)
             computed += 1
     else:
-        # Processes are safer than threads here (PyAV/OpenCV + GIL).
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as ex:
-            futs = [ex.submit(_worker_compute, job) for job in jobs]
-            for fut in concurrent.futures.as_completed(futs):
-                bn, raw, n, cov, status = fut.result()
-                if status == "MISS_MASK":
-                    print(f"[MISS MASK] {bn}  (looked for: {mask_dir}/{os.path.splitext(bn)[0]}_replace_mask.*)")
-                elif status.startswith("ERR:"):
-                    print(f"[ERR]  {bn}  {status}")
-                else:
-                    print(f"[OK]   {bn}  raw={raw:.2f}  samples={n}  roi_cov={cov:.2f}%")
+        pool_broken = False
+        try:
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=args.workers,
+                mp_context=mp.get_context("spawn"),
+            ) as ex:
+                fut_to_job = {ex.submit(_worker_compute, job): job for job in jobs}
+                for fut in concurrent.futures.as_completed(fut_to_job):
+                    try:
+                        bn, raw, n, cov, status = fut.result()
+                    except Exception as e:
+                        # If the pool dies abruptly, recover in sequential mode below.
+                        if isinstance(e, BrokenProcessPool):
+                            pool_broken = True
+                            print(f"[WARN] process pool broken, fallback to sequential: {e}")
+                            ex.shutdown(wait=False, cancel_futures=True)
+                            break
+                        job = fut_to_job[fut]
+                        bn = os.path.basename(job[0])
+                        raw, n, cov, status = 0.0, 0, 0.0, f"ERR:{type(e).__name__}"
+                    _print_status(bn, raw, n, cov, status, mask_dir)
+                    results[bn] = (raw, n, cov)
+                    computed += 1
+        except Exception as e:
+            if isinstance(e, BrokenProcessPool):
+                pool_broken = True
+                print(f"[WARN] process pool setup/teardown broken, fallback to sequential: {e}")
+            else:
+                raise
+
+        if pool_broken:
+            remaining_jobs = [job for job in jobs if os.path.basename(job[0]) not in results]
+            print(f"[INFO] recovering remaining jobs sequentially: {len(remaining_jobs)}")
+            for job in remaining_jobs:
+                bn, raw, n, cov, status = _worker_compute(job)
+                _print_status(bn, raw, n, cov, status, mask_dir)
                 results[bn] = (raw, n, cov)
                 computed += 1
 
-    # Rebuild tmp list in original stable order
-    tmp = []
+    # Stable order
+    tmp: List[Tuple[str, float, int, float]] = []
     for p in paths:
         bn = os.path.basename(p)
         raw, n, cov = results.get(bn, (0.0, 0, 0.0))
@@ -334,9 +444,12 @@ def main():
         for (bn, raw, n, cov), pct in zip(tmp, pcts):
             w.writerow([bn, f"{raw:.6f}", f"{pct:.2f}", n, f"{cov:.3f}"])
 
-    print(f"\nDone: {out_csv}  (reused={reused}, computed={computed}, total={len(tmp)})")
+    print(
+        f"\nDone: {out_csv}  "
+        f"(reused={reused}, computed={computed}, total={len(tmp)})  "
+        f"band_mode={args.band_mode} band_px={args.band_px} gap={args.band_gap_px}"
+    )
 
 
 if __name__ == "__main__":
     main()
-
