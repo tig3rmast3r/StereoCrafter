@@ -589,6 +589,14 @@ def run_batch(args):
                 new_overlap = max(0, frames_chunk - 1)
                 print(f"[WARN] overlap={overlap} >= frames_chunk={frames_chunk}; clamping overlap -> {new_overlap}")
                 overlap = new_overlap
+            tail_pad = int(args.tail_pad)
+            if tail_pad < 0:
+                print(f"[WARN] tail_pad={tail_pad} < 0; clamping tail_pad -> 0")
+                tail_pad = 0
+            if tail_pad >= frames_chunk:
+                new_tail_pad = max(0, frames_chunk - 1)
+                print(f"[WARN] tail_pad={tail_pad} >= frames_chunk={frames_chunk}; clamping tail_pad -> {new_tail_pad}")
+                tail_pad = new_tail_pad
 
             _save_current_job_state(current_job_path, {
                 "mode": "active_job",
@@ -606,6 +614,7 @@ def run_batch(args):
                 save_dir=args.output_dir,
                 frames_chunk=frames_chunk,
                 overlap=overlap,
+                tail_pad=tail_pad,
                 tile_num=args.tile_num,
                 vf=None,
                 num_inference_steps=num_steps,
@@ -704,7 +713,9 @@ def main():
                    help="Constant for dynamic frames_chunk: frames_chunk ~= chunk_k/(W*H). Default based on 1920x832->24.")
     p.add_argument("--chunk_min", type=int, default=20, help="Minimum frames_chunk when dynamic/override is used")
     p.add_argument("--chunk_max", type=int, default=500, help="Maximum frames_chunk when dynamic/override is used")
-    p.add_argument("--overlap", type=int, default=4)
+    p.add_argument("--overlap", type=int, default=3)
+    p.add_argument("--tail_pad", type=int, default=3,
+                   help="Guard frames used for both non-last chunk handoff and last-chunk duplication.")
     p.add_argument("--original_input_blend_strength", type=float, default=0.0)
     p.add_argument("--output_crf", type=int, default=1)
     p.add_argument("--process_length", type=int, default=-1)

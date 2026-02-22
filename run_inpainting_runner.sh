@@ -14,7 +14,8 @@ OFFLOAD_TYPE="model"                 # none | model | sequential
 
 TILE_NUM=2
 FRAMES_CHUNK=50
-OVERLAP=4
+OVERLAP=3
+TAIL_PAD=2
 ORIGINAL_INPUT_BLEND_STRENGTH=0
 OUTPUT_CRF=1
 PROCESS_LENGTH=-1
@@ -60,6 +61,7 @@ CMD+=(--output_dir "$OUTPUT_DIR"
      --tile_num "$TILE_NUM"
      --frames_chunk "$FRAMES_CHUNK"
      --overlap "$OVERLAP"
+     --tail_pad "$TAIL_PAD"
      --original_input_blend_strength "$ORIGINAL_INPUT_BLEND_STRENGTH"
      --output_crf "$OUTPUT_CRF"
      --process_length "$PROCESS_LENGTH"

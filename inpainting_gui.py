@@ -91,6 +91,7 @@ class InpaintingGUI(ThemedTk):
         self.tile_num_var = tk.StringVar(value=str(self.app_config.get("tile_num", 2)))
         self.frames_chunk_var = tk.StringVar(value=str(self.app_config.get("frames_chunk", 23)))
         self.overlap_var = tk.StringVar(value=str(self.app_config.get("frame_overlap", 3)))
+        self.tail_pad_var = tk.StringVar(value=str(self.app_config.get("tail_pad", 3)))
         self.original_input_blend_strength_var = tk.StringVar(value=str(self.app_config.get("original_input_blend_strength", 0.0)))
         self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
         self.process_length_var = tk.StringVar(value=str(self.app_config.get("process_length", -1)))
@@ -929,6 +930,7 @@ class InpaintingGUI(ThemedTk):
             "process_length": self.process_length_var.get(),
             "frames_chunk": self.frames_chunk_var.get(),
             "frame_overlap": self.overlap_var.get(),
+            "tail_pad": self.tail_pad_var.get(),
             "original_input_blend_strength": self.original_input_blend_strength_var.get(),            
             "output_crf": self.output_crf_var.get(),
             "offload_type": self.offload_type_var.get(),
@@ -1629,24 +1631,31 @@ class InpaintingGUI(ThemedTk):
         ttk.Entry(param_frame, textvariable=self.overlap_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
-        # Row 2: Frames Chunk (Left) & Frame Overlap (Right)
+        # Row 2: Frames Chunk (Left) & Tail Pad / Guard (Right)
         frames_chunk_label = ttk.Label(param_frame, text="Frames Chunk:")
         frames_chunk_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(frames_chunk_label, self.help_data.get("frames_chunk", ""))
         ttk.Entry(param_frame, textvariable=self.frames_chunk_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
-        
-        output_crf_label = ttk.Label(param_frame, text="Output CRF:")
-        output_crf_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
-        Tooltip(output_crf_label, self.help_data.get("output_crf", ""))
-        ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
+
+        tail_pad_label = ttk.Label(param_frame, text="Tail Pad / Guard:")
+        tail_pad_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(tail_pad_label, self.help_data.get("tail_pad", "Extra guard frames for chunk handoff and final tail duplication."))
+        ttk.Entry(param_frame, textvariable=self.tail_pad_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
-        # Row 3: Original Input Bias (Left) & CPU Offload (Right)
-        process_length_label = ttk.Label(param_frame, text="Process Length:")
-        process_length_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(process_length_label, self.help_data.get("process_length", "Number of frames to process. Use -1 for all frames."))
-        ttk.Entry(param_frame, textvariable=self.process_length_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
+        # Row 3: Output CRF (Left) & Process Length (Right)
+        output_crf_label = ttk.Label(param_frame, text="Output CRF:")
+        output_crf_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(output_crf_label, self.help_data.get("output_crf", ""))
+        ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
 
+        process_length_label = ttk.Label(param_frame, text="Process Length:")
+        process_length_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(process_length_label, self.help_data.get("process_length", "Number of frames to process. Use -1 for all frames."))
+        ttk.Entry(param_frame, textvariable=self.process_length_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
+        current_row += 1
+
+        # Row 4: CPU Offload (Right)
         offload_label = ttk.Label(param_frame, text="CPU Offload:")
         offload_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
         Tooltip(offload_label, self.help_data.get("offload_type", ""))
@@ -1779,6 +1788,7 @@ class InpaintingGUI(ThemedTk):
         save_dir: str,
         frames_chunk: int = 23,
         overlap: int = 3,
+        tail_pad: int = 3,
         tile_num: int = 1,
         vf: Optional[str] = None,
         num_inference_steps: int = 5,
@@ -1886,6 +1896,7 @@ class InpaintingGUI(ThemedTk):
         # 3. INPAINTING CHUNKS (The main loop)
         # This part of the loop remains the same, but the logic inside is simplified
         total_frames_to_process_actual = num_frames_original        
+        tail_pad = max(0, int(tail_pad))
 
         stride = max(1, frames_chunk - overlap)
 
@@ -1931,11 +1942,11 @@ class InpaintingGUI(ThemedTk):
             
             # --- CHUNK SLICING AND PADDING LOGIC ---
             # Guard-frame policy:
-            # - Non-last chunk: read one extra REAL frame and discard it from output.
-            # - Last chunk: append one DUPLICATED tail frame and discard it from output.
+            # - Non-last chunk: read tail_pad extra REAL frames and discard them from output.
+            # - Last chunk: append tail_pad DUPLICATED tail frames and discard them from output.
             next_chunk_start = i + stride
             is_last_chunk = next_chunk_start >= total_frames_to_process_actual
-            guard_extra_real = 0 if is_last_chunk else 1
+            guard_extra_real = 0 if is_last_chunk else tail_pad
             end_idx_for_slicing = min(i + frames_chunk + guard_extra_real, total_frames_to_process_actual)
             if stream_input_enabled:
                 (original_input_frames_slice, mask_frames_slice,
@@ -1953,7 +1964,7 @@ class InpaintingGUI(ThemedTk):
                 if not is_dual_input and frames_left_original_cropped is not None:
                     left_unpadded_slice = frames_left_original_cropped[i:end_idx_for_slicing]
             actual_sliced_length = original_input_frames_slice.shape[0]
-            emit_sliced_length = actual_sliced_length if is_last_chunk else max(0, actual_sliced_length - 1)
+            emit_sliced_length = actual_sliced_length if is_last_chunk else max(0, actual_sliced_length - tail_pad)
 
             if emit_sliced_length <= 0:
                 logger.debug(f"Skipping empty chunk at frame {i} (actual_sliced_length={actual_sliced_length}).")
@@ -1961,8 +1972,9 @@ class InpaintingGUI(ThemedTk):
 
             # Skip useless tail chunks that would contribute no new frames (only overlap)
             if i > 0 and overlap > 0 and emit_sliced_length <= overlap:
+                tail_end_idx = end_idx_for_slicing - 1
                 logger.debug(
-                    f"Skipping tail chunk {i}-{end_idx_for_slicing} (length {emit_sliced_length}) "
+                    f"Skipping tail chunk real_idx={i}-{tail_end_idx} (len={emit_sliced_length}) "
                     f"because it contributes no new frames (overlap={overlap})."
                 )
                 break
@@ -1970,38 +1982,20 @@ class InpaintingGUI(ThemedTk):
             input_frames_to_pipeline = original_input_frames_slice
             mask_frames_i = mask_frames_slice
 
-            if is_last_chunk:
+            if is_last_chunk and tail_pad > 0:
                 logger.debug(
                     f"Applying last-chunk guard duplication at frame {i} "
-                    f"(emit_sliced_length={emit_sliced_length})."
+                    f"(emit_sliced_length={emit_sliced_length}, guard_dup={tail_pad})."
                 )
                 last_original_frame_warpped = input_frames_to_pipeline[-1:].clone()
                 last_original_frame_mask = mask_frames_i[-1:].clone()
-                input_frames_to_pipeline = torch.cat([input_frames_to_pipeline, last_original_frame_warpped], dim=0)
-                mask_frames_i = torch.cat([mask_frames_i, last_original_frame_mask], dim=0)
-            
-            padding_needed_for_pipeline_input = 0
-            # Overlap-aware tail padding: ensure at least (overlap + 3) frames (and at least 6 total) for pipeline stability
-            min_tail_frames = 3
-            target_length = max(6, overlap + min_tail_frames)
-            if input_frames_to_pipeline.shape[0] < target_length:
-                padding_needed_for_pipeline_input = target_length - input_frames_to_pipeline.shape[0]
-                logger.debug(
-                    f"End-of-video optimization: Short tail chunk ({input_frames_to_pipeline.shape[0]} frames) "
-                    f"padded to minimum {target_length} (overlap={overlap})."
-                )
-
-            if padding_needed_for_pipeline_input > 0:
-                logger.debug(
-                    f"Dynamically padding input for chunk starting at frame {i}: "
-                    f"{input_frames_to_pipeline.shape[0]} input frames, +{padding_needed_for_pipeline_input}."
-                )
-                last_original_frame_warpped = input_frames_to_pipeline[-1:].clone()
-                last_original_frame_mask = mask_frames_i[-1:].clone()
-                repeated_warpped = last_original_frame_warpped.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
-                repeated_mask = last_original_frame_mask.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
+                repeated_warpped = last_original_frame_warpped.repeat(tail_pad, 1, 1, 1)
+                repeated_mask = last_original_frame_mask.repeat(tail_pad, 1, 1, 1)
                 input_frames_to_pipeline = torch.cat([input_frames_to_pipeline, repeated_warpped], dim=0)
                 mask_frames_i = torch.cat([mask_frames_i, repeated_mask], dim=0)
+            # No extra temporal tail padding beyond guard frames:
+            # - non-last chunks: tail_pad extra real frames (guard for overlap handoff)
+            # - last chunk: tail_pad duplicated tail frames (guard for model tail stability)
             # --- END CHUNK SLICING AND PADDING LOGIC ---
 
             # --- INPUT-LEVEL BLENDING (Remains from your last correct version) ---
@@ -2022,7 +2016,18 @@ class InpaintingGUI(ThemedTk):
             # --- END INPUT-LEVEL BLENDING ---
 
             # --- INFERENCE ---
-            logger.info(f"Starting inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} (Temporal length: {input_frames_to_pipeline.shape[0]})...")
+            real_start_idx = i
+            real_end_idx = end_idx_for_slicing - 1
+            real_len = actual_sliced_length
+            guard_dup = tail_pad if is_last_chunk else 0
+            # "tail_pad" is now strictly the non-last guard frames used for chunk handoff.
+            tail_pad_used = guard_extra_real
+            will_emit = emit_sliced_length if i == 0 else max(0, emit_sliced_length - overlap)
+            logger.info(
+                f"Starting inference chunk real_idx={real_start_idx}-{real_end_idx} "
+                f"(real_len={real_len}, overlap={overlap}, "
+                f"guard_dup={guard_dup}, tail_pad={tail_pad_used}, will_emit={will_emit})..."
+            )
             start_time = time.time()
 
             with torch.no_grad():
@@ -2038,7 +2043,10 @@ class InpaintingGUI(ThemedTk):
 
             # --- DECODING & CHUNK COLLECT ---
             inference_duration = time.time() - start_time
-            logger.debug(f"Inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} completed in {inference_duration:.2f} seconds.")
+            logger.debug(
+                f"Inference completed chunk real_idx={real_start_idx}-{real_end_idx} "
+                f"in {inference_duration:.2f}s."
+            )
             
             video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
             current_chunk_generated = torch.stack([
@@ -2297,6 +2305,7 @@ class InpaintingGUI(ThemedTk):
         self.tile_num_var.set("2")
         self.frames_chunk_var.set("23")
         self.overlap_var.set("3")
+        self.tail_pad_var.set("3")
         self.original_input_blend_strength_var.set("0.5")
         self.offload_type_var.set("model")
 
@@ -2371,6 +2380,7 @@ class InpaintingGUI(ThemedTk):
             num_inference_steps,
             tile_num, offload_type,
             frames_chunk, gui_overlap,
+            gui_tail_pad,
             gui_original_input_blend_strength,
             gui_output_crf,
             process_length
@@ -2410,6 +2420,7 @@ class InpaintingGUI(ThemedTk):
                 
                 # Initialize current video's parameters with GUI fallbacks
                 current_overlap = gui_overlap
+                current_tail_pad = gui_tail_pad
                 current_original_input_blend_strength = gui_original_input_blend_strength
                 current_output_crf = gui_output_crf # NEW: Initialize current_output_crf
                 current_process_length = process_length # NEW: Current process_length (from GUI initially)
@@ -2470,6 +2481,7 @@ class InpaintingGUI(ThemedTk):
                     save_dir=output_folder,
                     frames_chunk=frames_chunk,
                     overlap=current_overlap,
+                    tail_pad=current_tail_pad,
                     tile_num=tile_num,
                     vf=None, 
                     num_inference_steps=num_inference_steps,
@@ -2540,6 +2552,7 @@ class InpaintingGUI(ThemedTk):
             tile_num = int(self.tile_num_var.get())
             frames_chunk = int(self.frames_chunk_var.get())
             gui_overlap = int(self.overlap_var.get())
+            gui_tail_pad = int(self.tail_pad_var.get())
             gui_original_input_blend_strength = float(self.original_input_blend_strength_var.get())
             gui_output_crf = int(self.output_crf_var.get()) # NEW: Get CRF
             # Get Process Length and Validate
@@ -2548,11 +2561,12 @@ class InpaintingGUI(ThemedTk):
                 raise ValueError("Process Length must be -1 or a positive integer.")
             
             if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1 or gui_overlap  < 0 or \
+               gui_tail_pad < 0 or \
                not (0.0 <= gui_original_input_blend_strength  <= 1.0) or gui_output_crf < 0: # NEW VALIDATION for CRF
                 raise ValueError("Invalid parameter values")
         except ValueError:
             # UPDATED ERROR MESSAGE
-            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Tile Number >=1, Frames Chunk >=1, Frame Overlap >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0.")
+            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Tile Number >=1, Frames Chunk >=1, Frame Overlap >=0, Tail Pad >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0.")
             return
         offload_type = self.offload_type_var.get()
 
@@ -2569,7 +2583,7 @@ class InpaintingGUI(ThemedTk):
         self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
 
         threading.Thread(target=self.run_batch_process,
-                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength, gui_output_crf, process_length),
+                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_tail_pad, gui_original_input_blend_strength, gui_output_crf, process_length),
                          daemon=True).start()
 
     def stop_processing(self):
