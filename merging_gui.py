@@ -117,31 +117,95 @@ def apply_shadow_blur(
     if num_steps <= 0:
         return mask
 
+    # Component-aware direction:
+    # - Components that touch only the RIGHT border -> propagate shadow to the LEFT.
+    # - All other components (left-edge or middle) keep legacy RIGHT propagation.
+    # This avoids accidental "double feather" on unrelated masks in the middle.
+    border_tolerance_px = 2
+    border_cols = max(1, min(border_tolerance_px, mask.shape[-1]))
+    component_thresh = 0.05
+
+    stamp_source_right = torch.zeros_like(mask)
+    stamp_source_left = torch.zeros_like(mask)
+    mask_cpu = mask.detach().cpu()
+
+    for t in range(mask_cpu.shape[0]):
+        frame_np = mask_cpu[t, 0].numpy().astype(np.float32, copy=False)
+        frame_bin = (frame_np > component_thresh).astype(np.uint8)
+        if frame_bin.max() == 0:
+            continue
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(frame_bin, connectivity=8)
+        if num_labels <= 1:
+            continue
+
+        width = frame_np.shape[1]
+        right_only_labels = []
+        default_right_labels = []
+
+        for lbl in range(1, num_labels):
+            x = int(stats[lbl, cv2.CC_STAT_LEFT])
+            w = int(stats[lbl, cv2.CC_STAT_WIDTH])
+            x2 = x + w - 1
+            touches_left = x < border_cols
+            touches_right = x2 >= (width - border_cols)
+
+            if touches_right and not touches_left:
+                right_only_labels.append(lbl)
+            else:
+                default_right_labels.append(lbl)
+
+        frame_right = np.zeros_like(frame_np, dtype=np.float32)
+        frame_left = np.zeros_like(frame_np, dtype=np.float32)
+
+        if default_right_labels:
+            sel = np.isin(labels, np.asarray(default_right_labels, dtype=labels.dtype))
+            frame_right[sel] = frame_np[sel]
+        if right_only_labels:
+            sel = np.isin(labels, np.asarray(right_only_labels, dtype=labels.dtype))
+            frame_left[sel] = frame_np[sel]
+
+        stamp_source_right[t, 0] = torch.from_numpy(frame_right)
+        stamp_source_left[t, 0] = torch.from_numpy(frame_left)
+
+    stamp_source_right = stamp_source_right.to(device=mask.device, dtype=mask.dtype)
+    stamp_source_left = stamp_source_left.to(device=mask.device, dtype=mask.dtype)
+
     if use_gpu:
         canvas_mask = mask.clone()
-        stamp_source = mask.clone()
         for i in range(num_steps):
             t = 1.0 - (i / (num_steps - 1)) if num_steps > 1 else 1.0
             curved_t = t**decay_gamma
             current_opacity = min_opacity + (start_opacity - min_opacity) * curved_t
             total_shift = (i + 1) * shift_per_step
-            padded_stamp = F.pad(stamp_source, (total_shift, 0), "constant", 0)
-            shifted_stamp = padded_stamp[:, :, :, :-total_shift]
+
+            padded_right = F.pad(stamp_source_right, (total_shift, 0), "constant", 0)
+            shifted_right = padded_right[:, :, :, :-total_shift]
+            padded_left = F.pad(stamp_source_left, (0, total_shift), "constant", 0)
+            shifted_left = padded_left[:, :, :, total_shift:]
+
+            shifted_stamp = torch.max(shifted_right, shifted_left)
             canvas_mask = torch.max(canvas_mask, shifted_stamp * current_opacity)
         return canvas_mask
     else:
         processed_frames = []
         for t in range(mask.shape[0]):
             canvas_np = mask[t].squeeze(0).cpu().numpy()  # Process one frame at a time
-            stamp_source_np = canvas_np.copy()
+            stamp_source_right_np = stamp_source_right[t].squeeze(0).cpu().numpy()
+            stamp_source_left_np = stamp_source_left[t].squeeze(0).cpu().numpy()
             for i in range(num_steps):
                 time_step = 1.0 - (i / (num_steps - 1)) if num_steps > 1 else 1.0
                 curved_t = time_step**decay_gamma
                 current_opacity = min_opacity + (start_opacity - min_opacity) * curved_t
                 total_shift = (i + 1) * shift_per_step
-                shifted_stamp = np.roll(
-                    stamp_source_np, total_shift, axis=1
-                )  # axis=1 for HxW
+                shifted_r = np.zeros_like(stamp_source_right_np)
+                shifted_l = np.zeros_like(stamp_source_left_np)
+
+                if total_shift < shifted_r.shape[1]:
+                    shifted_r[:, total_shift:] = stamp_source_right_np[:, :-total_shift]
+                    shifted_l[:, :-total_shift] = stamp_source_left_np[:, total_shift:]
+
+                shifted_stamp = np.maximum(shifted_r, shifted_l)
                 canvas_np = np.maximum(canvas_np, shifted_stamp * current_opacity)
             processed_frames.append(torch.from_numpy(canvas_np).unsqueeze(0))
         return torch.stack(processed_frames).to(mask.device)
