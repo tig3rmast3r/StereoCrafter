@@ -77,8 +77,8 @@ DEFAULTS: Dict[str, object] = {
     "ct_clamp_ab_max": 3,
     "ct_exclude_black_in_target": True,
     "ct_stats_region": "ring",     # global | nonmask | ring
-    "ct_ring_width": 40,
-    "ct_target_stats_source": "warped",       # warped | inpainted
+    "ct_ring_width": 20,
+    "ct_target_stats_source": "inpainted",       # warped | inpainted
     "ct_reference_source": "warped_filled",            # left | warped_filled
     "mask_binarize_threshold": -0.01,   # used for stats-mask and optional binarize step if you add it later
 
@@ -92,7 +92,7 @@ DEFAULTS: Dict[str, object] = {
     # Shadow (soft edge) post-processing
     "shadow_shift": 1,
     "shadow_start_opacity": 1.0,
-    "shadow_opacity_decay": 0.06,
+    "shadow_opacity_decay": 0.05,
     "shadow_min_opacity": 0.0,
     "shadow_decay_gamma": 1.0,
 
@@ -550,6 +550,24 @@ def build_output_path(
     return os.path.join(output_folder, output_filename), output_width, output_height
 
 
+def output_suffix_and_width_factor(output_format: str) -> Tuple[str, int]:
+    """
+    Returns (output_suffix, filename_width_factor).
+    filename_width_factor is applied to the perceived width in the output filename.
+    """
+    if output_format == "Full SBS Cross-eye (Right-Left)":
+        return "_merged_full_sbsx.mp4", 1
+    if output_format == "Full SBS (Left-Right)":
+        return "_merged_full_sbs.mp4", 1
+    if output_format == "Double SBS":
+        return "_merged_half_sbs.mp4", 2
+    if output_format == "Half SBS (Left-Right)":
+        return "_merged_half_sbs.mp4", 1
+    if output_format in ["Anaglyph (Red/Cyan)", "Anaglyph Half-Color"]:
+        return "_merged_anaglyph.mp4", 1
+    return "_merged_right_eye.mp4", 1
+
+
 def assemble_output_chunk(
     output_format: str,
     hires_h: int,
@@ -666,7 +684,44 @@ def process_one_job(
     """
     inpainted_base_name = os.path.basename(inpainted_video_path).rsplit(".", 1)[0]
     core_with_width, is_sbs_input = parse_inpainted_name(os.path.basename(inpainted_video_path))
-    core_name, _w = parse_core_and_width(core_with_width)
+    core_name, width_from_name = parse_core_and_width(core_with_width)
+
+    # Determine input type from splatted filename and probe original availability early.
+    is_dual_input = "_splatted2" in os.path.basename(splatted_video_path)
+    original_video_path_to_move: Optional[str] = None
+    original_missing_for_dual = False
+    if is_dual_input:
+        original_video_path_to_move = find_video_by_core_name(original_folder, core_name)
+        if not (original_video_path_to_move and os.path.exists(original_video_path_to_move)):
+            original_missing_for_dual = True
+
+    # Decide effective output format early (needed for fast skip path).
+    output_format = str(settings["output_format"])
+    if original_missing_for_dual and output_format != "Right-Eye Only":
+        LOG.warning(f"Original video is missing for '{inpainted_base_name}'. Forcing output format to 'Right-Eye Only'.")
+        output_format = "Right-Eye Only"
+
+    # Fast path: if width is encoded in filename, compute output path without opening readers.
+    precomputed_output_path: Optional[str] = None
+    if width_from_name is not None:
+        suffix, width_factor = output_suffix_and_width_factor(output_format)
+        perceived_width_for_filename = int(width_from_name) * int(width_factor)
+        precomputed_output_path = os.path.join(
+            output_folder,
+            f"{core_name}_{perceived_width_for_filename}{suffix}",
+        )
+        if should_skip_output(precomputed_output_path, bool(settings.get("skip_existing", True))):
+            LOG.info(f"SKIP (exists-fast): {os.path.basename(precomputed_output_path)}")
+            return JobPaths(
+                inpainted_video_path,
+                splatted_video_path,
+                original_video_path_to_move,
+                None,
+                precomputed_output_path,
+                os.path.splitext(inpainted_video_path)[0],
+                core_name,
+                is_sbs_input,
+            )
 
     # sidecar (may be empty dict)
     inpainted_base = os.path.splitext(inpainted_video_path)[0]
@@ -679,9 +734,6 @@ def process_one_job(
     # 1) Open readers
     inpainted_reader = VideoReader(inpainted_video_path, ctx=cpu(0))
     splatted_reader = VideoReader(splatted_video_path, ctx=cpu(0))
-
-    # Determine input type from splatted filename
-    is_dual_input = "_splatted2" in os.path.basename(splatted_video_path)
 
     # Optional replace-mask
     replace_mask_reader = None
@@ -701,17 +753,15 @@ def process_one_job(
 
     # Original reader:
     original_reader = None
-    original_video_path: Optional[str] = None
-    original_video_path_to_move: Optional[str] = None
+    original_video_path: Optional[str] = original_video_path_to_move
     if is_dual_input:
-        original_video_path = find_video_by_core_name(original_folder, core_name)
-        original_video_path_to_move = original_video_path
         if original_video_path and os.path.exists(original_video_path):
             LOG.info(f"Found matching original video for dual-input: {os.path.basename(original_video_path)}")
             original_reader = VideoReader(original_video_path, ctx=cpu(0))
         else:
-            LOG.warning(f"Original video not found for dual-input mode: '{core_name}.*'.")
-            LOG.warning("Will proceed, but only 'Right-Eye Only' output will be possible for this video.")
+            if not original_missing_for_dual:
+                LOG.warning(f"Original video not found for dual-input mode: '{core_name}.*'.")
+                LOG.warning("Will proceed, but only 'Right-Eye Only' output will be possible for this video.")
             original_reader = None
     else:
         # quad: splatted itself contains left eye
@@ -729,8 +779,7 @@ def process_one_job(
     else:
         hires_H, hires_W = H_splat // 2, W_splat // 2
 
-    # 3) Output format constraints
-    output_format = str(settings["output_format"])
+    # 3) Output format constraints (double-check with actual reader state)
     if original_reader is None and output_format != "Right-Eye Only":
         LOG.warning(f"Original video is missing for '{inpainted_base_name}'. Forcing output format to 'Right-Eye Only'.")
         output_format = "Right-Eye Only"
@@ -742,6 +791,11 @@ def process_one_job(
         hires_h=hires_H,
         output_format=output_format,
     )
+    if precomputed_output_path and os.path.normpath(precomputed_output_path) != os.path.normpath(output_path):
+        LOG.debug(
+            f"Precomputed output path differs from probed path: "
+            f"{os.path.basename(precomputed_output_path)} vs {os.path.basename(output_path)}"
+        )
 
     if should_skip_output(output_path, bool(settings.get("skip_existing", True))):
         LOG.info(f"SKIP (exists): {os.path.basename(output_path)}")
