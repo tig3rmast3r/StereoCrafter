@@ -6,6 +6,7 @@
   "tile_num": "Number of spatial tiles (e.g., 2 means 2x2 grid) to split each video frame into. Useful for processing high-resolution videos with limited GPU memory. Set to 1 to disable tiling. Default:1",
   "frames_chunk": "The number of frames processed together in a single temporal batch. Adjust based on your GPU memory. Larger chunks can be faster but require more VRAM. Default:23",
   "frame_overlap": "The number of frames that temporally overlap between consecutive processing chunks. These overlapping frames from the previous generated output and original input are smoothly blended to condition the start of the current chunk, reducing visual glitches. Default:3",
+  "tail_pad": "Guard frames used by chunk logic. Non-last chunks read this many extra real frames and discard them; last chunk duplicates this many tail frames and discards them. Default:3",
   "original_input_blend_strength": "Controls how much the original warped input (1.0) versus the previous generated inpainted frame (0.0) influences the blend during temporal overlap. higher for less hallucination but less consistency Default:0 = Off",
   "offload_type": "Determines how parts of the model are moved to CPU memory to reduce GPU VRAM usage. 'model' offloads entire components, 'sequential' offloads layers one by one, 'none' keeps everything on GPU.",
   "process_length": "Number of frames to process for each video. Enter -1 to process all frames, or a positive integer to limit the processing to the first N frames. Useful for quick testing.",
