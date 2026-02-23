@@ -29,6 +29,7 @@ DEFAULT_MASK_DILATE_ITER = 0
 DEFAULT_BAND_MODE = "match_run"  # match_run | fixed
 DEFAULT_BAND_PX = 10
 DEFAULT_BAND_GAP_PX = 0
+DEFAULT_RIGHT_BORDER_TOL_PX = 2
 DEFAULT_MIN_ROI_PIXELS = 250
 DEFAULT_WORKERS = min(8, max(1, os.cpu_count() or 1))
 
@@ -64,9 +65,12 @@ def make_right_band_roi(
     """
     Build a dynamic ROI immediately to the right of each white run in the mask.
 
-    For each row:
-      - find each contiguous white block in the binary mask
-      - for each block right edge x_r, mark [x_r + 1 + gap, x_r + 1 + gap + band_px)
+    Default behavior builds a right-side band per mask run.
+    For runs that touch the RIGHT border (with tolerance), build the band on
+    the LEFT side instead.
+
+    Direction is decided per row/run (not per connected component), so the
+    side can switch inside the same shape when rows stop touching the border.
     """
     _, m = cv2.threshold(mask_gray, int(thr), 255, cv2.THRESH_BINARY)
     base = m.astype(np.uint8)
@@ -78,6 +82,9 @@ def make_right_band_roi(
         band_mode = "match_run"
     if band_mode == "fixed" and band_px <= 0:
         return roi
+
+    border_cols = max(1, min(int(DEFAULT_RIGHT_BORDER_TOL_PX), w))
+    right_touch_start = w - border_cols
 
     row_has = np.any(base > 0, axis=1)
     for y in np.where(row_has)[0]:
@@ -94,12 +101,24 @@ def make_right_band_roi(
             width = run_len if band_mode == "match_run" else int(band_px)
             if width <= 0:
                 continue
+            touches_left = int(xs) < border_cols
+            touches_right = int(xe) >= right_touch_start
+            prefer_left = touches_right and not touches_left
+
+            if prefer_left:
+                x1 = int(xs) - int(band_gap_px)
+                x0 = x1 - width
+                x0c = max(0, x0)
+                x1c = min(w, x1)
+                if x0c < x1c:
+                    roi[y, x0c:x1c] = 255
+                    continue
+                # Fallback to right side if left side band is out of bounds.
 
             x0 = int(xe) + 1 + int(band_gap_px)
-            if x0 >= w:
-                continue
             x1 = min(w, x0 + width)
-            roi[y, x0:x1] = 255
+            if x0 < x1:
+                roi[y, x0:x1] = 255
 
     # Ensure ROI excludes original mask pixels.
     roi = cv2.bitwise_and(roi, cv2.bitwise_not(base))

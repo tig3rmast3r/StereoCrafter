@@ -80,6 +80,7 @@ DEFAULTS: Dict[str, object] = {
     "ct_ring_width": 20,
     "ct_target_stats_source": "inpainted",       # warped | inpainted
     "ct_reference_source": "warped_filled",            # left | warped_filled
+    "ct_warped_fill_mode": "hybrid",            # telea | directional | hybrid
     "mask_binarize_threshold": -0.01,   # used for stats-mask and optional binarize step if you add it later
 
     # Replace mask
@@ -129,6 +130,149 @@ def _telea_inpaint_rgb_uint8(frame_rgb_u8: np.ndarray, mask_u8: np.ndarray, radi
         return frame_rgb_u8
 
 
+def _normalize_warped_fill_mode(fill_mode: str) -> str:
+    mode = str(fill_mode).strip().lower().replace("-", "_")
+    if mode not in ("telea", "directional", "hybrid"):
+        return "hybrid"
+    return mode
+
+
+def _directional_fill_rgb_uint8(
+    frame_rgb_u8: np.ndarray,
+    mask_u8: np.ndarray,
+    border_tol_px: int = 2,
+) -> np.ndarray:
+    """
+    Directional fill for warped_filled reference:
+    - default runs copy color from RIGHT side of each masked run
+    - runs touching RIGHT border (with tolerance) copy from LEFT side
+
+    Direction is decided per row/run (not per connected component), so the side
+    can switch inside the same connected shape.
+    """
+    try:
+        if frame_rgb_u8.ndim != 3 or frame_rgb_u8.shape[2] != 3:
+            return frame_rgb_u8
+        if mask_u8.ndim != 2:
+            return frame_rgb_u8
+        h, w = mask_u8.shape
+        if h != frame_rgb_u8.shape[0] or w != frame_rgb_u8.shape[1]:
+            return frame_rgb_u8
+
+        mask_bin = (mask_u8 > 0).astype(np.uint8)
+        if not np.any(mask_bin):
+            return frame_rgb_u8.copy()
+
+        out = frame_rgb_u8.copy()
+        border_cols = max(1, min(int(border_tol_px), w))
+        right_touch_start = w - border_cols
+
+        def _find_valid_x(y: int, start_x: int, step: int) -> int:
+            x = int(start_x)
+            while 0 <= x < w:
+                if mask_bin[y, x] == 0:
+                    return x
+                x += step
+            return -1
+
+        for y in range(h):
+            xs = np.flatnonzero(mask_bin[y])
+            if xs.size == 0:
+                continue
+
+            run_start = int(xs[0])
+            prev = int(xs[0])
+
+            def _paint_run(a: int, b: int):
+                touches_left = a < border_cols
+                touches_right = b >= right_touch_start
+                prefer_left = touches_right and not touches_left
+                if prefer_left:
+                    src_x = _find_valid_x(y, a - 1, -1)
+                    if src_x < 0:
+                        src_x = _find_valid_x(y, b + 1, 1)
+                else:
+                    src_x = _find_valid_x(y, b + 1, 1)
+                    if src_x < 0:
+                        src_x = _find_valid_x(y, a - 1, -1)
+                if src_x >= 0:
+                    out[y, a : b + 1, :] = frame_rgb_u8[y, src_x : src_x + 1, :]
+
+            for cur in xs[1:]:
+                cur = int(cur)
+                if cur != prev + 1:
+                    _paint_run(run_start, prev)
+                    run_start = cur
+                prev = cur
+            _paint_run(run_start, prev)
+
+        return out
+    except Exception as e:
+        LOG.error(f"Directional fill failed: {e!r}", exc_info=True)
+        return frame_rgb_u8
+
+
+def _build_warped_filled_reference(
+    frame_rgb_u8: np.ndarray,
+    mask_u8: np.ndarray,
+    fill_mode: str = "hybrid",
+    border_tol_px: int = 2,
+    telea_radius: int = 3,
+) -> np.ndarray:
+    mode = _normalize_warped_fill_mode(fill_mode)
+    if mode == "telea":
+        return _telea_inpaint_rgb_uint8(frame_rgb_u8, mask_u8, radius=telea_radius)
+
+    directional = _directional_fill_rgb_uint8(
+        frame_rgb_u8, mask_u8, border_tol_px=border_tol_px
+    )
+    if mode == "directional":
+        return directional
+
+    # Hybrid: keep TELEA as base and replace only runs that touch the right border
+    # (with tolerance) with directional fill.
+    try:
+        mask_bin = (mask_u8 > 0).astype(np.uint8)
+        if not np.any(mask_bin):
+            return frame_rgb_u8.copy()
+
+        h, w = mask_bin.shape
+        border_cols = max(1, min(int(border_tol_px), w))
+        edge_mask = np.zeros((h, w), dtype=bool)
+        right_touch_start = w - border_cols
+        for y in range(h):
+            xs = np.flatnonzero(mask_bin[y])
+            if xs.size == 0:
+                continue
+            run_start = int(xs[0])
+            prev = int(xs[0])
+            for cur in xs[1:]:
+                cur = int(cur)
+                if cur != prev + 1:
+                    a, b = run_start, prev
+                    touches_left = a < border_cols
+                    touches_right = b >= right_touch_start
+                    if touches_right and not touches_left:
+                        edge_mask[y, a : b + 1] = True
+                    run_start = cur
+                prev = cur
+            a, b = run_start, prev
+            touches_left = a < border_cols
+            touches_right = b >= right_touch_start
+            if touches_right and not touches_left:
+                edge_mask[y, a : b + 1] = True
+
+        if not np.any(edge_mask):
+            return _telea_inpaint_rgb_uint8(frame_rgb_u8, mask_u8, radius=telea_radius)
+
+        telea = _telea_inpaint_rgb_uint8(frame_rgb_u8, mask_u8, radius=telea_radius)
+        telea[edge_mask] = directional[edge_mask]
+        return telea
+    except Exception as e:
+        LOG.error(f"Hybrid warped fill failed: {e!r}", exc_info=True)
+        return _telea_inpaint_rgb_uint8(frame_rgb_u8, mask_u8, radius=telea_radius)
+
+
 def _make_stats_mask(
     mask_1hw: torch.Tensor,
     stats_region: str,
@@ -158,7 +302,95 @@ def _make_stats_mask(
     if ring_width <= 0:
         return inv
 
-    mm = (m > 0.5).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    # Directional ring by row/run:
+    # - default runs: collect stats on RIGHT side of mask
+    # - runs touching RIGHT border (2px tol): collect on LEFT side
+    # Ring width adapts to ROI/run size: effective width = min(ring_width, run_len).
+    base = (m > 0.5).float()
+    base_np = (base.detach().cpu().numpy() > 0.5).astype(np.uint8)
+    h, w = base_np.shape
+    if h <= 0 or w <= 0:
+        return inv
+
+    border_tol_px = 2
+    border_cols = max(1, min(border_tol_px, w))
+    rw = int(ring_width)
+    if rw <= 0:
+        return inv
+    right_touch_start = w - border_cols
+    ring_right = np.zeros_like(base_np, dtype=np.uint8)
+    ring_left = np.zeros_like(base_np, dtype=np.uint8)
+
+    for y in range(h):
+        xs = np.flatnonzero(base_np[y])
+        if xs.size == 0:
+            continue
+        run_start = int(xs[0])
+        prev = int(xs[0])
+        for cur in xs[1:]:
+            cur = int(cur)
+            if cur != prev + 1:
+                a, b = run_start, prev
+                run_len = int(b - a + 1)
+                width = max(1, min(rw, run_len))
+                touches_left = a < border_cols
+                touches_right = b >= right_touch_start
+                if touches_right and not touches_left:
+                    x1 = a
+                    x0 = max(0, x1 - width)
+                    if x0 < x1:
+                        ring_left[y, x0:x1] = 1
+                    else:
+                        xr0 = b + 1
+                        xr1 = min(w, xr0 + width)
+                        if xr0 < xr1:
+                            ring_right[y, xr0:xr1] = 1
+                else:
+                    x0 = b + 1
+                    x1 = min(w, x0 + width)
+                    if x0 < x1:
+                        ring_right[y, x0:x1] = 1
+                    else:
+                        xl1 = a
+                        xl0 = max(0, xl1 - width)
+                        if xl0 < xl1:
+                            ring_left[y, xl0:xl1] = 1
+                run_start = cur
+            prev = cur
+
+        a, b = run_start, prev
+        run_len = int(b - a + 1)
+        width = max(1, min(rw, run_len))
+        touches_left = a < border_cols
+        touches_right = b >= right_touch_start
+        if touches_right and not touches_left:
+            x1 = a
+            x0 = max(0, x1 - width)
+            if x0 < x1:
+                ring_left[y, x0:x1] = 1
+            else:
+                xr0 = b + 1
+                xr1 = min(w, xr0 + width)
+                if xr0 < xr1:
+                    ring_right[y, xr0:xr1] = 1
+        else:
+            x0 = b + 1
+            x1 = min(w, x0 + width)
+            if x0 < x1:
+                ring_right[y, x0:x1] = 1
+            else:
+                xl1 = a
+                xl0 = max(0, xl1 - width)
+                if xl0 < xl1:
+                    ring_left[y, xl0:xl1] = 1
+
+    ring_bool = ((ring_right > 0) | (ring_left > 0)) & (base_np == 0)
+    if np.any(ring_bool):
+        ring = torch.from_numpy(ring_bool.astype(np.float32)).to(device=m.device, dtype=m.dtype)
+        return ring
+
+    # Fallback: isotropic outer ring, then nonmask.
+    mm = base.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
     k = int(ring_width) * 2 + 1
     pad = k // 2
     dil = F.max_pool2d(mm, kernel_size=k, stride=1, padding=pad)
@@ -184,10 +416,11 @@ def apply_shadow_blur(
     if num_steps <= 0:
         return mask
 
-    # Component-aware direction:
-    # - Components that touch only the RIGHT border -> propagate shadow to the LEFT.
-    # - All other components (left-edge or middle) keep legacy RIGHT propagation.
-    # This avoids accidental "double feather" on unrelated masks in the middle.
+    # Row/run-aware direction:
+    # - default: propagate shadow to the RIGHT.
+    # - for runs touching RIGHT border (2px tolerance), propagate to the LEFT.
+    # This lets direction switch inside the same connected component when a row
+    # no longer touches the border.
     border_tolerance_px = 2
     border_cols = max(1, min(border_tolerance_px, mask.shape[-1]))
     component_thresh = 0.05
@@ -202,35 +435,37 @@ def apply_shadow_blur(
         if frame_bin.max() == 0:
             continue
 
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(frame_bin, connectivity=8)
-        if num_labels <= 1:
-            continue
-
         width = frame_np.shape[1]
-        right_only_labels = []
-        default_right_labels = []
-
-        for lbl in range(1, num_labels):
-            x = int(stats[lbl, cv2.CC_STAT_LEFT])
-            w = int(stats[lbl, cv2.CC_STAT_WIDTH])
-            x2 = x + w - 1
-            touches_left = x < border_cols
-            touches_right = x2 >= (width - border_cols)
-
-            if touches_right and not touches_left:
-                right_only_labels.append(lbl)
-            else:
-                default_right_labels.append(lbl)
-
         frame_right = np.zeros_like(frame_np, dtype=np.float32)
         frame_left = np.zeros_like(frame_np, dtype=np.float32)
+        right_touch_start = width - border_cols
 
-        if default_right_labels:
-            sel = np.isin(labels, np.asarray(default_right_labels, dtype=labels.dtype))
-            frame_right[sel] = frame_np[sel]
-        if right_only_labels:
-            sel = np.isin(labels, np.asarray(right_only_labels, dtype=labels.dtype))
-            frame_left[sel] = frame_np[sel]
+        # Process each row independently so direction can switch within a component.
+        for y in range(frame_bin.shape[0]):
+            xs = np.flatnonzero(frame_bin[y])
+            if xs.size == 0:
+                continue
+            run_start = int(xs[0])
+            prev = int(xs[0])
+            for cur in xs[1:]:
+                cur = int(cur)
+                if cur != prev + 1:
+                    a, b = run_start, prev
+                    touches_left = a < border_cols
+                    touches_right = b >= right_touch_start
+                    if touches_right and not touches_left:
+                        frame_left[y, a : b + 1] = frame_np[y, a : b + 1]
+                    else:
+                        frame_right[y, a : b + 1] = frame_np[y, a : b + 1]
+                    run_start = cur
+                prev = cur
+            a, b = run_start, prev
+            touches_left = a < border_cols
+            touches_right = b >= right_touch_start
+            if touches_right and not touches_left:
+                frame_left[y, a : b + 1] = frame_np[y, a : b + 1]
+            else:
+                frame_right[y, a : b + 1] = frame_np[y, a : b + 1]
 
         stamp_source_right[t, 0] = torch.from_numpy(frame_right)
         stamp_source_left[t, 0] = torch.from_numpy(frame_left)
@@ -1013,7 +1248,13 @@ def process_one_job(
                         wf = warped_original[fi].cpu()
                         wf_u8 = (torch.clamp(wf, 0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                         mm = (mask_bin[fi].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-                        ref_u8 = _telea_inpaint_rgb_uint8(wf_u8, mm, radius=3)
+                        ref_u8 = _build_warped_filled_reference(
+                            wf_u8,
+                            mm,
+                            fill_mode=str(settings.get("ct_warped_fill_mode", "hybrid")),
+                            border_tol_px=2,
+                            telea_radius=3,
+                        )
                         ref = torch.from_numpy(ref_u8).permute(2, 0, 1).float() / 255.0
                     else:
                         ref = original_left[fi].cpu()
@@ -1131,6 +1372,7 @@ def main() -> int:
     ap.add_argument("--ct-ring-width", type=int, default=None)
     ap.add_argument("--ct-target-stats-source", choices=["warped", "inpainted"], default=None)
     ap.add_argument("--ct-reference-source", choices=["left", "warped_filled"], default=None)
+    ap.add_argument("--ct-warped-fill-mode", choices=["telea", "directional", "hybrid"], default=None)
     ap.add_argument("--mask-binarize-threshold", type=float, default=None, help="Threshold for building binary stats mask; -1 disables")
     ap.add_argument("--use-replace-mask", action="store_true", default=None)
     ap.add_argument("--replace-mask-folder", default=None)
@@ -1199,6 +1441,8 @@ def main() -> int:
         settings["ct_target_stats_source"] = args.ct_target_stats_source
     if args.ct_reference_source is not None:
         settings["ct_reference_source"] = args.ct_reference_source
+    if args.ct_warped_fill_mode is not None:
+        settings["ct_warped_fill_mode"] = args.ct_warped_fill_mode
     if args.mask_binarize_threshold is not None:
         settings["mask_binarize_threshold"] = float(args.mask_binarize_threshold)
 

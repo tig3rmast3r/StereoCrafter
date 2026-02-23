@@ -19,6 +19,7 @@
     "add_borders": "If checked, applies borders from sidecar files to mask edge artifacts. Uncheck to disable border application for testing.",
     "resume": "If checked, moves processed files to a 'finished' subfolder after successful encoding and skips them on subsequent runs. Useful for resuming interrupted batch processing.",
     "enable_color_transfer": "Transfers the color palette from the original left-eye view to the inpainted right-eye view to correct color shifts from the inpainting model.",
+    "ct_warped_fill_mode": "Only used when Reference is 'warped_filled'. telea: OpenCV Telea inpaint (isotropic). directional: copy color directionally (right side by default, left side for mask components touching the right border with 2px tolerance). hybrid: Telea base with directional override only on right-edge components.",
     "batch_chunk_size": "The number of frames to process in memory at one time during batch processing. Lower this value if you run out of RAM on long videos.",
 
     "start_blending": "Starts the batch process to merge all found videos using the current settings.",
