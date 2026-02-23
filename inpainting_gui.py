@@ -1944,10 +1944,11 @@ class InpaintingGUI(ThemedTk):
             # Guard-frame policy:
             # - Non-last chunk: read tail_pad extra REAL frames and discard them from output.
             # - Last chunk: append tail_pad DUPLICATED tail frames and discard them from output.
-            next_chunk_start = i + stride
-            is_last_chunk = next_chunk_start >= total_frames_to_process_actual
-            guard_extra_real = 0 if is_last_chunk else tail_pad
-            end_idx_for_slicing = min(i + frames_chunk + guard_extra_real, total_frames_to_process_actual)
+            # A chunk is "last" when its core real span reaches EOF.
+            # Using next_chunk_start can misclassify near-tail chunks and drop frames.
+            is_last_chunk = (i + frames_chunk) >= total_frames_to_process_actual
+            guard_extra_real_requested = 0 if is_last_chunk else tail_pad
+            end_idx_for_slicing = min(i + frames_chunk + guard_extra_real_requested, total_frames_to_process_actual)
             if stream_input_enabled:
                 (original_input_frames_slice, mask_frames_slice,
                  warped_unpadded_slice, mask_unpadded_slice, left_unpadded_slice) = self._read_and_prepare_chunk_from_reader(
@@ -1964,7 +1965,14 @@ class InpaintingGUI(ThemedTk):
                 if not is_dual_input and frames_left_original_cropped is not None:
                     left_unpadded_slice = frames_left_original_cropped[i:end_idx_for_slicing]
             actual_sliced_length = original_input_frames_slice.shape[0]
-            emit_sliced_length = actual_sliced_length if is_last_chunk else max(0, actual_sliced_length - tail_pad)
+            if is_last_chunk:
+                guard_extra_real_actual = 0
+                emit_sliced_length = actual_sliced_length
+            else:
+                # If we are close to EOF, we may have fewer real guard frames than requested.
+                # Drop only the guard frames we actually have.
+                guard_extra_real_actual = max(0, actual_sliced_length - frames_chunk)
+                emit_sliced_length = max(0, actual_sliced_length - guard_extra_real_actual)
 
             if emit_sliced_length <= 0:
                 logger.debug(f"Skipping empty chunk at frame {i} (actual_sliced_length={actual_sliced_length}).")
@@ -2021,7 +2029,7 @@ class InpaintingGUI(ThemedTk):
             real_len = actual_sliced_length
             guard_dup = tail_pad if is_last_chunk else 0
             # "tail_pad" is now strictly the non-last guard frames used for chunk handoff.
-            tail_pad_used = guard_extra_real
+            tail_pad_used = guard_extra_real_actual
             will_emit = emit_sliced_length if i == 0 else max(0, emit_sliced_length - overlap)
             logger.info(
                 f"Starting inference chunk real_idx={real_start_idx}-{real_end_idx} "
@@ -2165,6 +2173,10 @@ class InpaintingGUI(ThemedTk):
                     mask_unpadded_accum.append(mask_unpadded_slice[offset:end_off].detach().cpu())
                     if (not is_dual_input) and left_unpadded_accum is not None and left_unpadded_slice is not None:
                         left_unpadded_accum.append(left_unpadded_slice[offset:end_off].detach().cpu())
+
+            # Stop after processing the true last chunk.
+            if is_last_chunk:
+                break
         # If streaming encoding is enabled, we have already written frames to ffmpeg as they were generated.
         if stream_encode_enabled and ffmpeg_p is not None and video_only_path is not None:
             if update_info_callback:

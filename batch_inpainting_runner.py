@@ -31,7 +31,7 @@ except Exception:
 
 import inpainting_gui as igs
 
-RESTART_EVERY = 15           # or from env/arg
+RESTART_EVERY = 0           # or from env/arg
 PLANNED_RESTART_CODE = 99
 class _Var:
     """Tiny stand-in for tkinter's StringVar/BooleanVar/IntVar."""
