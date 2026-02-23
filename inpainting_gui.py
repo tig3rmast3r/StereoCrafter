@@ -2031,7 +2031,22 @@ class InpaintingGUI(ThemedTk):
             model_len = int(input_frames_to_pipeline.shape[0])
             # "tail_pad" is now strictly the non-last guard frames used for chunk handoff.
             tail_pad_used = guard_extra_real_actual
-            will_emit = emit_sliced_length if i == 0 else max(0, emit_sliced_length - overlap)
+            planned_end_emit = emit_sliced_length if is_last_chunk else min(stride, emit_sliced_length)
+            if i == 0:
+                will_emit = planned_end_emit
+            else:
+                overlap_actual_for_log = 0
+                if overlap > 0 and previous_chunk_output_frames is not None:
+                    overlap_actual_for_log = min(
+                        overlap,
+                        int(previous_chunk_output_frames.shape[0]),
+                        int(planned_end_emit),
+                    )
+                if overlap_actual_for_log > 0:
+                    # Cross-fade keeps overlap in output (blended with previous chunk).
+                    will_emit = planned_end_emit
+                else:
+                    will_emit = max(0, planned_end_emit - min(overlap, planned_end_emit))
             logger.info(
                 f"Starting inference chunk idx={real_start_idx}-{real_end_idx} "
                 f"(len={real_len}, overlap={overlap}, "
@@ -2063,13 +2078,45 @@ class InpaintingGUI(ThemedTk):
             ]).cpu()
             self._save_debug_image(current_chunk_generated, f"07_inpainted_chunk_{i}", base_video_name, i)
 
-            # Emit only the "new" frames
+            # Emit frames with temporal cross-fade on overlap boundaries.
+            source_start_off = 0
             if i == 0:
-                chunk_new = current_chunk_generated[:emit_sliced_length]
-                global_start = 0
+                end_emit = planned_end_emit
+                chunk_new = current_chunk_generated[:end_emit]
+                source_start_off = 0
             else:
-                chunk_new = current_chunk_generated[overlap:emit_sliced_length]
-                global_start = i + overlap
+                overlap_actual = 0
+                if overlap > 0 and previous_chunk_output_frames is not None:
+                    overlap_actual = min(
+                        overlap,
+                        int(previous_chunk_output_frames.shape[0]),
+                        int(current_chunk_generated.shape[0]),
+                        int(planned_end_emit),
+                    )
+
+                end_emit = planned_end_emit
+                if overlap_actual > 0:
+                    weights = torch.linspace(
+                        0.0,
+                        1.0,
+                        overlap_actual,
+                        device=current_chunk_generated.device,
+                    ).view(-1, 1, 1, 1)
+                    prev_overlap = previous_chunk_output_frames[-overlap_actual:]
+                    curr_overlap = current_chunk_generated[:overlap_actual]
+                    blended_overlap = (1.0 - weights) * prev_overlap + weights * curr_overlap
+
+                    if end_emit < overlap_actual:
+                        end_emit = overlap_actual
+                    rest = current_chunk_generated[overlap_actual:end_emit]
+                    chunk_new = torch.cat([blended_overlap, rest], dim=0)
+                    source_start_off = 0
+                else:
+                    start_emit = min(overlap, planned_end_emit)
+                    if end_emit < start_emit:
+                        end_emit = start_emit
+                    chunk_new = current_chunk_generated[start_emit:end_emit]
+                    source_start_off = start_emit
 
             # Keep only overlap tail (on CPU) for the next chunk to reduce VRAM growth
             if overlap > 0 and emit_sliced_length >= overlap:
@@ -2083,15 +2130,14 @@ class InpaintingGUI(ThemedTk):
 
                 # Per-chunk unpadded tensors for post-processing (match emitted frames)
                 chunk_len = chunk_new.shape[0]
-                if i == 0:
-                    mask_chunk = mask_unpadded_slice[:chunk_len]
-                    warped_chunk = warped_unpadded_slice[:chunk_len]
-                    left_chunk = left_unpadded_slice[:chunk_len] if left_unpadded_slice is not None else None
-                else:
-                    start_off = overlap
-                    mask_chunk = mask_unpadded_slice[start_off:start_off + chunk_len]
-                    warped_chunk = warped_unpadded_slice[start_off:start_off + chunk_len]
-                    left_chunk = left_unpadded_slice[start_off:start_off + chunk_len] if left_unpadded_slice is not None else None
+                start_off = source_start_off
+                mask_chunk = mask_unpadded_slice[start_off:start_off + chunk_len]
+                warped_chunk = warped_unpadded_slice[start_off:start_off + chunk_len]
+                left_chunk = (
+                    left_unpadded_slice[start_off:start_off + chunk_len]
+                    if left_unpadded_slice is not None
+                    else None
+                )
 
                 # Color transfer (chunk-wise)
                 if self.enable_color_transfer.get():
@@ -2160,10 +2206,7 @@ class InpaintingGUI(ThemedTk):
                     _write_rgb_frame(ffmpeg_p, out_np[t])
             else:
                 # Non-streaming fallback: accumulate results in RAM
-                if i == 0:
-                    offset = 0
-                else:
-                    offset = overlap
+                offset = source_start_off
                 new_frames = chunk_new
                 results.append(new_frames)
 
