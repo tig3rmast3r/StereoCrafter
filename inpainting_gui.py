@@ -2028,13 +2028,14 @@ class InpaintingGUI(ThemedTk):
             real_end_idx = end_idx_for_slicing - 1
             real_len = actual_sliced_length
             guard_dup = tail_pad if is_last_chunk else 0
+            model_len = int(input_frames_to_pipeline.shape[0])
             # "tail_pad" is now strictly the non-last guard frames used for chunk handoff.
             tail_pad_used = guard_extra_real_actual
             will_emit = emit_sliced_length if i == 0 else max(0, emit_sliced_length - overlap)
             logger.info(
-                f"Starting inference chunk real_idx={real_start_idx}-{real_end_idx} "
-                f"(real_len={real_len}, overlap={overlap}, "
-                f"guard_dup={guard_dup}, tail_pad={tail_pad_used}, will_emit={will_emit})..."
+                f"Starting inference chunk idx={real_start_idx}-{real_end_idx} "
+                f"(len={real_len}, overlap={overlap}, "
+                f"guard_dup={guard_dup}, tail_pad={tail_pad_used}, model={model_len}, output={will_emit})..."
             )
             start_time = time.time()
 
