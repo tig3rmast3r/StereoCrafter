@@ -3,12 +3,15 @@ set -euo pipefail
 
 # Stage 1:
 # - System deps
-# - Clone/update your fork
+# - Use current cloned repo
 # - Install Python deps WITHOUT torch stack
 # - Build/install Forward-Warp CUDA extension
 
-REPO_URL="${REPO_URL:-https://github.com/tig3rmast3r/StereoCrafter.git}"
-REPO_DIR="${REPO_DIR:-/workspace/StereoCrafter}"
+SCRIPT_DIR="$(
+  cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1
+  pwd -P
+)"
+REPO_DIR="${REPO_DIR:-${SCRIPT_DIR}}"
 VENV_PATH="${VENV_PATH:-/venv/main}"
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
 MAX_JOBS="${MAX_JOBS:-8}"
@@ -33,13 +36,18 @@ ${SUDO} apt-get update
 ${SUDO} apt-get install -y software-properties-common
 ${SUDO} apt-get install -y git git-lfs ffmpeg build-essential cmake ninja-build pkg-config libgl1 libglib2.0-0
 
-echo "[INFO] Cloning/updating repository..."
+echo "[INFO] Using repository at: ${REPO_DIR}"
 if [[ ! -d "${REPO_DIR}/.git" ]]; then
-  git clone --recursive "${REPO_URL}" "${REPO_DIR}"
-else
-  git -C "${REPO_DIR}" remote set-url origin "${REPO_URL}" || true
-  git -C "${REPO_DIR}" submodule update --init --recursive
+  echo "[ERR] No git repo found at ${REPO_DIR}"
+  echo "[ERR] Clone first, then run this script from inside StereoCrafter."
+  echo "[ERR] Example:"
+  echo "      cd /workspace"
+  echo "      git clone --recursive https://github.com/tig3rmast3r/StereoCrafter"
+  echo "      cd StereoCrafter && ./setup_vast_stage1.sh"
+  exit 2
 fi
+
+git -C "${REPO_DIR}" submodule update --init --recursive
 
 cd "${REPO_DIR}"
 python -m pip install -U pip setuptools wheel
