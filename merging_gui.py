@@ -7,7 +7,7 @@ import gc
 import tkinter as tk  # Used for PanedWindow
 from tkinter import filedialog, messagebox, ttk
 from ttkthemes import ThemedTk
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Dict, List, Any
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -17,6 +17,8 @@ from decord import VideoReader, cpu
 import logging
 import time
 import queue
+import faulthandler
+from concurrent.futures import ThreadPoolExecutor
 from dependency.stereocrafter_util import (
     Tooltip,
     logger,
@@ -40,6 +42,31 @@ from dependency.stereocrafter_util import (
 from dependency.video_previewer import VideoPreviewer
 
 GUI_VERSION = "26-02-08.3"
+_FAULTHANDLER_LOG = None
+
+
+def _enable_debug_faulthandler() -> None:
+    """Enable crash stack dumps when debug mode is enabled."""
+    global _FAULTHANDLER_LOG
+    try:
+        os.makedirs("logs", exist_ok=True)
+        log_path = os.path.join("logs", "merging_gui_faulthandler.log")
+        _FAULTHANDLER_LOG = open(log_path, "a", buffering=1)
+        _FAULTHANDLER_LOG.write(
+            f"\n=== debug session {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} ===\n"
+        )
+        _FAULTHANDLER_LOG.flush()
+        faulthandler.enable(file=_FAULTHANDLER_LOG, all_threads=True)
+        logger.info(f"Debug faulthandler active: {log_path}")
+    except Exception as e:
+        logger.warning(f"Failed to enable debug faulthandler: {e}")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 # --- MASK PROCESSING FUNCTIONS (from test.py) ---
@@ -128,48 +155,50 @@ def apply_shadow_blur(
 
     stamp_source_right = torch.zeros_like(mask)
     stamp_source_left = torch.zeros_like(mask)
-    mask_cpu = mask.detach().cpu()
+    mask_cpu = mask.detach().to(device="cpu")
+    height = int(mask_cpu.shape[2])
+    width = int(mask_cpu.shape[3])
+    right_touch_start = width - border_cols
 
     for t in range(mask_cpu.shape[0]):
-        frame_np = mask_cpu[t, 0].numpy().astype(np.float32, copy=False)
-        frame_bin = (frame_np > component_thresh).astype(np.uint8)
-        if frame_bin.max() == 0:
+        frame = mask_cpu[t, 0]
+        frame_bin = frame > component_thresh
+        if not bool(frame_bin.any().item()):
             continue
 
-        width = frame_np.shape[1]
-        frame_right = np.zeros_like(frame_np, dtype=np.float32)
-        frame_left = np.zeros_like(frame_np, dtype=np.float32)
-        right_touch_start = width - border_cols
+        frame_right = torch.zeros_like(frame)
+        frame_left = torch.zeros_like(frame)
 
         # Process each row independently so direction can switch within a component.
-        for y in range(frame_bin.shape[0]):
-            xs = np.flatnonzero(frame_bin[y])
-            if xs.size == 0:
+        for y in range(height):
+            xs = torch.where(frame_bin[y])[0]
+            n = int(xs.numel())
+            if n == 0:
                 continue
-            run_start = int(xs[0])
-            prev = int(xs[0])
-            for cur in xs[1:]:
-                cur = int(cur)
+            run_start = int(xs[0].item())
+            prev = run_start
+            for idx in range(1, n):
+                cur = int(xs[idx].item())
                 if cur != prev + 1:
                     a, b = run_start, prev
                     touches_left = a < border_cols
                     touches_right = b >= right_touch_start
                     if touches_right and not touches_left:
-                        frame_left[y, a : b + 1] = frame_np[y, a : b + 1]
+                        frame_left[y, a : b + 1] = frame[y, a : b + 1]
                     else:
-                        frame_right[y, a : b + 1] = frame_np[y, a : b + 1]
+                        frame_right[y, a : b + 1] = frame[y, a : b + 1]
                     run_start = cur
                 prev = cur
             a, b = run_start, prev
             touches_left = a < border_cols
             touches_right = b >= right_touch_start
             if touches_right and not touches_left:
-                frame_left[y, a : b + 1] = frame_np[y, a : b + 1]
+                frame_left[y, a : b + 1] = frame[y, a : b + 1]
             else:
-                frame_right[y, a : b + 1] = frame_np[y, a : b + 1]
+                frame_right[y, a : b + 1] = frame[y, a : b + 1]
 
-        stamp_source_right[t, 0] = torch.from_numpy(frame_right)
-        stamp_source_left[t, 0] = torch.from_numpy(frame_left)
+        stamp_source_right[t, 0] = frame_right
+        stamp_source_left[t, 0] = frame_left
 
     stamp_source_right = stamp_source_right.to(device=mask.device, dtype=mask.dtype)
     stamp_source_left = stamp_source_left.to(device=mask.device, dtype=mask.dtype)
@@ -621,6 +650,490 @@ def apply_color_transfer_safe(
 
 # --- END COLOR TRANSFER (SAFE) HELPERS ---
 
+# --- CT PRESETS (ranked by effectiveness from analyzer) ---
+CT_PRESETS: List[Dict[str, Any]] = [
+    {
+        "id": 1,
+        "label": "1) safe sr=ring ts=inpainted ref=warped",
+        "mode": "safe",
+        "stats_region": "ring",
+        "target_stats_source": "inpainted",
+        "reference_source": "warped_filled",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 2,
+        "label": "2) safe sr=ring ts=inpainted ref=left",
+        "mode": "safe",
+        "stats_region": "ring",
+        "target_stats_source": "inpainted",
+        "reference_source": "left",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 3,
+        "label": "3) safe sr=global ts=inpainted ref=warped_filled fill=directional",
+        "mode": "safe",
+        "stats_region": "global",
+        "target_stats_source": "inpainted",
+        "reference_source": "warped_filled",
+        "warped_fill_mode": "directional",
+    },
+    {
+        "id": 4,
+        "label": "4) safe sr=nonmask ts=inpainted ref=left",
+        "mode": "safe",
+        "stats_region": "nonmask",
+        "target_stats_source": "inpainted",
+        "reference_source": "left",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 5,
+        "label": "5) safe sr=nonmask ts=inpainted ref=warped",
+        "mode": "safe",
+        "stats_region": "nonmask",
+        "target_stats_source": "inpainted",
+        "reference_source": "warped_filled",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 6,
+        "label": "6) safe sr=global ts=inpainted ref=left",
+        "mode": "safe",
+        "stats_region": "global",
+        "target_stats_source": "inpainted",
+        "reference_source": "left",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 7,
+        "label": "7) legacy",
+        "mode": "legacy",
+        "stats_region": "ring",
+        "target_stats_source": "inpainted",
+        "reference_source": "left",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 8,
+        "label": "8) safe sr=ring ts=warped ref=left",
+        "mode": "safe",
+        "stats_region": "ring",
+        "target_stats_source": "warped",
+        "reference_source": "left",
+        "warped_fill_mode": "telea",
+    },
+]
+
+CT_PRESET_LABELS = [p["label"] for p in CT_PRESETS]
+CT_PRESET_BY_LABEL = {p["label"]: p for p in CT_PRESETS}
+CT_PRESET_BY_ID = {int(p["id"]): p for p in CT_PRESETS}
+CT_PRESET_DEFAULT_LABEL = CT_PRESET_LABELS[0]
+# Auto-eval order optimized to reuse caches (stats/ref) across adjacent presets.
+CT_PRESET_AUTO_EVAL_ORDER = [1, 2, 8, 4, 5, 6, 3, 7]
+CT_AUTO_EVAL_MAX_WORKERS = 3
+
+
+def _build_auto_ct_eval_groups(
+    preset_order: List[int],
+) -> Tuple[List[List[int]], List[int]]:
+    """
+    Build fixed groups for auto-eval:
+    - parallel: ring, nonmask, global (max 3 workers)
+    - serial: legacy/other
+    """
+    grouped: Dict[str, List[int]] = {"ring": [], "nonmask": [], "global": []}
+    serial_ids: List[int] = []
+    for pid in preset_order:
+        preset = CT_PRESET_BY_ID[int(pid)]
+        mode = str(preset.get("mode", "safe"))
+        if mode == "legacy":
+            serial_ids.append(int(pid))
+            continue
+        sr = str(preset.get("stats_region", "ring"))
+        if sr in grouped:
+            grouped[sr].append(int(pid))
+        else:
+            serial_ids.append(int(pid))
+
+    parallel_groups: List[List[int]] = []
+    for key in ("ring", "nonmask", "global"):
+        if grouped[key]:
+            parallel_groups.append(grouped[key])
+    return parallel_groups, serial_ids
+
+
+CT_AUTO_EVAL_PARALLEL_GROUPS, CT_AUTO_EVAL_SERIAL_IDS = _build_auto_ct_eval_groups(
+    CT_PRESET_AUTO_EVAL_ORDER
+)
+
+
+def _is_better_auto_ct_candidate(
+    score: float,
+    preset_id: int,
+    best_score: float,
+    best_preset_id: int,
+    order_index: Dict[int, int],
+) -> bool:
+    if score > best_score:
+        return True
+    if score < best_score:
+        return False
+    # Stable tie-break: preserve canonical auto-eval order.
+    return order_index.get(int(preset_id), 10**9) < order_index.get(
+        int(best_preset_id), 10**9
+    )
+
+
+def _eval_auto_ct_subset(
+    preset_ids: List[int],
+    inpainted_3: torch.Tensor,
+    original_left_3: torch.Tensor,
+    warped_3: torch.Tensor,
+    mask_bin_1hw: torch.Tensor,
+    settings: Dict[str, Any],
+    eval_ref_lab: Optional[np.ndarray],
+    mask_bool: np.ndarray,
+    order_index: Dict[int, int],
+) -> Tuple[float, torch.Tensor, int]:
+    stats_valid_cache: Dict[str, torch.Tensor] = {}
+    warped_ref_cache: Dict[str, torch.Tensor] = {}
+
+    best_score = -1.0
+    best_frame = inpainted_3
+    best_preset_id = int(preset_ids[0]) if preset_ids else int(CT_PRESET_AUTO_EVAL_ORDER[0])
+
+    for pid in preset_ids:
+        preset = CT_PRESET_BY_ID[int(pid)]
+        adjusted_3 = _apply_ct_preset_frame(
+            preset=preset,
+            inpainted_3=inpainted_3,
+            original_left_3=original_left_3,
+            warped_3=warped_3,
+            mask_bin_1hw=mask_bin_1hw,
+            settings=settings,
+            stats_valid_cache=stats_valid_cache,
+            warped_ref_cache=warped_ref_cache,
+        )
+        if eval_ref_lab is not None:
+            score = _masked_delta_e_score(
+                pred_rgb01=_tensor_chw_to_rgb_np01(adjusted_3),
+                ref_lab32=eval_ref_lab,
+                mask_bool=mask_bool,
+            )
+        else:
+            score = 0.0
+        if _is_better_auto_ct_candidate(
+            score,
+            int(pid),
+            best_score,
+            best_preset_id,
+            order_index,
+        ):
+            best_score = score
+            best_frame = adjusted_3
+            best_preset_id = int(pid)
+
+    return best_score, best_frame, best_preset_id
+
+
+def _select_best_auto_ct_preset_frame(
+    inpainted_3: torch.Tensor,
+    original_left_3: torch.Tensor,
+    warped_3: torch.Tensor,
+    mask_bin_1hw: torch.Tensor,
+    settings: Dict[str, Any],
+    fallback_preset_id: int,
+    executor: Optional[ThreadPoolExecutor] = None,
+) -> Tuple[torch.Tensor, int]:
+    mask_bool = mask_bin_1hw.squeeze(0).cpu().numpy() > 0.5
+    if int(mask_bool.sum()) > 0:
+        mm_u8 = mask_bool.astype(np.uint8) * 255
+        warped_u8 = (np.clip(_tensor_chw_to_rgb_np01(warped_3), 0.0, 1.0) * 255.0).astype(
+            np.uint8
+        )
+        eval_ref_u8 = _build_ring_shift_reference(warped_u8, mm_u8, border_tol_px=2)
+        eval_ref_lab = _rgb01_to_lab32(eval_ref_u8.astype(np.float32) / 255.0)
+    else:
+        eval_ref_lab = None
+
+    order_index = {int(pid): i for i, pid in enumerate(CT_PRESET_AUTO_EVAL_ORDER)}
+    best_score = -1.0
+    best_frame = inpainted_3
+    best_preset_id = int(fallback_preset_id)
+
+    def _consider(candidate: Tuple[float, torch.Tensor, int]) -> None:
+        nonlocal best_score, best_frame, best_preset_id
+        score, frame, pid = candidate
+        if _is_better_auto_ct_candidate(
+            score, int(pid), best_score, best_preset_id, order_index
+        ):
+            best_score = score
+            best_frame = frame
+            best_preset_id = int(pid)
+
+    if executor is not None and CT_AUTO_EVAL_PARALLEL_GROUPS:
+        futures = [
+            executor.submit(
+                _eval_auto_ct_subset,
+                preset_ids=group,
+                inpainted_3=inpainted_3,
+                original_left_3=original_left_3,
+                warped_3=warped_3,
+                mask_bin_1hw=mask_bin_1hw,
+                settings=settings,
+                eval_ref_lab=eval_ref_lab,
+                mask_bool=mask_bool,
+                order_index=order_index,
+            )
+            for group in CT_AUTO_EVAL_PARALLEL_GROUPS
+        ]
+        for fut in futures:
+            _consider(fut.result())
+    else:
+        for group in CT_AUTO_EVAL_PARALLEL_GROUPS:
+            _consider(
+                _eval_auto_ct_subset(
+                    preset_ids=group,
+                    inpainted_3=inpainted_3,
+                    original_left_3=original_left_3,
+                    warped_3=warped_3,
+                    mask_bin_1hw=mask_bin_1hw,
+                    settings=settings,
+                    eval_ref_lab=eval_ref_lab,
+                    mask_bool=mask_bool,
+                    order_index=order_index,
+                )
+            )
+
+    if CT_AUTO_EVAL_SERIAL_IDS:
+        _consider(
+            _eval_auto_ct_subset(
+                preset_ids=CT_AUTO_EVAL_SERIAL_IDS,
+                inpainted_3=inpainted_3,
+                original_left_3=original_left_3,
+                warped_3=warped_3,
+                mask_bin_1hw=mask_bin_1hw,
+                settings=settings,
+                eval_ref_lab=eval_ref_lab,
+                mask_bool=mask_bool,
+                order_index=order_index,
+            )
+        )
+
+    return best_frame, best_preset_id
+
+
+def _resolve_ct_preset_label(value: str) -> str:
+    v = str(value or "").strip()
+    if v in CT_PRESET_BY_LABEL:
+        return v
+    return CT_PRESET_DEFAULT_LABEL
+
+
+def _parse_ct_preset_arg(value: str) -> str:
+    v = str(value or "").strip()
+    if not v:
+        return CT_PRESET_DEFAULT_LABEL
+    if v.isdigit():
+        pid = int(v)
+        if pid in CT_PRESET_BY_ID:
+            return CT_PRESET_BY_ID[pid]["label"]
+    return _resolve_ct_preset_label(v)
+
+
+def _tensor_chw_to_rgb_np01(t: torch.Tensor) -> np.ndarray:
+    x = t.detach().cpu().float()
+    if x.dim() == 4 and x.shape[0] == 1:
+        x = x[0]
+    return np.clip(x.permute(1, 2, 0).numpy().astype(np.float32), 0.0, 1.0)
+
+
+def _rgb01_to_lab32(rgb01: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(rgb01.astype(np.float32), cv2.COLOR_RGB2LAB).astype(np.float32)
+
+
+def _masked_delta_e_score(
+    pred_rgb01: np.ndarray, ref_lab32: np.ndarray, mask_bool: np.ndarray
+) -> float:
+    n = int(mask_bool.sum())
+    if n <= 0:
+        return 0.0
+    pred_lab = _rgb01_to_lab32(pred_rgb01)
+    diff = pred_lab - ref_lab32
+    de = np.sqrt(np.sum(diff * diff, axis=2))
+    de_mean = float(de[mask_bool].mean())
+    return 1.0 / (1.0 + max(0.0, de_mean))
+
+
+def _build_ring_shift_reference(
+    frame_rgb_u8: np.ndarray, mask_u8: np.ndarray, border_tol_px: int = 2
+) -> np.ndarray:
+    """
+    Build reference by row/run ring shift:
+    - default: copy adjacent block from right side into mask run
+    - runs touching right border (with tolerance): copy from left side
+    Fallbacks keep behavior robust near edges.
+    """
+    if frame_rgb_u8.ndim != 3 or frame_rgb_u8.shape[2] != 3:
+        return frame_rgb_u8
+    if mask_u8.ndim != 2:
+        return frame_rgb_u8
+    h, w = mask_u8.shape
+    if h != frame_rgb_u8.shape[0] or w != frame_rgb_u8.shape[1]:
+        return frame_rgb_u8
+
+    frame_t = torch.as_tensor(frame_rgb_u8, dtype=torch.uint8, device="cpu")
+    mask_t = torch.as_tensor(mask_u8, device="cpu")
+    mask_bin = mask_t > 0
+    if not bool(mask_bin.any().item()):
+        return frame_rgb_u8.copy()
+
+    out = frame_t.clone()
+    border_cols = max(1, min(int(border_tol_px), w))
+    right_touch_start = w - border_cols
+
+    def _nearest_nonmask_x(y: int, start_x: int, step: int) -> int:
+        x = int(start_x)
+        while 0 <= x < w:
+            if not bool(mask_bin[y, x].item()):
+                return x
+            x += step
+        return -1
+
+    def _copy_block_if_valid(y: int, dst_a: int, dst_b: int, src_a: int, src_b: int) -> bool:
+        if src_a < 0 or src_b > w or src_a >= src_b:
+            return False
+        if bool(mask_bin[y, src_a:src_b].any().item()):
+            return False
+        out[y, dst_a : dst_b + 1, :] = frame_t[y, src_a:src_b, :]
+        return True
+
+    for y in range(h):
+        xs = torch.where(mask_bin[y])[0]
+        if int(xs.numel()) == 0:
+            continue
+        run_start = int(xs[0].item())
+        prev = run_start
+
+        def _paint_run(a: int, b: int) -> None:
+            run_len = int(b - a + 1)
+            touches_left = a < border_cols
+            touches_right = b >= right_touch_start
+            prefer_left = touches_right and not touches_left
+
+            copied = False
+            if prefer_left:
+                copied = _copy_block_if_valid(y, a, b, a - run_len, a)
+                if not copied:
+                    copied = _copy_block_if_valid(y, a, b, b + 1, b + 1 + run_len)
+            else:
+                copied = _copy_block_if_valid(y, a, b, b + 1, b + 1 + run_len)
+                if not copied:
+                    copied = _copy_block_if_valid(y, a, b, a - run_len, a)
+            if copied:
+                return
+
+            if prefer_left:
+                src_x = _nearest_nonmask_x(y, a - 1, -1)
+                if src_x < 0:
+                    src_x = _nearest_nonmask_x(y, b + 1, 1)
+            else:
+                src_x = _nearest_nonmask_x(y, b + 1, 1)
+                if src_x < 0:
+                    src_x = _nearest_nonmask_x(y, a - 1, -1)
+            if src_x >= 0:
+                out[y, a : b + 1, :] = frame_t[y, src_x : src_x + 1, :]
+
+        for idx in range(1, int(xs.numel())):
+            cur = int(xs[idx].item())
+            if cur != prev + 1:
+                _paint_run(run_start, prev)
+                run_start = cur
+            prev = cur
+        _paint_run(run_start, prev)
+
+    return out.numpy()
+
+
+def _apply_ct_preset_frame(
+    preset: Dict[str, Any],
+    inpainted_3: torch.Tensor,
+    original_left_3: torch.Tensor,
+    warped_3: torch.Tensor,
+    mask_bin_1hw: torch.Tensor,
+    settings: Dict[str, Any],
+    stats_valid_cache: Dict[str, torch.Tensor],
+    warped_ref_cache: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    mode = str(preset.get("mode", "safe"))
+    if mode == "legacy":
+        return apply_color_transfer(original_left_3.cpu(), inpainted_3.cpu())
+
+    stats_region = str(preset.get("stats_region", "ring"))
+    if stats_region not in stats_valid_cache:
+        stats_valid_cache[stats_region] = _make_stats_mask(
+            mask_bin_1hw,
+            stats_region=stats_region,
+            ring_width=int(settings.get("ct_ring_width", 40)),
+            use_gpu=False,
+        )
+    stats_valid = stats_valid_cache[stats_region]
+
+    if str(preset.get("target_stats_source", "inpainted")) == "warped":
+        tgt_stats = warped_3.cpu()
+    else:
+        tgt_stats = inpainted_3.cpu()
+
+    ref_src = str(preset.get("reference_source", "left"))
+    if ref_src == "warped_filled":
+        if stats_region != "global":
+            ref = warped_3.cpu()
+        else:
+            fill_mode = str(preset.get("warped_fill_mode", "directional"))
+            if fill_mode not in warped_ref_cache:
+                wf = warped_3.cpu()
+                wf_u8 = (
+                    torch.clamp(wf, 0, 1).permute(1, 2, 0).numpy() * 255
+                ).astype(np.uint8)
+                mm = (mask_bin_1hw.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                ref_u8 = _build_warped_filled_reference(
+                    wf_u8,
+                    mm,
+                    fill_mode=fill_mode,
+                    border_tol_px=2,
+                    telea_radius=3,
+                )
+                warped_ref_cache[fill_mode] = (
+                    torch.from_numpy(ref_u8).permute(2, 0, 1).float() / 255.0
+                )
+            ref = warped_ref_cache[fill_mode]
+    else:
+        ref = original_left_3.cpu()
+
+    return apply_color_transfer_safe(
+        ref,
+        inpainted_3.cpu(),
+        black_thresh=float(settings.get("ct_black_thresh", 0.0)),
+        min_valid_ratio=float(settings.get("ct_min_valid_ratio", 0.0)),
+        min_valid=int(settings.get("ct_min_valid", 0)),
+        strength=float(settings.get("ct_strength", 1.0)),
+        clamp_scale_L=(
+            float(settings.get("ct_clamp_L_min", 0.1)),
+            float(settings.get("ct_clamp_L_max", 2.0)),
+        ),
+        clamp_scale_ab=(
+            float(settings.get("ct_clamp_ab_min", 0.1)),
+            float(settings.get("ct_clamp_ab_max", 3.0)),
+        ),
+        exclude_black_in_target=bool(settings.get("ct_exclude_black_in_target", True)),
+        source_valid_mask=stats_valid,
+        target_valid_mask=stats_valid,
+        target_stats_frame=tgt_stats,
+    )
+
+
 class MergingGUI(ThemedTk):
     # --- Centralized Default Settings ---
     APP_DEFAULTS = {
@@ -642,7 +1155,8 @@ class MergingGUI(ThemedTk):
         "output_format": "Full SBS (Left-Right)",
         "pad_to_16_9": False,
         "enable_color_transfer": True,
-        "color_transfer_mode": "safe",  # safe | legacy
+        "ct_preset": "1) safe sr=ring ts=inpainted ref=warped",
+        "auto_ct_eval": True,
         "ct_strength": 1.0,
         "ct_black_thresh": 0.0,
         "ct_min_valid_ratio": 0,
@@ -652,14 +1166,11 @@ class MergingGUI(ThemedTk):
         "ct_clamp_ab_min": 0.1,
         "ct_clamp_ab_max": 3,
         "ct_exclude_black_in_target": True,
-        "ct_stats_region": "ring",  # global | nonmask | ring
-        "ct_ring_width": 40,
-        "ct_target_stats_source": "warped",  # warped | inpainted
-        "ct_reference_source": "warped_filled",  # left | warped_filled
-        "ct_warped_fill_mode": "hybrid",  # telea | directional | hybrid
+        "ct_ring_width": 20,
 
         "batch_chunk_size": "20",
         "preview_size": "100%",
+        "debug_logging_enabled": True,
     }
 
     def __init__(self):
@@ -808,9 +1319,28 @@ class MergingGUI(ThemedTk):
             )
                 )
 
-        # --- Color Transfer (Safe) controls ---
-        self.color_transfer_mode_var = tk.StringVar(
-            value=self.app_config.get("color_transfer_mode", self.APP_DEFAULTS["color_transfer_mode"])
+        # --- Color Transfer (Preset + Safe controls) ---
+        self.ct_preset_var = tk.StringVar(
+            value=_resolve_ct_preset_label(
+                self.app_config.get(
+                    "ct_preset",
+                    self.APP_DEFAULTS["ct_preset"],
+                )
+            )
+        )
+        self.auto_ct_eval_var = tk.BooleanVar(
+            value=bool(
+                self.app_config.get(
+                    "auto_ct_eval", self.APP_DEFAULTS.get("auto_ct_eval", True)
+                )
+            )
+        )
+        self.auto_ct_best_var = tk.StringVar(
+            value=(
+                "Auto CT best: pending..."
+                if self.auto_ct_eval_var.get()
+                else "Auto CT best: (disabled)"
+            )
         )
         self.ct_strength_var = tk.DoubleVar(
             value=float(self.app_config.get("ct_strength", self.APP_DEFAULTS["ct_strength"]))
@@ -839,25 +1369,14 @@ class MergingGUI(ThemedTk):
         self.ct_exclude_black_in_target_var = tk.BooleanVar(
             value=bool(self.app_config.get("ct_exclude_black_in_target", self.APP_DEFAULTS["ct_exclude_black_in_target"]))
         )
-        self.ct_stats_region_var = tk.StringVar(
-            value=self.app_config.get("ct_stats_region", self.APP_DEFAULTS["ct_stats_region"])
-        )
         self.ct_ring_width_var = tk.IntVar(
             value=int(self.app_config.get("ct_ring_width", self.APP_DEFAULTS["ct_ring_width"]))
         )
-        self.ct_target_stats_source_var = tk.StringVar(
-            value=self.app_config.get("ct_target_stats_source", self.APP_DEFAULTS["ct_target_stats_source"])
-        )
-        self.ct_reference_source_var = tk.StringVar(
-            value=self.app_config.get("ct_reference_source", self.APP_DEFAULTS["ct_reference_source"])
-        )
-        self.ct_warped_fill_mode_var = tk.StringVar(
-            value=self.app_config.get("ct_warped_fill_mode", self.APP_DEFAULTS["ct_warped_fill_mode"])
-        )
-        # --- END Color Transfer (Safe) controls ---
-        self.debug_logging_var = tk.BooleanVar(
-            value=self.app_config.get("debug_logging_enabled", False)
-        )
+        # Ensure preset is normalized early.
+        self._apply_ct_preset_to_controls(self.ct_preset_var.get())
+        # --- END Color Transfer (Preset + Safe controls) ---
+        # Debug build: start verbose logging by default every run.
+        self.debug_logging_var = tk.BooleanVar(value=True)
         self.dark_mode_var = tk.BooleanVar(
             value=self.app_config.get("dark_mode_enabled", False)
         )
@@ -1146,6 +1665,10 @@ class MergingGUI(ThemedTk):
                     logger.error(
                         f"Could not apply setting for '{key}' with value '{value}': {e}"
                     )
+
+        # Keep derived CT controls coherent after loading/applying settings.
+        self._apply_ct_preset_to_controls(self.ct_preset_var.get())
+        self._on_auto_ct_eval_toggle()
 
         # After setting all variables, manually update the slider labels to match.
         for updater in self.slider_label_updaters:
@@ -1447,86 +1970,58 @@ class MergingGUI(ThemedTk):
         )
 
         
-        # --- COLOR TRANSFER (SAFE) PARAMETERS ---
+        # --- COLOR TRANSFER (PRESET-ONLY) PARAMETERS ---
         ct_frame = ttk.LabelFrame(params_ct_row, text="Color Transfer (Safe)", padding=10)
         ct_frame.grid(row=0, column=1, sticky="nsew")
-        for _c in range(8):
-            ct_frame.grid_columnconfigure(_c, weight=1 if _c in (1,3,5,7) else 0)
+        for _c in range(4):
+            ct_frame.grid_columnconfigure(_c, weight=1 if _c in (1, 3) else 0)
 
-        # Mode / options row
-        ttk.Label(ct_frame, text="Mode:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
-        ct_mode_combo = ttk.Combobox(
-            ct_frame,
-            textvariable=self.color_transfer_mode_var,
-            values=["safe", "legacy"],
-            state="readonly",
-            width=10,
+        ct_preset_row = ttk.Frame(ct_frame)
+        ct_preset_row.grid(
+            row=0, column=0, columnspan=4, sticky="ew", padx=0, pady=(0, 4)
         )
-        ct_mode_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(ct_mode_combo, "color_transfer_mode")
-        self.widgets_to_disable.append(ct_mode_combo)
+        ct_preset_row.grid_columnconfigure(1, weight=1)
+        ct_preset_row.grid_columnconfigure(3, weight=1)
 
-        ttk.Label(ct_frame, text="Stats Region:").grid(row=0, column=2, sticky="e", padx=5, pady=2)
-        ct_region_combo = ttk.Combobox(
-            ct_frame,
-            textvariable=self.ct_stats_region_var,
-            values=["global", "nonmask", "ring"],
-            state="readonly",
-            width=10,
+        ttk.Label(ct_preset_row, text="Preset:").grid(
+            row=0, column=0, sticky="e", padx=5, pady=2
         )
-        ct_region_combo.grid(row=0, column=3, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(ct_region_combo, "ct_stats_region")
-        self.widgets_to_disable.append(ct_region_combo)
-
-        ttk.Label(ct_frame, text="Target Stats:").grid(row=0, column=4, sticky="e", padx=5, pady=2)
-        ct_tgtstats_combo = ttk.Combobox(
-            ct_frame,
-            textvariable=self.ct_target_stats_source_var,
-            values=["warped", "inpainted"],
+        ct_preset_combo = ttk.Combobox(
+            ct_preset_row,
+            textvariable=self.ct_preset_var,
+            values=CT_PRESET_LABELS,
             state="readonly",
-            width=10,
+            width=48,
         )
-        ct_tgtstats_combo.grid(row=0, column=5, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(ct_tgtstats_combo, "ct_target_stats_source")
-        self.widgets_to_disable.append(ct_tgtstats_combo)
+        ct_preset_combo.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+        self.widgets_to_disable.append(ct_preset_combo)
 
-        ttk.Label(ct_frame, text="Reference:").grid(row=0, column=6, sticky="e", padx=5, pady=2)
-        ct_ref_combo = ttk.Combobox(
-            ct_frame,
-            textvariable=self.ct_reference_source_var,
-            values=["left", "warped_filled"],
-            state="readonly",
-            width=12,
+        auto_ct_eval_check = ttk.Checkbutton(
+            ct_preset_row,
+            text="Auto CT Eval (test all 8 presets per frame and pick best)",
+            variable=self.auto_ct_eval_var,
+            command=self._on_auto_ct_eval_toggle,
         )
-        ct_ref_combo.grid(row=0, column=7, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(ct_ref_combo, "ct_reference_source")
-        self.widgets_to_disable.append(ct_ref_combo)
+        auto_ct_eval_check.grid(row=0, column=2, sticky="w", padx=5, pady=2)
+        self.widgets_to_disable.append(auto_ct_eval_check)
 
-        # Checkbox
+        auto_ct_best_label = ttk.Label(
+            ct_preset_row, textvariable=self.auto_ct_best_var, anchor="w"
+        )
+        auto_ct_best_label.grid(row=0, column=3, sticky="w", padx=5, pady=2)
+
         ct_excl = ttk.Checkbutton(
             ct_frame,
             text="Exclude near-black in target stats",
             variable=self.ct_exclude_black_in_target_var,
         )
-        ct_excl.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        ct_excl.grid(row=1, column=0, columnspan=4, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(ct_excl, "ct_exclude_black_in_target")
         self.widgets_to_disable.append(ct_excl)
 
-        ttk.Label(ct_frame, text="Warped Fill:").grid(row=1, column=2, sticky="e", padx=5, pady=2)
-        ct_fill_combo = ttk.Combobox(
-            ct_frame,
-            textvariable=self.ct_warped_fill_mode_var,
-            values=["telea", "directional", "hybrid"],
-            state="readonly",
-            width=12,
-        )
-        ct_fill_combo.grid(row=1, column=3, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(ct_fill_combo, "ct_warped_fill_mode")
-        self.widgets_to_disable.append(ct_fill_combo)
-
-                # Sliders (two columns) — keep preview updates on release
+        # Sliders (two columns) — keep preview updates on release
         ct_sliders_row = ttk.Frame(ct_frame)
-        ct_sliders_row.grid(row=2, column=0, columnspan=8, sticky="ew", padx=0, pady=(6, 0))
+        ct_sliders_row.grid(row=2, column=0, columnspan=4, sticky="ew", padx=0, pady=(6, 0))
         ct_sliders_row.grid_columnconfigure(0, weight=1)
         ct_sliders_row.grid_columnconfigure(1, weight=1)
 
@@ -1577,20 +2072,20 @@ class MergingGUI(ThemedTk):
             self, ct_sliders_right, "Clamp ab Max:", self.ct_clamp_ab_max_var,
             0.1, 3.0, 3, decimals=2, step_size=0.01
         )
+
         # Make comboboxes trigger preview refresh immediately on change
         for _v in (
-            self.color_transfer_mode_var,
-            self.ct_stats_region_var,
-            self.ct_target_stats_source_var,
-            self.ct_reference_source_var,
-            self.ct_warped_fill_mode_var,
+            self.ct_preset_var,
             self.ct_exclude_black_in_target_var,
         ):
             try:
-                _v.trace_add("write", lambda *args: self.on_slider_release(None))
+                if _v is self.ct_preset_var:
+                    _v.trace_add("write", self._on_ct_preset_changed)
+                else:
+                    _v.trace_add("write", lambda *args: self.on_slider_release(None))
             except Exception:
                 pass
-        # --- END COLOR TRANSFER (SAFE) PARAMETERS ---
+        # --- END COLOR TRANSFER (PRESET-ONLY) PARAMETERS ---
 
 # --- NEW: Option to use external replace-mask video instead of embedded mask ---
         replace_mask_check = ttk.Checkbutton(
@@ -1819,6 +2314,30 @@ class MergingGUI(ThemedTk):
     def _clear_border_info(self):
         """Clears the border info display."""
         self.border_info_var.set("Borders: N/A")
+
+    def _apply_ct_preset_to_controls(self, preset_label: str) -> None:
+        """Normalize preset label to one of the known CT preset options."""
+        label = _resolve_ct_preset_label(preset_label)
+        if self.ct_preset_var.get() != label:
+            self.ct_preset_var.set(label)
+
+    def _on_ct_preset_changed(self, *args):
+        """Sync dependent CT controls when preset changes."""
+        self._apply_ct_preset_to_controls(self.ct_preset_var.get())
+        try:
+            self.on_slider_release(None)
+        except Exception:
+            pass
+
+    def _on_auto_ct_eval_toggle(self):
+        if self.auto_ct_eval_var.get():
+            self.auto_ct_best_var.set("Auto CT best: pending...")
+        else:
+            self.auto_ct_best_var.set("Auto CT best: (disabled)")
+        try:
+            self.on_slider_release(None)
+        except Exception:
+            pass
 
     def on_slider_release(self, event):
         """Called when a slider is released. Updates the preview."""
@@ -2097,6 +2616,7 @@ class MergingGUI(ThemedTk):
     def get_current_settings(self):
         """Collects all GUI settings into a dictionary, performing type conversion."""
         try:
+            selected_preset_label = _resolve_ct_preset_label(self.ct_preset_var.get())
             settings = {
                 "inpainted_folder": self.inpainted_folder_var.get(),
                 "original_folder": self.original_folder_var.get(),
@@ -2110,7 +2630,8 @@ class MergingGUI(ThemedTk):
                 "output_format": self.output_format_var.get(),
                 "batch_chunk_size": int(self.batch_chunk_size_var.get()),
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
-                "color_transfer_mode": self.color_transfer_mode_var.get(),
+                "ct_preset": selected_preset_label,
+                "auto_ct_eval": bool(self.auto_ct_eval_var.get()),
                 "ct_strength": float(self.ct_strength_var.get()),
                 "ct_black_thresh": float(self.ct_black_thresh_var.get()),
                 "ct_min_valid_ratio": float(self.ct_min_valid_ratio_var.get()),
@@ -2120,11 +2641,7 @@ class MergingGUI(ThemedTk):
                 "ct_clamp_ab_min": float(self.ct_clamp_ab_min_var.get()),
                 "ct_clamp_ab_max": float(self.ct_clamp_ab_max_var.get()),
                 "ct_exclude_black_in_target": bool(self.ct_exclude_black_in_target_var.get()),
-                "ct_stats_region": self.ct_stats_region_var.get(),
                 "ct_ring_width": int(self.ct_ring_width_var.get()),
-                "ct_target_stats_source": self.ct_target_stats_source_var.get(),
-                "ct_reference_source": self.ct_reference_source_var.get(),
-                "ct_warped_fill_mode": self.ct_warped_fill_mode_var.get(),
 
                 "preview_size": self.preview_size_var.get(),
                 "preview_source": self.preview_source_var.get(),
@@ -2473,6 +2990,12 @@ class MergingGUI(ThemedTk):
 
                 # 4. Loop through chunks
                 chunk_size = settings.get("batch_chunk_size", 32)
+                ct_usage_counts = {int(p["id"]): 0 for p in CT_PRESETS}
+                selected_label = _resolve_ct_preset_label(
+                    settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL)
+                )
+                selected_preset = CT_PRESET_BY_LABEL[selected_label]
+                auto_ct_eval = bool(settings.get("auto_ct_eval", False))
                 for frame_start in range(0, num_frames, chunk_size):
                     if self.stop_event.is_set():
                         break
@@ -2592,80 +3115,58 @@ class MergingGUI(ThemedTk):
                             align_corners=False,
                         )
 
+                    # GUI-aligned CT mask: clean binary mask before post-process blend pipeline.
+                    if settings["mask_binarize_threshold"] >= 0.0:
+                        mask_bin = (mask > settings["mask_binarize_threshold"]).float()
+                    else:
+                        mask_bin = (mask > 0.5).float()
+
                     if settings["enable_color_transfer"]:
-                        mode = settings.get("color_transfer_mode", "safe")
-                        if mode == "legacy":
-                            adjusted_frames = []
+                        adjusted_frames = []
+                        ct_eval_executor = (
+                            ThreadPoolExecutor(max_workers=CT_AUTO_EVAL_MAX_WORKERS)
+                            if auto_ct_eval
+                            else None
+                        )
+                        try:
                             for frame_idx in range(inpainted.shape[0]):
-                                adjusted_frame = apply_color_transfer(
-                                    original_left[frame_idx].cpu(),
-                                    inpainted[frame_idx].cpu(),
-                                )
-                                adjusted_frames.append(adjusted_frame.to(device))
-                            inpainted = torch.stack(adjusted_frames)
-                        else:
-                            # SAFE mode: compute stats on a stable region (global/nonmask/ring) and clamp scales
-                            # Build a binary mask for stats (use binarize threshold if enabled)
-                            if settings["mask_binarize_threshold"] >= 0.0:
-                                mask_bin = (mask > settings["mask_binarize_threshold"]).float()
-                            else:
-                                mask_bin = (mask > 0.5).float()
+                                inpainted_3 = inpainted[frame_idx].cpu()
+                                original_left_3 = original_left[frame_idx].cpu()
+                                warped_3 = warped_original[frame_idx].cpu()
+                                mask_bin_1hw = mask_bin[frame_idx].cpu()
 
-                            use_gpu_stats = False  # stats mask building is cheap on CPU
-                            adjusted_frames = []
-                            for frame_idx in range(inpainted.shape[0]):
-                                # stats region mask (VALID region)
-                                stats_valid = _make_stats_mask(
-                                    mask_bin[frame_idx],  # [1,H,W]
-                                    stats_region=settings.get("ct_stats_region", "nonmask"),
-                                    ring_width=int(settings.get("ct_ring_width", 20)),
-                                    use_gpu=use_gpu_stats,
-                                )
-                                # choose target stats frame
-                                if settings.get("ct_target_stats_source", "warped") == "warped":
-                                    tgt_stats = warped_original[frame_idx].cpu()
-                                else:
-                                    tgt_stats = inpainted[frame_idx].cpu()
-
-                                # choose reference
-                                if settings.get("ct_reference_source", "left") == "warped_filled":
-                                    # Fill inpaint region on warped to remove holes from stats
-                                    wf = warped_original[frame_idx].cpu()
-                                    wf_u8 = (torch.clamp(wf, 0, 1).permute(1,2,0).numpy() * 255).astype(np.uint8)
-                                    mm = (mask_bin[frame_idx].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-                                    ref_u8 = _build_warped_filled_reference(
-                                        wf_u8,
-                                        mm,
-                                        fill_mode=str(settings.get("ct_warped_fill_mode", "hybrid")),
-                                        border_tol_px=2,
-                                        telea_radius=3,
+                                if auto_ct_eval:
+                                    best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
+                                        inpainted_3=inpainted_3,
+                                        original_left_3=original_left_3,
+                                        warped_3=warped_3,
+                                        mask_bin_1hw=mask_bin_1hw,
+                                        settings=settings,
+                                        fallback_preset_id=int(selected_preset["id"]),
+                                        executor=ct_eval_executor,
                                     )
-                                    ref = torch.from_numpy(ref_u8).permute(2,0,1).float() / 255.0
+                                    ct_usage_counts[best_preset_id] += 1
+                                    adjusted_frames.append(best_frame.to(device))
                                 else:
-                                    ref = original_left[frame_idx].cpu()
+                                    stats_valid_cache: Dict[str, torch.Tensor] = {}
+                                    warped_ref_cache: Dict[str, torch.Tensor] = {}
+                                    adjusted_3 = _apply_ct_preset_frame(
+                                        preset=selected_preset,
+                                        inpainted_3=inpainted_3,
+                                        original_left_3=original_left_3,
+                                        warped_3=warped_3,
+                                        mask_bin_1hw=mask_bin_1hw,
+                                        settings=settings,
+                                        stats_valid_cache=stats_valid_cache,
+                                        warped_ref_cache=warped_ref_cache,
+                                    )
+                                    ct_usage_counts[int(selected_preset["id"])] += 1
+                                    adjusted_frames.append(adjusted_3.to(device))
+                        finally:
+                            if ct_eval_executor is not None:
+                                ct_eval_executor.shutdown(wait=True)
 
-                                adjusted_frame = apply_color_transfer_safe(
-                                    ref,
-                                    inpainted[frame_idx].cpu(),
-                                    black_thresh=float(settings.get("ct_black_thresh", 8.0)),
-                                    min_valid_ratio=float(settings.get("ct_min_valid_ratio", 0.01)),
-                                    min_valid=int(settings.get("ct_min_valid", 300)),
-                                    strength=float(settings.get("ct_strength", 1.0)),
-                                    clamp_scale_L=(
-                                        float(settings.get("ct_clamp_L_min", 0.7)),
-                                        float(settings.get("ct_clamp_L_max", 1.3)),
-                                    ),
-                                    clamp_scale_ab=(
-                                        float(settings.get("ct_clamp_ab_min", 0.6)),
-                                        float(settings.get("ct_clamp_ab_max", 1.4)),
-                                    ),
-                                    exclude_black_in_target=bool(settings.get("ct_exclude_black_in_target", False)),
-                                    source_valid_mask=stats_valid,
-                                    target_valid_mask=stats_valid,
-                                    target_stats_frame=tgt_stats,
-                                )
-                                adjusted_frames.append(adjusted_frame.to(device))
-                            inpainted = torch.stack(adjusted_frames)
+                        inpainted = torch.stack(adjusted_frames)
 
                     processed_mask = mask.clone()
                     # --- NEW: Binarization as the first step ---
@@ -2796,6 +3297,38 @@ class MergingGUI(ThemedTk):
                     )
 
                 # 5. Finalize FFmpeg process
+                if settings.get("enable_color_transfer", False):
+                    total_ct = int(sum(ct_usage_counts.values()))
+                    if total_ct > 0:
+                        ct_line = " ".join(
+                            [
+                                f"{pid}:{(100.0 * ct_usage_counts.get(pid, 0) / total_ct):.1f}%"
+                                for pid in range(1, 9)
+                            ]
+                        )
+                        logger.info(f"CT usage [{base_name}] {ct_line}")
+                        if bool(settings.get("auto_ct_eval", False)):
+                            best_pid = max(
+                                range(1, 9), key=lambda pid: ct_usage_counts.get(pid, 0)
+                            )
+                            best_pct = (
+                                100.0 * ct_usage_counts.get(best_pid, 0) / total_ct
+                            )
+                            self.after(
+                                0,
+                                lambda t=f"Auto CT best: #{best_pid} ({best_pct:.1f}%)": self.auto_ct_best_var.set(
+                                    t
+                                ),
+                            )
+                        else:
+                            selected_id = int(selected_preset["id"])
+                            self.after(
+                                0,
+                                lambda t=f"Auto CT best: #{selected_id} (manual)": self.auto_ct_best_var.set(
+                                    t
+                                ),
+                            )
+
                 if ffmpeg_process.stdin:
                     ffmpeg_process.stdin.close()
 
@@ -3252,77 +3785,64 @@ class MergingGUI(ThemedTk):
                 )
             processed_mask = processed_mask.squeeze(0)  # Remove batch dim
 
-            if params.get("enable_color_transfer", False):
-                if original_left is not None:
-                    mode = params.get("color_transfer_mode", "safe")
-                    if mode == "legacy":
-                        logger.debug("Applying LEGACY color transfer to preview frame...")
-                        inpainted = apply_color_transfer(
-                            original_left.cpu(), inpainted.cpu()
-                        ).to(device)
-                    else:
-                        logger.debug("Applying SAFE color transfer to preview frame...")
-                        # Build a binary mask for stats from the *processed* mask.
-                        # processed_mask here is [1,H,W] after squeeze(0) a few lines above.
-                        mask_bin = (processed_mask > 0.5).float()
+            if params.get("enable_color_transfer", False) and original_left is not None:
+                selected_label = _resolve_ct_preset_label(
+                    params.get("ct_preset", CT_PRESET_DEFAULT_LABEL)
+                )
+                selected_preset = CT_PRESET_BY_LABEL[selected_label]
+                auto_ct_eval = bool(params.get("auto_ct_eval", False))
 
-                        stats_valid = _make_stats_mask(
-                            mask_bin,
-                            stats_region=params.get("ct_stats_region", "nonmask"),
-                            ring_width=int(params.get("ct_ring_width", 20)),
-                            use_gpu=False,
+                # Preview uses the same clean binary CT mask strategy as batch.
+                if params.get("mask_binarize_threshold", -1.0) >= 0.0:
+                    mask_bin = (mask > params["mask_binarize_threshold"]).float()
+                else:
+                    mask_bin = (mask > 0.5).float()
+
+                inpainted_3 = inpainted[0].cpu() if inpainted.dim() == 4 else inpainted.cpu()
+                original_left_3 = (
+                    original_left[0].cpu() if original_left.dim() == 4 else original_left.cpu()
+                )
+                warped_3 = (
+                    right_eye_original[0].cpu()
+                    if right_eye_original.dim() == 4
+                    else right_eye_original.cpu()
+                )
+                mask_bin_1hw = mask_bin[0].cpu() if mask_bin.dim() == 4 else mask_bin.cpu()
+
+                if auto_ct_eval:
+                    with ThreadPoolExecutor(max_workers=CT_AUTO_EVAL_MAX_WORKERS) as ct_eval_executor:
+                        best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
+                            inpainted_3=inpainted_3,
+                            original_left_3=original_left_3,
+                            warped_3=warped_3,
+                            mask_bin_1hw=mask_bin_1hw,
+                            settings=params,
+                            fallback_preset_id=int(selected_preset["id"]),
+                            executor=ct_eval_executor,
                         )
-                                                # choose target stats frame
-                        if params.get("ct_target_stats_source", "warped") == "warped":
-                            tgt_stats_raw = right_eye_original
-                        else:
-                            tgt_stats_raw = inpainted
-                        
-                        # Ensure 3D [3,H,W] CPU tensors for safe CT
-                        tgt_stats_3 = (tgt_stats_raw[0].cpu() if tgt_stats_raw is not None and tgt_stats_raw.dim() == 4 else tgt_stats_raw.cpu())
-                        tgt_inp_3 = (inpainted[0].cpu() if inpainted.dim() == 4 else inpainted.cpu())
-                        
-                        # choose reference
-                        if params.get("ct_reference_source", "left") == "warped_filled":
-                            wf = (right_eye_original[0].cpu() if right_eye_original.dim() == 4 else right_eye_original.cpu())
-                            wf_u8 = (torch.clamp(wf, 0, 1).permute(1,2,0).numpy() * 255).astype(np.uint8)
-                            mm = (mask_bin.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-                            ref_u8 = _build_warped_filled_reference(
-                                wf_u8,
-                                mm,
-                                fill_mode=str(params.get("ct_warped_fill_mode", "hybrid")),
-                                border_tol_px=2,
-                                telea_radius=3,
-                            )
-                            ref = torch.from_numpy(ref_u8).permute(2,0,1).float() / 255.0
-                        else:
-                            ref = (original_left[0].cpu() if original_left.dim() == 4 else original_left.cpu())
-                        
-                        out_3 = apply_color_transfer_safe(
-                            ref,
-                            tgt_inp_3,
-                            black_thresh=float(params.get("ct_black_thresh", 8.0)),
-                            min_valid_ratio=float(params.get("ct_min_valid_ratio", 0.01)),
-                            min_valid=int(params.get("ct_min_valid", 300)),
-                            strength=float(params.get("ct_strength", 1.0)),
-                            clamp_scale_L=(
-                                float(params.get("ct_clamp_L_min", 0.7)),
-                                float(params.get("ct_clamp_L_max", 1.3)),
-                            ),
-                            clamp_scale_ab=(
-                                float(params.get("ct_clamp_ab_min", 0.6)),
-                                float(params.get("ct_clamp_ab_max", 1.4)),
-                            ),
-                            exclude_black_in_target=bool(params.get("ct_exclude_black_in_target", False)),
-                            source_valid_mask=stats_valid,
-                            target_valid_mask=stats_valid,
-                            target_stats_frame=tgt_stats_3,
-                        )
-                        out_3 = out_3.to(device)
-                        if inpainted.dim() == 4:
-                            inpainted = out_3.unsqueeze(0)
-                        else:
-                            inpainted = out_3
+                    out_3 = best_frame.to(device)
+                    self.auto_ct_best_var.set(f"Auto CT best: #{best_preset_id} (preview)")
+                else:
+                    stats_valid_cache = {}
+                    warped_ref_cache = {}
+                    out_3 = _apply_ct_preset_frame(
+                        preset=selected_preset,
+                        inpainted_3=inpainted_3,
+                        original_left_3=original_left_3,
+                        warped_3=warped_3,
+                        mask_bin_1hw=mask_bin_1hw,
+                        settings=params,
+                        stats_valid_cache=stats_valid_cache,
+                        warped_ref_cache=warped_ref_cache,
+                    ).to(device)
+                    self.auto_ct_best_var.set(
+                        f"Auto CT best: #{int(selected_preset['id'])} (manual)"
+                    )
+
+                if inpainted.dim() == 4:
+                    inpainted = out_3.unsqueeze(0)
+                else:
+                    inpainted = out_3
 
             blended_frame = (
                 right_eye_original * (1 - processed_mask) + inpainted * processed_mask
@@ -3629,11 +4149,15 @@ class MergingGUI(ThemedTk):
 
 
 if __name__ == "__main__":
+    debug_enabled = _env_flag("MERGE_DEBUG", False)
     # Basic logging setup
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if debug_enabled else logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%H:%M:%S",
     )
+    if debug_enabled:
+        _enable_debug_faulthandler()
+        logger.info("Debug mode enabled (MERGE_DEBUG=1).")
     app = MergingGUI()
     app.mainloop()

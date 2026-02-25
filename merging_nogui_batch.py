@@ -23,8 +23,10 @@ import re
 import shutil
 import threading
 import time
+import faulthandler
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -43,6 +45,56 @@ from dependency.stereocrafter_util import (  # type: ignore
 )
 
 LOG = logging.getLogger("merge_runner")
+_FAULTHANDLER_LOG = None
+
+
+def _enable_debug_faulthandler() -> None:
+    """Enable crash stack dumps for nogui runs when debug mode is enabled."""
+    global _FAULTHANDLER_LOG
+    try:
+        os.makedirs("logs", exist_ok=True)
+        log_path = os.path.join(
+            "logs", "merging_nogui_batch_faulthandler.log"
+        )
+        _FAULTHANDLER_LOG = open(log_path, "a", buffering=1)
+        _FAULTHANDLER_LOG.write(
+            f"\n=== debug session {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} ===\n"
+        )
+        _FAULTHANDLER_LOG.flush()
+        faulthandler.enable(file=_FAULTHANDLER_LOG, all_threads=True)
+        LOG.info(f"Debug faulthandler active: {log_path}")
+    except Exception as e:
+        LOG.warning(f"Failed to enable debug faulthandler: {e}")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _default_stop_marker_path(output_folder: str) -> str:
+    return os.path.join(os.path.abspath(output_folder), ".stop_after_current")
+
+
+def _stop_marker_exists(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        return os.path.exists(path)
+    except Exception:
+        return False
+
+
+def _clear_stop_marker(path: str) -> None:
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
 
 
 # =========================
@@ -60,13 +112,14 @@ DEFAULTS: Dict[str, object] = {
     # Output
     "output_format": "Full SBS (Left-Right)",  # see OUTPUT_FORMAT_CHOICES
     "pad_to_16_9": False,
-    "add_borders": False,              # sidecar-based borders (no-op if sidecar missing / 0%)
+    "add_borders": False,               # sidecar-based borders (no-op if sidecar missing / 0%)
     "skip_existing": True,
 
 
     # Color transfer
     "enable_color_transfer": True,
-    "color_transfer_mode": "safe",    # safe | legacy
+    "ct_preset": "1) safe sr=ring ts=inpainted ref=warped",
+    "auto_ct_eval": True,
     "ct_strength": 1.0,
     "ct_black_thresh": 0.0,
     "ct_min_valid_ratio": 0.0,
@@ -76,11 +129,7 @@ DEFAULTS: Dict[str, object] = {
     "ct_clamp_ab_min": 0.1,
     "ct_clamp_ab_max": 3,
     "ct_exclude_black_in_target": True,
-    "ct_stats_region": "ring",     # global | nonmask | ring
     "ct_ring_width": 20,
-    "ct_target_stats_source": "inpainted",       # warped | inpainted
-    "ct_reference_source": "warped_filled",            # left | warped_filled
-    "ct_warped_fill_mode": "hybrid",            # telea | directional | hybrid
     "mask_binarize_threshold": -0.01,   # used for stats-mask and optional binarize step if you add it later
 
     # Replace mask
@@ -398,7 +447,487 @@ def _make_stats_mask(
     if ring.sum().item() < 1.0:
         return inv
     return ring
-    
+
+
+# --- CT PRESETS (ranked by effectiveness from analyzer) ---
+CT_PRESETS: List[Dict[str, Any]] = [
+    {
+        "id": 1,
+        "label": "1) safe sr=ring ts=inpainted ref=warped",
+        "mode": "safe",
+        "stats_region": "ring",
+        "target_stats_source": "inpainted",
+        "reference_source": "warped_filled",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 2,
+        "label": "2) safe sr=ring ts=inpainted ref=left",
+        "mode": "safe",
+        "stats_region": "ring",
+        "target_stats_source": "inpainted",
+        "reference_source": "left",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 3,
+        "label": "3) safe sr=global ts=inpainted ref=warped_filled fill=directional",
+        "mode": "safe",
+        "stats_region": "global",
+        "target_stats_source": "inpainted",
+        "reference_source": "warped_filled",
+        "warped_fill_mode": "directional",
+    },
+    {
+        "id": 4,
+        "label": "4) safe sr=nonmask ts=inpainted ref=left",
+        "mode": "safe",
+        "stats_region": "nonmask",
+        "target_stats_source": "inpainted",
+        "reference_source": "left",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 5,
+        "label": "5) safe sr=nonmask ts=inpainted ref=warped",
+        "mode": "safe",
+        "stats_region": "nonmask",
+        "target_stats_source": "inpainted",
+        "reference_source": "warped_filled",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 6,
+        "label": "6) safe sr=global ts=inpainted ref=left",
+        "mode": "safe",
+        "stats_region": "global",
+        "target_stats_source": "inpainted",
+        "reference_source": "left",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 7,
+        "label": "7) legacy",
+        "mode": "legacy",
+        "stats_region": "ring",
+        "target_stats_source": "inpainted",
+        "reference_source": "left",
+        "warped_fill_mode": "telea",
+    },
+    {
+        "id": 8,
+        "label": "8) safe sr=ring ts=warped ref=left",
+        "mode": "safe",
+        "stats_region": "ring",
+        "target_stats_source": "warped",
+        "reference_source": "left",
+        "warped_fill_mode": "telea",
+    },
+]
+
+CT_PRESET_LABELS = [p["label"] for p in CT_PRESETS]
+CT_PRESET_BY_LABEL = {p["label"]: p for p in CT_PRESETS}
+CT_PRESET_BY_ID = {int(p["id"]): p for p in CT_PRESETS}
+CT_PRESET_DEFAULT_LABEL = CT_PRESET_LABELS[0]
+# Auto-eval order optimized to reuse caches (stats/ref) across adjacent presets.
+CT_PRESET_AUTO_EVAL_ORDER = [1, 2, 8, 4, 5, 6, 3, 7]
+CT_AUTO_EVAL_MAX_WORKERS = 3
+
+
+def _build_auto_ct_eval_groups(
+    preset_order: List[int],
+) -> Tuple[List[List[int]], List[int]]:
+    """
+    Build fixed groups for auto-eval:
+    - parallel: ring, nonmask, global (max 3 workers)
+    - serial: legacy/other
+    """
+    grouped: Dict[str, List[int]] = {"ring": [], "nonmask": [], "global": []}
+    serial_ids: List[int] = []
+    for pid in preset_order:
+        preset = CT_PRESET_BY_ID[int(pid)]
+        mode = str(preset.get("mode", "safe"))
+        if mode == "legacy":
+            serial_ids.append(int(pid))
+            continue
+        sr = str(preset.get("stats_region", "ring"))
+        if sr in grouped:
+            grouped[sr].append(int(pid))
+        else:
+            serial_ids.append(int(pid))
+
+    parallel_groups: List[List[int]] = []
+    for key in ("ring", "nonmask", "global"):
+        if grouped[key]:
+            parallel_groups.append(grouped[key])
+    return parallel_groups, serial_ids
+
+
+CT_AUTO_EVAL_PARALLEL_GROUPS, CT_AUTO_EVAL_SERIAL_IDS = _build_auto_ct_eval_groups(
+    CT_PRESET_AUTO_EVAL_ORDER
+)
+
+
+def _is_better_auto_ct_candidate(
+    score: float,
+    preset_id: int,
+    best_score: float,
+    best_preset_id: int,
+    order_index: Dict[int, int],
+) -> bool:
+    if score > best_score:
+        return True
+    if score < best_score:
+        return False
+    # Stable tie-break: preserve canonical auto-eval order.
+    return order_index.get(int(preset_id), 10**9) < order_index.get(
+        int(best_preset_id), 10**9
+    )
+
+
+def _eval_auto_ct_subset(
+    preset_ids: List[int],
+    inpainted_3: torch.Tensor,
+    original_left_3: torch.Tensor,
+    warped_3: torch.Tensor,
+    mask_bin_1hw: torch.Tensor,
+    settings: Dict[str, Any],
+    eval_ref_lab: Optional[np.ndarray],
+    mask_bool: np.ndarray,
+    order_index: Dict[int, int],
+) -> Tuple[float, torch.Tensor, int]:
+    stats_valid_cache: Dict[str, torch.Tensor] = {}
+    warped_ref_cache: Dict[str, torch.Tensor] = {}
+
+    best_score = -1.0
+    best_frame = inpainted_3
+    best_preset_id = (
+        int(preset_ids[0]) if preset_ids else int(CT_PRESET_AUTO_EVAL_ORDER[0])
+    )
+
+    for pid in preset_ids:
+        preset = CT_PRESET_BY_ID[int(pid)]
+        adjusted_3 = _apply_ct_preset_frame(
+            preset=preset,
+            inpainted_3=inpainted_3,
+            original_left_3=original_left_3,
+            warped_3=warped_3,
+            mask_bin_1hw=mask_bin_1hw,
+            settings=settings,
+            stats_valid_cache=stats_valid_cache,
+            warped_ref_cache=warped_ref_cache,
+        )
+        if eval_ref_lab is not None:
+            score = _masked_delta_e_score(
+                pred_rgb01=_tensor_chw_to_rgb_np01(adjusted_3),
+                ref_lab32=eval_ref_lab,
+                mask_bool=mask_bool,
+            )
+        else:
+            score = 0.0
+        if _is_better_auto_ct_candidate(
+            score,
+            int(pid),
+            best_score,
+            best_preset_id,
+            order_index,
+        ):
+            best_score = score
+            best_frame = adjusted_3
+            best_preset_id = int(pid)
+
+    return best_score, best_frame, best_preset_id
+
+
+def _select_best_auto_ct_preset_frame(
+    inpainted_3: torch.Tensor,
+    original_left_3: torch.Tensor,
+    warped_3: torch.Tensor,
+    mask_bin_1hw: torch.Tensor,
+    settings: Dict[str, Any],
+    fallback_preset_id: int,
+    executor: Optional[ThreadPoolExecutor] = None,
+) -> Tuple[torch.Tensor, int]:
+    mask_bool = mask_bin_1hw.squeeze(0).cpu().numpy() > 0.5
+    if int(mask_bool.sum()) > 0:
+        mm_u8 = mask_bool.astype(np.uint8) * 255
+        warped_u8 = (np.clip(_tensor_chw_to_rgb_np01(warped_3), 0.0, 1.0) * 255.0).astype(
+            np.uint8
+        )
+        eval_ref_u8 = _build_ring_shift_reference(warped_u8, mm_u8, border_tol_px=2)
+        eval_ref_lab = _rgb01_to_lab32(eval_ref_u8.astype(np.float32) / 255.0)
+    else:
+        eval_ref_lab = None
+
+    order_index = {int(pid): i for i, pid in enumerate(CT_PRESET_AUTO_EVAL_ORDER)}
+    best_score = -1.0
+    best_frame = inpainted_3
+    best_preset_id = int(fallback_preset_id)
+
+    def _consider(candidate: Tuple[float, torch.Tensor, int]) -> None:
+        nonlocal best_score, best_frame, best_preset_id
+        score, frame, pid = candidate
+        if _is_better_auto_ct_candidate(
+            score, int(pid), best_score, best_preset_id, order_index
+        ):
+            best_score = score
+            best_frame = frame
+            best_preset_id = int(pid)
+
+    if executor is not None and CT_AUTO_EVAL_PARALLEL_GROUPS:
+        futures = [
+            executor.submit(
+                _eval_auto_ct_subset,
+                preset_ids=group,
+                inpainted_3=inpainted_3,
+                original_left_3=original_left_3,
+                warped_3=warped_3,
+                mask_bin_1hw=mask_bin_1hw,
+                settings=settings,
+                eval_ref_lab=eval_ref_lab,
+                mask_bool=mask_bool,
+                order_index=order_index,
+            )
+            for group in CT_AUTO_EVAL_PARALLEL_GROUPS
+        ]
+        for fut in futures:
+            _consider(fut.result())
+    else:
+        for group in CT_AUTO_EVAL_PARALLEL_GROUPS:
+            _consider(
+                _eval_auto_ct_subset(
+                    preset_ids=group,
+                    inpainted_3=inpainted_3,
+                    original_left_3=original_left_3,
+                    warped_3=warped_3,
+                    mask_bin_1hw=mask_bin_1hw,
+                    settings=settings,
+                    eval_ref_lab=eval_ref_lab,
+                    mask_bool=mask_bool,
+                    order_index=order_index,
+                )
+            )
+
+    if CT_AUTO_EVAL_SERIAL_IDS:
+        _consider(
+            _eval_auto_ct_subset(
+                preset_ids=CT_AUTO_EVAL_SERIAL_IDS,
+                inpainted_3=inpainted_3,
+                original_left_3=original_left_3,
+                warped_3=warped_3,
+                mask_bin_1hw=mask_bin_1hw,
+                settings=settings,
+                eval_ref_lab=eval_ref_lab,
+                mask_bool=mask_bool,
+                order_index=order_index,
+            )
+        )
+
+    return best_frame, best_preset_id
+
+
+def _resolve_ct_preset_label(value: str) -> str:
+    v = str(value or "").strip()
+    if v in CT_PRESET_BY_LABEL:
+        return v
+    return CT_PRESET_DEFAULT_LABEL
+
+
+def _parse_ct_preset_arg(value: str) -> str:
+    v = str(value or "").strip()
+    if not v:
+        return CT_PRESET_DEFAULT_LABEL
+    if v.isdigit():
+        pid = int(v)
+        if pid in CT_PRESET_BY_ID:
+            return CT_PRESET_BY_ID[pid]["label"]
+    return _resolve_ct_preset_label(v)
+
+
+def _tensor_chw_to_rgb_np01(t: torch.Tensor) -> np.ndarray:
+    x = t.detach().cpu().float()
+    if x.dim() == 4 and x.shape[0] == 1:
+        x = x[0]
+    return np.clip(x.permute(1, 2, 0).numpy().astype(np.float32), 0.0, 1.0)
+
+
+def _rgb01_to_lab32(rgb01: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(rgb01.astype(np.float32), cv2.COLOR_RGB2LAB).astype(np.float32)
+
+
+def _masked_delta_e_score(pred_rgb01: np.ndarray, ref_lab32: np.ndarray, mask_bool: np.ndarray) -> float:
+    n = int(mask_bool.sum())
+    if n <= 0:
+        return 0.0
+    pred_lab = _rgb01_to_lab32(pred_rgb01)
+    diff = pred_lab - ref_lab32
+    de = np.sqrt(np.sum(diff * diff, axis=2))
+    de_mean = float(de[mask_bool].mean())
+    return 1.0 / (1.0 + max(0.0, de_mean))
+
+
+def _build_ring_shift_reference(frame_rgb_u8: np.ndarray, mask_u8: np.ndarray, border_tol_px: int = 2) -> np.ndarray:
+    """
+    Build reference by row/run ring shift:
+    - default: copy adjacent block from right side into mask run
+    - runs touching right border (with tolerance): copy from left side
+    Fallbacks keep behavior robust near edges.
+    """
+    if frame_rgb_u8.ndim != 3 or frame_rgb_u8.shape[2] != 3:
+        return frame_rgb_u8
+    if mask_u8.ndim != 2:
+        return frame_rgb_u8
+    h, w = mask_u8.shape
+    if h != frame_rgb_u8.shape[0] or w != frame_rgb_u8.shape[1]:
+        return frame_rgb_u8
+
+    frame_t = torch.as_tensor(frame_rgb_u8, dtype=torch.uint8, device="cpu")
+    mask_t = torch.as_tensor(mask_u8, device="cpu")
+    mask_bin = mask_t > 0
+    if not bool(mask_bin.any().item()):
+        return frame_rgb_u8.copy()
+
+    out = frame_t.clone()
+    border_cols = max(1, min(int(border_tol_px), w))
+    right_touch_start = w - border_cols
+
+    def _nearest_nonmask_x(y: int, start_x: int, step: int) -> int:
+        x = int(start_x)
+        while 0 <= x < w:
+            if not bool(mask_bin[y, x].item()):
+                return x
+            x += step
+        return -1
+
+    def _copy_block_if_valid(y: int, dst_a: int, dst_b: int, src_a: int, src_b: int) -> bool:
+        if src_a < 0 or src_b > w or src_a >= src_b:
+            return False
+        if bool(mask_bin[y, src_a:src_b].any().item()):
+            return False
+        out[y, dst_a : dst_b + 1, :] = frame_t[y, src_a:src_b, :]
+        return True
+
+    for y in range(h):
+        xs = torch.where(mask_bin[y])[0]
+        if int(xs.numel()) == 0:
+            continue
+        run_start = int(xs[0].item())
+        prev = run_start
+
+        def _paint_run(a: int, b: int) -> None:
+            run_len = int(b - a + 1)
+            touches_left = a < border_cols
+            touches_right = b >= right_touch_start
+            prefer_left = touches_right and not touches_left
+
+            copied = False
+            if prefer_left:
+                copied = _copy_block_if_valid(y, a, b, a - run_len, a)
+                if not copied:
+                    copied = _copy_block_if_valid(y, a, b, b + 1, b + 1 + run_len)
+            else:
+                copied = _copy_block_if_valid(y, a, b, b + 1, b + 1 + run_len)
+                if not copied:
+                    copied = _copy_block_if_valid(y, a, b, a - run_len, a)
+            if copied:
+                return
+
+            if prefer_left:
+                src_x = _nearest_nonmask_x(y, a - 1, -1)
+                if src_x < 0:
+                    src_x = _nearest_nonmask_x(y, b + 1, 1)
+            else:
+                src_x = _nearest_nonmask_x(y, b + 1, 1)
+                if src_x < 0:
+                    src_x = _nearest_nonmask_x(y, a - 1, -1)
+            if src_x >= 0:
+                out[y, a : b + 1, :] = frame_t[y, src_x : src_x + 1, :]
+
+        for idx in range(1, int(xs.numel())):
+            cur = int(xs[idx].item())
+            if cur != prev + 1:
+                _paint_run(run_start, prev)
+                run_start = cur
+            prev = cur
+        _paint_run(run_start, prev)
+
+    return out.numpy()
+
+
+def _apply_ct_preset_frame(
+    preset: Dict[str, Any],
+    inpainted_3: torch.Tensor,
+    original_left_3: torch.Tensor,
+    warped_3: torch.Tensor,
+    mask_bin_1hw: torch.Tensor,
+    settings: Dict[str, Any],
+    stats_valid_cache: Dict[str, torch.Tensor],
+    warped_ref_cache: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    mode = str(preset.get("mode", "safe"))
+    if mode == "legacy":
+        return apply_color_transfer(original_left_3.cpu(), inpainted_3.cpu())
+
+    stats_region = str(preset.get("stats_region", "ring"))
+    if stats_region not in stats_valid_cache:
+        stats_valid_cache[stats_region] = _make_stats_mask(
+            mask_bin_1hw,
+            stats_region=stats_region,
+            ring_width=int(settings.get("ct_ring_width", 40)),
+            use_gpu=False,
+        )
+    stats_valid = stats_valid_cache[stats_region]
+
+    if str(preset.get("target_stats_source", "inpainted")) == "warped":
+        tgt_stats = warped_3.cpu()
+    else:
+        tgt_stats = inpainted_3.cpu()
+
+    ref_src = str(preset.get("reference_source", "left"))
+    if ref_src == "warped_filled":
+        # Optimization: for non-global stats, filled mask area does not affect stats.
+        if stats_region != "global":
+            ref = warped_3.cpu()
+        else:
+            fill_mode = str(preset.get("warped_fill_mode", "directional"))
+            if fill_mode not in warped_ref_cache:
+                wf = warped_3.cpu()
+                wf_u8 = (torch.clamp(wf, 0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                mm = (mask_bin_1hw.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
+                ref_u8 = _build_warped_filled_reference(
+                    wf_u8,
+                    mm,
+                    fill_mode=fill_mode,
+                    border_tol_px=2,
+                    telea_radius=3,
+                )
+                warped_ref_cache[fill_mode] = torch.from_numpy(ref_u8).permute(2, 0, 1).float() / 255.0
+            ref = warped_ref_cache[fill_mode]
+    else:
+        ref = original_left_3.cpu()
+
+    return apply_color_transfer_safe(
+        ref,
+        inpainted_3.cpu(),
+        black_thresh=float(settings.get("ct_black_thresh", 0.0)),
+        min_valid_ratio=float(settings.get("ct_min_valid_ratio", 0.0)),
+        min_valid=int(settings.get("ct_min_valid", 0)),
+        strength=float(settings.get("ct_strength", 1.0)),
+        clamp_scale_L=(
+            float(settings.get("ct_clamp_L_min", 0.1)),
+            float(settings.get("ct_clamp_L_max", 2.0)),
+        ),
+        clamp_scale_ab=(
+            float(settings.get("ct_clamp_ab_min", 0.1)),
+            float(settings.get("ct_clamp_ab_max", 3.0)),
+        ),
+        exclude_black_in_target=bool(settings.get("ct_exclude_black_in_target", True)),
+        source_valid_mask=stats_valid,
+        target_valid_mask=stats_valid,
+        target_stats_frame=tgt_stats,
+    )
+
+
 def apply_shadow_blur(
     mask: torch.Tensor,
     shift_per_step: int,
@@ -427,48 +956,50 @@ def apply_shadow_blur(
 
     stamp_source_right = torch.zeros_like(mask)
     stamp_source_left = torch.zeros_like(mask)
-    mask_cpu = mask.detach().cpu()
+    mask_cpu = mask.detach().to(device="cpu")
+    height = int(mask_cpu.shape[2])
+    width = int(mask_cpu.shape[3])
+    right_touch_start = width - border_cols
 
     for t in range(mask_cpu.shape[0]):
-        frame_np = mask_cpu[t, 0].numpy().astype(np.float32, copy=False)
-        frame_bin = (frame_np > component_thresh).astype(np.uint8)
-        if frame_bin.max() == 0:
+        frame = mask_cpu[t, 0]
+        frame_bin = frame > component_thresh
+        if not bool(frame_bin.any().item()):
             continue
 
-        width = frame_np.shape[1]
-        frame_right = np.zeros_like(frame_np, dtype=np.float32)
-        frame_left = np.zeros_like(frame_np, dtype=np.float32)
-        right_touch_start = width - border_cols
+        frame_right = torch.zeros_like(frame)
+        frame_left = torch.zeros_like(frame)
 
         # Process each row independently so direction can switch within a component.
-        for y in range(frame_bin.shape[0]):
-            xs = np.flatnonzero(frame_bin[y])
-            if xs.size == 0:
+        for y in range(height):
+            xs = torch.where(frame_bin[y])[0]
+            n = int(xs.numel())
+            if n == 0:
                 continue
-            run_start = int(xs[0])
-            prev = int(xs[0])
-            for cur in xs[1:]:
-                cur = int(cur)
+            run_start = int(xs[0].item())
+            prev = run_start
+            for idx in range(1, n):
+                cur = int(xs[idx].item())
                 if cur != prev + 1:
                     a, b = run_start, prev
                     touches_left = a < border_cols
                     touches_right = b >= right_touch_start
                     if touches_right and not touches_left:
-                        frame_left[y, a : b + 1] = frame_np[y, a : b + 1]
+                        frame_left[y, a : b + 1] = frame[y, a : b + 1]
                     else:
-                        frame_right[y, a : b + 1] = frame_np[y, a : b + 1]
+                        frame_right[y, a : b + 1] = frame[y, a : b + 1]
                     run_start = cur
                 prev = cur
             a, b = run_start, prev
             touches_left = a < border_cols
             touches_right = b >= right_touch_start
             if touches_right and not touches_left:
-                frame_left[y, a : b + 1] = frame_np[y, a : b + 1]
+                frame_left[y, a : b + 1] = frame[y, a : b + 1]
             else:
-                frame_right[y, a : b + 1] = frame_np[y, a : b + 1]
+                frame_right[y, a : b + 1] = frame[y, a : b + 1]
 
-        stamp_source_right[t, 0] = torch.from_numpy(frame_right)
-        stamp_source_left[t, 0] = torch.from_numpy(frame_left)
+        stamp_source_right[t, 0] = frame_right
+        stamp_source_left[t, 0] = frame_left
 
     stamp_source_right = stamp_source_right.to(device=mask.device, dtype=mask.dtype)
     stamp_source_left = stamp_source_left.to(device=mask.device, dtype=mask.dtype)
@@ -665,11 +1196,11 @@ def apply_color_transfer_safe(
 # =========================
 
 def setup_logging(verbosity: int) -> None:
-    level = logging.INFO
-    if verbosity >= 2:
-        level = logging.DEBUG
-    elif verbosity <= 0:
+    level = logging.DEBUG
+    if verbosity <= 0:
         level = logging.WARNING
+    elif verbosity == 1:
+        level = logging.INFO
     logging.basicConfig(
         level=level,
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -722,6 +1253,32 @@ def delete_if_exists(p: Optional[str]) -> None:
             os.remove(p)
     except Exception as e:
         LOG.warning(f"Failed to remove '{p}': {e}")
+
+
+def partial_output_path(output_path: str) -> str:
+    """
+    Temp output path that preserves a valid container extension for ffmpeg.
+    Example: clip.mp4 -> clip.part.mp4
+    """
+    root, ext = os.path.splitext(output_path)
+    if not ext:
+        ext = ".mp4"
+    return f"{root}.part{ext}"
+
+
+def legacy_partial_output_path(output_path: str) -> str:
+    """Previous temp naming kept for backward-compatible cleanup."""
+    return f"{output_path}.part"
+
+
+def cleanup_partial_output_files(output_path: Optional[str]) -> None:
+    if not output_path:
+        return
+    new_partial = partial_output_path(output_path)
+    old_partial = legacy_partial_output_path(output_path)
+    delete_if_exists(new_partial)
+    if old_partial != new_partial:
+        delete_if_exists(old_partial)
 
 
 def find_video_by_core_name(folder: str, core_name: str) -> Optional[str]:
@@ -917,8 +1474,45 @@ def write_chunk_to_ffmpeg(ffmpeg_process, chunk: torch.Tensor) -> None:
         ffmpeg_process.stdin.write(frame_bgr.tobytes())
 
 
-def should_skip_output(output_path: str, skip_existing: bool) -> bool:
-    return skip_existing and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+def should_skip_output(
+    output_path: str,
+    skip_existing: bool,
+    strict_validate: bool = False,
+) -> bool:
+    if not skip_existing:
+        return False
+    if not os.path.exists(output_path):
+        return False
+    if os.path.getsize(output_path) <= 0:
+        return False
+
+    # Keep skip checks fast by default; strict validation is optional.
+    if strict_validate:
+        stream_info = get_video_stream_info(output_path)
+        if stream_info is None:
+            LOG.warning(
+                f"Existing output appears invalid/corrupted, will re-encode: {os.path.basename(output_path)}"
+            )
+            return False
+    return True
+
+
+def infer_output_path_from_inpainted(
+    inpainted_video_path: str,
+    output_folder: str,
+    output_format: str,
+) -> Optional[str]:
+    """
+    Best-effort fast output path inference from inpainted filename.
+    Returns None when width token is not available in filename.
+    """
+    core_with_width, _ = parse_inpainted_name(os.path.basename(inpainted_video_path))
+    core_name, width_from_name = parse_core_and_width(core_with_width)
+    if width_from_name is None:
+        return None
+    suffix, width_factor = output_suffix_and_width_factor(output_format)
+    perceived_width_for_filename = int(width_from_name) * int(width_factor)
+    return os.path.join(output_folder, f"{core_name}_{perceived_width_for_filename}{suffix}")
 
 
 def collect_jobs(
@@ -978,6 +1572,7 @@ def process_one_job(
     original_folder: str,
     output_folder: str,
     settings: Dict[str, object],
+    stop_marker_path: str = "",
 ) -> JobPaths:
     """
     Open readers and run the streaming merge pipeline for one video.
@@ -998,6 +1593,9 @@ def process_one_job(
 
     # Decide effective output format early (needed for fast skip path).
     output_format = str(settings["output_format"])
+    skip_existing = bool(settings.get("skip_existing", True))
+    cleanup_partials = bool(settings.get("cleanup_partial_outputs", True))
+    strict_existing_validate = bool(settings.get("strict_existing_validate", False))
     if original_missing_for_dual and output_format != "Right-Eye Only":
         LOG.warning(f"Original video is missing for '{inpainted_base_name}'. Forcing output format to 'Right-Eye Only'.")
         output_format = "Right-Eye Only"
@@ -1011,7 +1609,9 @@ def process_one_job(
             output_folder,
             f"{core_name}_{perceived_width_for_filename}{suffix}",
         )
-        if should_skip_output(precomputed_output_path, bool(settings.get("skip_existing", True))):
+        if should_skip_output(precomputed_output_path, skip_existing, strict_validate=strict_existing_validate):
+            if cleanup_partials:
+                cleanup_partial_output_files(precomputed_output_path)
             LOG.info(f"SKIP (exists-fast): {os.path.basename(precomputed_output_path)}")
             return JobPaths(
                 inpainted_video_path,
@@ -1023,6 +1623,14 @@ def process_one_job(
                 core_name,
                 is_sbs_input,
             )
+        if cleanup_partials and skip_existing and os.path.exists(precomputed_output_path):
+            LOG.warning(
+                f"Removing invalid existing output before re-encode: "
+                f"{os.path.basename(precomputed_output_path)}"
+            )
+            delete_if_exists(precomputed_output_path)
+        if cleanup_partials:
+            cleanup_partial_output_files(precomputed_output_path)
 
     # sidecar (may be empty dict)
     inpainted_base = os.path.splitext(inpainted_video_path)[0]
@@ -1098,230 +1706,299 @@ def process_one_job(
             f"{os.path.basename(precomputed_output_path)} vs {os.path.basename(output_path)}"
         )
 
-    if should_skip_output(output_path, bool(settings.get("skip_existing", True))):
+    output_partial_path = partial_output_path(output_path)
+    if should_skip_output(output_path, skip_existing, strict_validate=strict_existing_validate):
+        if cleanup_partials:
+            cleanup_partial_output_files(output_path)
         LOG.info(f"SKIP (exists): {os.path.basename(output_path)}")
         return JobPaths(inpainted_video_path, splatted_video_path, original_video_path_to_move, replace_mask_path, output_path, inpainted_base, core_name, is_sbs_input)
+    if cleanup_partials and skip_existing and os.path.exists(output_path):
+        LOG.warning(
+            f"Removing invalid existing output before re-encode: {os.path.basename(output_path)}"
+        )
+        delete_if_exists(output_path)
+    if cleanup_partials:
+        cleanup_partial_output_files(output_path)
 
     safe_makedirs(output_folder)
 
     # 4) Start ffmpeg pipe
-    ffmpeg_process = start_ffmpeg_pipe_process(
-        content_width=output_width,
-        content_height=output_height,
-        final_output_mp4_path=output_path,
-        fps=fps,
-        video_stream_info=video_stream_info,
-        pad_to_16_9=bool(settings.get("pad_to_16_9", False)),
-        output_format_str=output_format,
-    )
-    if ffmpeg_process is None:
-        raise RuntimeError("Failed to start FFmpeg pipe process.")
+    ffmpeg_process = None
+    stdout_thread: Optional[threading.Thread] = None
+    stderr_thread: Optional[threading.Thread] = None
 
-    stdout_thread = threading.Thread(target=_read_ffmpeg_output, args=(ffmpeg_process.stdout, logging.DEBUG), daemon=True)
-    stderr_thread = threading.Thread(target=_read_ffmpeg_output, args=(ffmpeg_process.stderr, logging.DEBUG), daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-
-    # 5) Chunk loop
+    # 5) Chunk loop + ffmpeg finalize
     chunk_size = int(settings.get("batch_chunk_size", 32))
     device = torch.device(str(settings.get("device", "cuda")) if torch.cuda.is_available() else "cpu")
     use_gpu_mask_ops = bool(settings.get("use_gpu_mask_ops", True)) and torch.cuda.is_available()
+    ct_usage_counts = {int(p["id"]): 0 for p in CT_PRESETS}
+    selected_ct_label = _resolve_ct_preset_label(str(settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL)))
+    selected_ct_preset = CT_PRESET_BY_LABEL[selected_ct_label]
+    auto_ct_eval = bool(settings.get("auto_ct_eval", False))
+    encode_ok = False
 
-    for frame_start in range(0, num_frames, chunk_size):
-        frame_end = min(frame_start + chunk_size, num_frames)
-        frame_indices = list(range(frame_start, frame_end))
-        if not frame_indices:
-            break
-
-        LOG.debug(f"Processing frames {frame_start + 1}-{frame_end}/{num_frames}...")
-
-        inpainted_np = inpainted_reader.get_batch(frame_indices).asnumpy()
-        splatted_np = splatted_reader.get_batch(frame_indices).asnumpy()
-
-        replace_mask_np = None
-        if replace_mask_reader is not None:
-            try:
-                replace_mask_np = replace_mask_reader.get_batch(frame_indices).asnumpy()
-            except Exception as e_rmread:
-                LOG.warning(f"Replace mask read failed for {inpainted_base_name} frames {frame_start}-{frame_end}: {e_rmread}")
-                replace_mask_np = None
-
-        # tensors
-        inpainted_tensor_full = torch.from_numpy(inpainted_np).permute(0, 3, 1, 2).float() / 255.0
-        splatted_tensor = torch.from_numpy(splatted_np).permute(0, 3, 1, 2).float() / 255.0
-
-        inpainted = (
-            inpainted_tensor_full[:, :, :, inpainted_tensor_full.shape[3] // 2 :]
-            if is_sbs_input
-            else inpainted_tensor_full
-        )
-
-        _, _, H, W = splatted_tensor.shape
-
-        if is_dual_input:
-            if original_reader is None:
-                original_left = torch.zeros_like(inpainted)
-            else:
-                original_np = original_reader.get_batch(frame_indices).asnumpy()
-                original_left = torch.from_numpy(original_np).permute(0, 3, 1, 2).float() / 255.0
-
-            mask_raw = splatted_tensor[:, :, :, : W // 2]
-            warped_original = splatted_tensor[:, :, :, W // 2 :]
-        else:
-            # quad: top-left is left eye, bottom-left is mask, bottom-right is warped
-            original_left = splatted_tensor[:, :, : H // 2, : W // 2]
-            mask_raw = splatted_tensor[:, :, H // 2 :, : W // 2]
-            warped_original = splatted_tensor[:, :, H // 2 :, W // 2 :]
-
-        # Use external replace mask if enabled
-        if replace_mask_np is not None and bool(settings.get("use_replace_mask", False)):
-            # Expect replace_mask_np either single-channel or 3-channel; take first channel.
-            rm_t = torch.from_numpy(replace_mask_np).permute(0, 3, 1, 2).float() / 255.0
-            rm = rm_t[:, 0:1, :, :]
-            # Ensure same H,W as mask_raw (resize if needed)
-            if rm.shape[2:] != mask_raw.shape[2:]:
-                rm = F.interpolate(rm, size=mask_raw.shape[2:], mode="nearest")
-            mask_raw = rm.repeat(1, 3, 1, 1)
-
-        # processed mask (grayscale 0..1)
-        processed_mask = mask_raw[:, 0:1, :, :].to(device)
-
-
-        # Match GUI: optional binarization as FIRST step of the mask chain (affects blending mask)
-        bin_thr = float(settings.get("mask_binarize_threshold", -1.0))
-        if bin_thr >= 0.0:
-            processed_mask = (processed_mask > bin_thr).float()
-        # Post-process mask
-        if int(settings.get("mask_dilate_kernel_size", 0)) > 0:
-            processed_mask = apply_mask_dilation(processed_mask, int(settings["mask_dilate_kernel_size"]), use_gpu_mask_ops)
-        if int(settings.get("mask_blur_kernel_size", 0)) > 0:
-            processed_mask = apply_gaussian_blur(processed_mask, int(settings["mask_blur_kernel_size"]), use_gpu_mask_ops)
-
-        if int(settings.get("shadow_shift", 0)) > 0:
-            processed_mask = apply_shadow_blur(
-                processed_mask,
-                int(settings["shadow_shift"]),
-                float(settings.get("shadow_start_opacity", 0.0)),
-                float(settings.get("shadow_opacity_decay", 0.0)),
-                float(settings.get("shadow_min_opacity", 0.0)),
-                float(settings.get("shadow_decay_gamma", 1.0)),
-                use_gpu_mask_ops,
-            )
-
-        warped_original = warped_original.to(device)
-        inpainted = inpainted.to(device)
-        original_left = original_left.to(device)
-
-        # --- Color Transfer ---
-        if bool(settings.get("enable_color_transfer", True)):
-            mode = str(settings.get("color_transfer_mode", "safe")).lower().strip()
-            if mode == "legacy":
-                # legacy util: per-frame
-                adjusted = []
-                for fi in range(inpainted.shape[0]):
-                    adj = apply_color_transfer(original_left[fi].cpu(), inpainted[fi].cpu()).to(device)
-                    adjusted.append(adj)
-                inpainted = torch.stack(adjusted, dim=0)
-            else:
-                # SAFE mode: stats on stable region (global/nonmask/ring) and clamped scales
-                # Match GUI: stats binarization is fixed at 0.5 on the (already post-processed) mask.
-                mask_bin = (processed_mask > 0.5).float()
-
-                adjusted = []
-                for fi in range(inpainted.shape[0]):
-                    stats_valid = _make_stats_mask(
-                        mask_bin[fi],  # [1,H,W]
-                        stats_region=str(settings.get("ct_stats_region", "nonmask")),
-                        ring_width=int(settings.get("ct_ring_width", 20)),
-                        use_gpu=False,
-                    )
-
-                    # choose target stats frame
-                    if str(settings.get("ct_target_stats_source", "warped")) == "warped":
-                        tgt_stats = warped_original[fi].cpu()
-                    else:
-                        tgt_stats = inpainted[fi].cpu()
-
-                    # choose reference frame
-                    ref_src = str(settings.get("ct_reference_source", "left")).strip().lower().replace("-", "_")
-                    if ref_src == "warped_filled":
-                        wf = warped_original[fi].cpu()
-                        wf_u8 = (torch.clamp(wf, 0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                        mm = (mask_bin[fi].squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-                        ref_u8 = _build_warped_filled_reference(
-                            wf_u8,
-                            mm,
-                            fill_mode=str(settings.get("ct_warped_fill_mode", "hybrid")),
-                            border_tol_px=2,
-                            telea_radius=3,
-                        )
-                        ref = torch.from_numpy(ref_u8).permute(2, 0, 1).float() / 255.0
-                    else:
-                        ref = original_left[fi].cpu()
-
-                    adj = apply_color_transfer_safe(
-                        ref,
-                        inpainted[fi].cpu(),
-                        black_thresh=float(settings.get("ct_black_thresh", 8.0)),
-                        min_valid_ratio=float(settings.get("ct_min_valid_ratio", 0.01)),
-                        min_valid=int(settings.get("ct_min_valid", 300)),
-                        strength=float(settings.get("ct_strength", 1.0)),
-                        clamp_scale_L=(
-                            float(settings.get("ct_clamp_L_min", 0.7)),
-                            float(settings.get("ct_clamp_L_max", 1.3)),
-                        ),
-                        clamp_scale_ab=(
-                            float(settings.get("ct_clamp_ab_min", 0.6)),
-                            float(settings.get("ct_clamp_ab_max", 1.4)),
-                        ),
-                        exclude_black_in_target=bool(settings.get("ct_exclude_black_in_target", False)),
-                        source_valid_mask=stats_valid,
-                        target_valid_mask=stats_valid,
-                        target_stats_frame=tgt_stats,
-                    ).to(device)
-                    adjusted.append(adj)
-                inpainted = torch.stack(adjusted, dim=0)
-
-        blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
-
-        # Borders from sidecar
-        left_border = float(clip_sidecar_data.get("left_border", 0.0))
-        right_border = float(clip_sidecar_data.get("right_border", 0.0))
-        if bool(settings.get("add_borders", True)) and (left_border > 0 or right_border > 0):
-            original_left, blended_right_eye = apply_borders_to_frames(
-                left_border, right_border, original_left, blended_right_eye
-            )
-
-        # Assemble output chunk
-        final_chunk = assemble_output_chunk(output_format, hires_H, hires_W, original_left, blended_right_eye)
-
-        # Write frames
-        write_chunk_to_ffmpeg(ffmpeg_process, final_chunk.detach().cpu())
-
-        draw_progress_bar(frame_end, num_frames, prefix=f"  Encoding {inpainted_base_name}:")
-
-        # free per-chunk tensors
-        del inpainted_tensor_full, splatted_tensor, inpainted, mask_raw, warped_original, processed_mask, blended_right_eye, final_chunk
-        if replace_mask_np is not None:
-            del replace_mask_np
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    # 6) Finalize ffmpeg
     try:
-        if ffmpeg_process.stdin:
-            ffmpeg_process.stdin.close()
-    except Exception:
-        pass
+        ffmpeg_process = start_ffmpeg_pipe_process(
+            content_width=output_width,
+            content_height=output_height,
+            final_output_mp4_path=output_partial_path,
+            fps=fps,
+            video_stream_info=video_stream_info,
+            pad_to_16_9=bool(settings.get("pad_to_16_9", False)),
+            output_format_str=output_format,
+        )
+        if ffmpeg_process is None:
+            raise RuntimeError("Failed to start FFmpeg pipe process.")
 
-    # Wait then join threads
-    ffmpeg_process.wait(timeout=120)
-    stdout_thread.join(timeout=5)
-    stderr_thread.join(timeout=5)
+        stdout_thread = threading.Thread(
+            target=_read_ffmpeg_output,
+            args=(ffmpeg_process.stdout, logging.DEBUG),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_read_ffmpeg_output,
+            args=(ffmpeg_process.stderr, logging.DEBUG),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
 
-    rc = getattr(ffmpeg_process, "returncode", 0)
-    if rc not in (0, None):
-        raise RuntimeError(f"ffmpeg failed with returncode={rc} for {inpainted_base_name}")
+        for frame_start in range(0, num_frames, chunk_size):
+            frame_end = min(frame_start + chunk_size, num_frames)
+            frame_indices = list(range(frame_start, frame_end))
+            if not frame_indices:
+                break
+
+            LOG.debug(f"Processing frames {frame_start + 1}-{frame_end}/{num_frames}...")
+
+            inpainted_np = inpainted_reader.get_batch(frame_indices).asnumpy()
+            splatted_np = splatted_reader.get_batch(frame_indices).asnumpy()
+
+            replace_mask_np = None
+            if replace_mask_reader is not None:
+                try:
+                    replace_mask_np = replace_mask_reader.get_batch(frame_indices).asnumpy()
+                except Exception as e_rmread:
+                    LOG.warning(f"Replace mask read failed for {inpainted_base_name} frames {frame_start}-{frame_end}: {e_rmread}")
+                    replace_mask_np = None
+
+            # tensors
+            inpainted_tensor_full = torch.from_numpy(inpainted_np).permute(0, 3, 1, 2).float() / 255.0
+            splatted_tensor = torch.from_numpy(splatted_np).permute(0, 3, 1, 2).float() / 255.0
+
+            inpainted = (
+                inpainted_tensor_full[:, :, :, inpainted_tensor_full.shape[3] // 2 :]
+                if is_sbs_input
+                else inpainted_tensor_full
+            )
+
+            _, _, H, W = splatted_tensor.shape
+
+            if is_dual_input:
+                if original_reader is None:
+                    original_left = torch.zeros_like(inpainted)
+                else:
+                    original_np = original_reader.get_batch(frame_indices).asnumpy()
+                    original_left = torch.from_numpy(original_np).permute(0, 3, 1, 2).float() / 255.0
+
+                mask_raw = splatted_tensor[:, :, :, : W // 2]
+                warped_original = splatted_tensor[:, :, :, W // 2 :]
+            else:
+                # quad: top-left is left eye, bottom-left is mask, bottom-right is warped
+                original_left = splatted_tensor[:, :, : H // 2, : W // 2]
+                mask_raw = splatted_tensor[:, :, H // 2 :, : W // 2]
+                warped_original = splatted_tensor[:, :, H // 2 :, W // 2 :]
+
+            # Use external replace mask if enabled
+            if replace_mask_np is not None and bool(settings.get("use_replace_mask", False)):
+                # GUI-aligned replace-mask conversion: use grayscale from RGB (not channel-0 only).
+                if replace_mask_np.ndim == 4 and replace_mask_np.shape[3] >= 1:
+                    rm_gray = replace_mask_np[..., :3].mean(axis=3)  # T,H,W
+                elif replace_mask_np.ndim == 3:
+                    rm_gray = replace_mask_np  # T,H,W
+                else:
+                    rm_gray = np.squeeze(replace_mask_np)
+                rm_gray = rm_gray.astype(np.float32)
+                if rm_gray.size > 0 and float(np.nanmax(rm_gray)) > 1.5:
+                    rm_gray = rm_gray / 255.0
+                rm = torch.from_numpy(rm_gray).float().unsqueeze(1)  # T,1,H,W
+                # Ensure same H,W as mask_raw (resize if needed)
+                if rm.shape[2:] != mask_raw.shape[2:]:
+                    rm = F.interpolate(rm, size=mask_raw.shape[2:], mode="nearest")
+                mask_raw = rm.repeat(1, 3, 1, 1)
+
+            # Build clean binary mask for CT/ring/warped_filled (pre post-processing, GUI-aligned).
+            mask_clean = mask_raw[:, 0:1, :, :].to(device)
+            bin_thr = float(settings.get("mask_binarize_threshold", -1.0))
+            if bin_thr >= 0.0:
+                mask_bin_clean = (mask_clean > bin_thr).float()
+            else:
+                mask_bin_clean = (mask_clean > 0.5).float()
+
+            # Processed mask is used only for final blending.
+            processed_mask = mask_bin_clean.clone()
+            # Post-process mask
+            if int(settings.get("mask_dilate_kernel_size", 0)) > 0:
+                processed_mask = apply_mask_dilation(processed_mask, int(settings["mask_dilate_kernel_size"]), use_gpu_mask_ops)
+            if int(settings.get("mask_blur_kernel_size", 0)) > 0:
+                processed_mask = apply_gaussian_blur(processed_mask, int(settings["mask_blur_kernel_size"]), use_gpu_mask_ops)
+
+            if int(settings.get("shadow_shift", 0)) > 0:
+                processed_mask = apply_shadow_blur(
+                    processed_mask,
+                    int(settings["shadow_shift"]),
+                    float(settings.get("shadow_start_opacity", 0.0)),
+                    float(settings.get("shadow_opacity_decay", 0.0)),
+                    float(settings.get("shadow_min_opacity", 0.0)),
+                    float(settings.get("shadow_decay_gamma", 1.0)),
+                    use_gpu_mask_ops,
+                )
+
+            warped_original = warped_original.to(device)
+            inpainted = inpainted.to(device)
+            original_left = original_left.to(device)
+
+            # --- Color Transfer ---
+            if bool(settings.get("enable_color_transfer", True)):
+                mask_bin = mask_bin_clean
+                adjusted_frames: List[torch.Tensor] = []
+                ct_eval_executor = (
+                    ThreadPoolExecutor(max_workers=CT_AUTO_EVAL_MAX_WORKERS)
+                    if auto_ct_eval
+                    else None
+                )
+                try:
+                    for fi in range(inpainted.shape[0]):
+                        inpainted_3 = inpainted[fi].cpu()
+                        original_left_3 = original_left[fi].cpu()
+                        warped_3 = warped_original[fi].cpu()
+                        mask_bin_1hw = mask_bin[fi].cpu()
+
+                        if auto_ct_eval:
+                            best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
+                                inpainted_3=inpainted_3,
+                                original_left_3=original_left_3,
+                                warped_3=warped_3,
+                                mask_bin_1hw=mask_bin_1hw,
+                                settings=settings,
+                                fallback_preset_id=int(selected_ct_preset["id"]),
+                                executor=ct_eval_executor,
+                            )
+                            ct_usage_counts[best_preset_id] += 1
+                            adjusted_frames.append(best_frame.to(device))
+                        else:
+                            stats_valid_cache = {}
+                            warped_ref_cache = {}
+                            adjusted_3 = _apply_ct_preset_frame(
+                                preset=selected_ct_preset,
+                                inpainted_3=inpainted_3,
+                                original_left_3=original_left_3,
+                                warped_3=warped_3,
+                                mask_bin_1hw=mask_bin_1hw,
+                                settings=settings,
+                                stats_valid_cache=stats_valid_cache,
+                                warped_ref_cache=warped_ref_cache,
+                            )
+                            ct_usage_counts[int(selected_ct_preset["id"])] += 1
+                            adjusted_frames.append(adjusted_3.to(device))
+                finally:
+                    if ct_eval_executor is not None:
+                        ct_eval_executor.shutdown(wait=True)
+
+                inpainted = torch.stack(adjusted_frames, dim=0)
+
+            blended_right_eye = warped_original * (1 - processed_mask) + inpainted * processed_mask
+
+            # Borders from sidecar
+            left_border = float(clip_sidecar_data.get("left_border", 0.0))
+            right_border = float(clip_sidecar_data.get("right_border", 0.0))
+            if bool(settings.get("add_borders", True)) and (left_border > 0 or right_border > 0):
+                original_left, blended_right_eye = apply_borders_to_frames(
+                    left_border, right_border, original_left, blended_right_eye
+                )
+
+            # Assemble output chunk
+            final_chunk = assemble_output_chunk(output_format, hires_H, hires_W, original_left, blended_right_eye)
+
+            # Write frames
+            write_chunk_to_ffmpeg(ffmpeg_process, final_chunk.detach().cpu())
+
+            draw_progress_bar(frame_end, num_frames, prefix=f"  Encoding {inpainted_base_name}:")
+
+            # free per-chunk tensors
+            del inpainted_tensor_full, splatted_tensor, inpainted, mask_raw, warped_original, processed_mask, blended_right_eye, final_chunk
+            if replace_mask_np is not None:
+                del replace_mask_np
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if bool(settings.get("enable_color_transfer", False)):
+            total_ct = int(sum(ct_usage_counts.values()))
+            if total_ct > 0:
+                ct_line = " ".join(
+                    [
+                        f"{pid}:{(100.0 * ct_usage_counts.get(pid, 0) / total_ct):.1f}%"
+                        for pid in range(1, 9)
+                    ]
+                )
+                LOG.info(f"CT usage [{inpainted_base_name}] {ct_line}")
+
+        # 6) Finalize ffmpeg
+        try:
+            if ffmpeg_process.stdin:
+                ffmpeg_process.stdin.close()
+        except Exception:
+            pass
+
+        ffmpeg_process.wait(timeout=120)
+        rc = getattr(ffmpeg_process, "returncode", 0)
+        stop_requested_now = bool(stop_marker_path and _stop_marker_exists(stop_marker_path))
+
+        if rc not in (0, None):
+            # During graceful stop, ffmpeg may return non-zero late in finalize even when
+            # a decodable .part was produced. Keep that output and stop cleanly.
+            if stop_requested_now and should_skip_output(
+                output_partial_path, True, strict_validate=True
+            ):
+                LOG.warning(
+                    f"FFmpeg returned rc={rc} during stop request for {inpainted_base_name}; "
+                    f"promoting readable partial output."
+                )
+                os.replace(output_partial_path, output_path)
+                encode_ok = True
+            else:
+                raise RuntimeError(f"ffmpeg failed with returncode={rc} for {inpainted_base_name}")
+
+        if not encode_ok:
+            # Promote completed temp file atomically.
+            os.replace(output_partial_path, output_path)
+            encode_ok = True
+    finally:
+        # Best-effort process/thread cleanup for error paths and abrupt ffmpeg exits.
+        try:
+            if ffmpeg_process is not None and ffmpeg_process.stdin:
+                ffmpeg_process.stdin.close()
+        except Exception:
+            pass
+
+        try:
+            if ffmpeg_process is not None and ffmpeg_process.poll() is None:
+                ffmpeg_process.terminate()
+                ffmpeg_process.wait(timeout=10)
+        except Exception:
+            try:
+                if ffmpeg_process is not None:
+                    ffmpeg_process.kill()
+            except Exception:
+                pass
+
+        if stdout_thread is not None:
+            stdout_thread.join(timeout=5)
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=5)
+
+        if not encode_ok and cleanup_partials:
+            cleanup_partial_output_files(output_path)
 
     # Cleanup reader refs
     try:
@@ -1337,13 +2014,17 @@ def process_one_job(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Headless batch runner for merging_gui pipeline (streaming).")
+    ap = argparse.ArgumentParser(
+        description="Headless single-worker batch runner for merging_gui pipeline (streaming)."
+    )
     ap.add_argument("--inpainted-folder", required=True, help="Folder containing *_inpainted_right_eye.mp4 or *_inpainted_sbs.mp4")
     ap.add_argument("--splatted-folder", required=True, help="Folder containing *_splatted2.mp4 / *_splatted4.mp4")
     ap.add_argument("--original-folder", required=True, help="Folder containing original left-eye videos (dual-input case)")
     ap.add_argument("--output-folder", required=True, help="Output folder for merged files")
+    ap.add_argument("--stop-marker", default="", help="Path to a marker file used for graceful stop-after-current-file behavior.")
     ap.add_argument("--only", default=None, help="Process only one file (basename or prefix match)")
-    ap.add_argument("--verbosity", type=int, default=1, help="0=warnings,1=info,2=debug")
+    ap.add_argument("--debug", action="store_true", default=False, help="Enable debug mode (or set MERGE_DEBUG=1).")
+    ap.add_argument("--verbosity", type=int, default=None, help="0=warnings,1=info,2=debug")
 
     # Overrides for the most relevant knobs (everything else stays in DEFAULTS above)
     ap.add_argument("--output-format", choices=OUTPUT_FORMAT_CHOICES, default=None)
@@ -1357,7 +2038,9 @@ def main() -> int:
     ap.add_argument("--no-add-borders", action="store_true", default=False)
     # Color transfer
     ap.add_argument("--no-color-transfer", action="store_true", default=False, help="Disable color transfer entirely")
-    ap.add_argument("--color-transfer-mode", choices=["safe", "legacy"], default=None)
+    ap.add_argument("--ct-preset", default=None, help="CT preset label or id (1..8)")
+    ap.add_argument("--auto-ct-eval", action="store_true", default=None, help="Try all CT presets per-frame and pick the best score.")
+    ap.add_argument("--no-auto-ct-eval", action="store_true", default=False)
     ap.add_argument("--ct-strength", type=float, default=None)
     ap.add_argument("--ct-black-thresh", type=float, default=None)
     ap.add_argument("--ct-min-valid-ratio", type=float, default=None)
@@ -1368,11 +2051,7 @@ def main() -> int:
     ap.add_argument("--ct-clamp-ab-max", type=float, default=None)
     ap.add_argument("--ct-exclude-black-in-target", action="store_true", default=None)
     ap.add_argument("--no-ct-exclude-black-in-target", action="store_true", default=False)
-    ap.add_argument("--ct-stats-region", choices=["global", "nonmask", "ring"], default=None)
     ap.add_argument("--ct-ring-width", type=int, default=None)
-    ap.add_argument("--ct-target-stats-source", choices=["warped", "inpainted"], default=None)
-    ap.add_argument("--ct-reference-source", choices=["left", "warped_filled"], default=None)
-    ap.add_argument("--ct-warped-fill-mode", choices=["telea", "directional", "hybrid"], default=None)
     ap.add_argument("--mask-binarize-threshold", type=float, default=None, help="Threshold for building binary stats mask; -1 disables")
     ap.add_argument("--use-replace-mask", action="store_true", default=None)
     ap.add_argument("--replace-mask-folder", default=None)
@@ -1381,7 +2060,12 @@ def main() -> int:
     ap.add_argument("--no-cleanup-partials", action="store_true", default=False)
 
     args = ap.parse_args()
-    setup_logging(args.verbosity)
+    debug_enabled = bool(args.debug or _env_flag("MERGE_DEBUG", False))
+    verbosity = int(args.verbosity) if args.verbosity is not None else (2 if debug_enabled else 1)
+    setup_logging(verbosity)
+    if debug_enabled:
+        _enable_debug_faulthandler()
+        LOG.info("Debug mode enabled (MERGE_DEBUG/--debug).")
 
     # Build settings
     settings: Dict[str, object] = dict(DEFAULTS)
@@ -1411,8 +2095,12 @@ def main() -> int:
     # Color transfer settings
     if args.no_color_transfer is True:
         settings["enable_color_transfer"] = False
-    if args.color_transfer_mode is not None:
-        settings["color_transfer_mode"] = args.color_transfer_mode
+    if args.ct_preset is not None:
+        settings["ct_preset"] = _parse_ct_preset_arg(args.ct_preset)
+    if args.auto_ct_eval is True:
+        settings["auto_ct_eval"] = True
+    if args.no_auto_ct_eval is True:
+        settings["auto_ct_eval"] = False
     if args.ct_strength is not None:
         settings["ct_strength"] = float(args.ct_strength)
     if args.ct_black_thresh is not None:
@@ -1433,18 +2121,13 @@ def main() -> int:
         settings["ct_exclude_black_in_target"] = True
     if args.no_ct_exclude_black_in_target is True:
         settings["ct_exclude_black_in_target"] = False
-    if args.ct_stats_region is not None:
-        settings["ct_stats_region"] = args.ct_stats_region
     if args.ct_ring_width is not None:
         settings["ct_ring_width"] = int(args.ct_ring_width)
-    if args.ct_target_stats_source is not None:
-        settings["ct_target_stats_source"] = args.ct_target_stats_source
-    if args.ct_reference_source is not None:
-        settings["ct_reference_source"] = args.ct_reference_source
-    if args.ct_warped_fill_mode is not None:
-        settings["ct_warped_fill_mode"] = args.ct_warped_fill_mode
     if args.mask_binarize_threshold is not None:
         settings["mask_binarize_threshold"] = float(args.mask_binarize_threshold)
+
+    settings["ct_preset"] = _parse_ct_preset_arg(str(settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL)))
+    selected_ct = CT_PRESET_BY_LABEL[_resolve_ct_preset_label(str(settings["ct_preset"]))]
 
     if args.use_replace_mask is True:
         settings["use_replace_mask"] = True
@@ -1458,6 +2141,11 @@ def main() -> int:
 
     if args.no_cleanup_partials is True:
         settings["cleanup_partial_outputs"] = False
+    stop_marker_path = (
+        os.path.abspath(args.stop_marker)
+        if args.stop_marker
+        else _default_stop_marker_path(args.output_folder)
+    )
 
     # Collect jobs
     pairs = collect_jobs(
@@ -1469,7 +2157,7 @@ def main() -> int:
     )
     if not pairs:
         LOG.warning("No matching jobs found.")
-        return 1
+        return 0
 
     LOG.info(f"Jobs: {len(pairs)}")
     finished_root = os.path.join(args.inpainted_folder, "finished")
@@ -1482,6 +2170,10 @@ def main() -> int:
     rm_failed_root = os.path.join(str(settings.get("replace_mask_folder") or args.splatted_folder), "failed")
 
     for (inpainted_path, splatted_path) in pairs:
+        if _stop_marker_exists(stop_marker_path):
+            LOG.info(f"[STOP] marker detected, stopping before next file: {stop_marker_path}")
+            return 0
+
         base = os.path.basename(inpainted_path)
         attempts_total = 1 + int(settings.get("retries", 0))
         ok = False
@@ -1489,6 +2181,12 @@ def main() -> int:
         job_paths: Optional[JobPaths] = None
 
         for attempt in range(1, attempts_total + 1):
+            if _stop_marker_exists(stop_marker_path):
+                LOG.info(
+                    f"[STOP] marker detected before attempt {attempt}/{attempts_total} for {base}; "
+                    "stopping without retry."
+                )
+                return 0
             try:
                 LOG.info(f"[{attempt}/{attempts_total}] {base}")
                 job_paths = process_one_job(
@@ -1497,6 +2195,7 @@ def main() -> int:
                     original_folder=args.original_folder,
                     output_folder=args.output_folder,
                     settings=settings,
+                    stop_marker_path=stop_marker_path,
                 )
                 ok = True
                 break
@@ -1504,9 +2203,39 @@ def main() -> int:
                 last_err = e
                 LOG.exception(f"FAILED attempt {attempt}/{attempts_total} for {base}: {e}")
 
+                if _stop_marker_exists(stop_marker_path):
+                    LOG.info(
+                        f"[STOP] marker detected after failed attempt for {base}; "
+                        "skipping remaining retries and exiting."
+                    )
+                    if bool(settings.get("cleanup_partial_outputs", True)):
+                        inferred_output_path = infer_output_path_from_inpainted(
+                            inpainted_video_path=inpainted_path,
+                            output_folder=args.output_folder,
+                            output_format=str(settings.get("output_format", "Right-Eye Only")),
+                        )
+                        if inferred_output_path:
+                            cleanup_partial_output_files(inferred_output_path)
+                    return 0
+
                 # Cleanup partial output if requested
-                if bool(settings.get("cleanup_partial_outputs", True)) and job_paths is not None:
-                    delete_if_exists(job_paths.output_path)
+                if bool(settings.get("cleanup_partial_outputs", True)):
+                    if job_paths is not None:
+                        delete_if_exists(job_paths.output_path)
+                        cleanup_partial_output_files(job_paths.output_path)
+                    else:
+                        inferred_output_path = infer_output_path_from_inpainted(
+                            inpainted_video_path=inpainted_path,
+                            output_folder=args.output_folder,
+                            output_format=str(settings.get("output_format", "Right-Eye Only")),
+                        )
+                        if inferred_output_path:
+                            # Keep valid complete outputs, remove only stale temp/invalid leftovers.
+                            cleanup_partial_output_files(inferred_output_path)
+                            if os.path.exists(inferred_output_path) and not should_skip_output(
+                                inferred_output_path, True, strict_validate=True
+                            ):
+                                delete_if_exists(inferred_output_path)
 
                 # Give some breathing room
                 time.sleep(2)
@@ -1527,16 +2256,27 @@ def main() -> int:
                 move_file(job_paths.replace_mask_path, rm_finished_root)
         else:
             LOG.error(f"GIVING UP: {base} -> {last_err}")
-            # Cleanup partial output even if job_paths wasn't built
+            # Final best-effort cleanup on terminal failure.
             if bool(settings.get("cleanup_partial_outputs", True)):
-                # best-effort: infer output path by opening splatted frame 0 is too expensive; skip
-                pass
+                if job_paths is not None:
+                    cleanup_partial_output_files(job_paths.output_path)
+                else:
+                    inferred_output_path = infer_output_path_from_inpainted(
+                        inpainted_video_path=inpainted_path,
+                        output_folder=args.output_folder,
+                        output_format=str(settings.get("output_format", "Right-Eye Only")),
+                    )
+                    if inferred_output_path:
+                        cleanup_partial_output_files(inferred_output_path)
 
             if bool(settings.get("move_failed", False)):
                 move_file(inpainted_path, failed_root)
                 core_with_width, _ = parse_inpainted_name(base)
                 # Move matching splatted too if present
                 move_file(splatted_path, splat_failed_root)
+
+    if _stop_marker_exists(stop_marker_path):
+        LOG.info(f"[STOP] marker still present at end of batch: {stop_marker_path}")
 
     LOG.info("All done.")
     return 0
