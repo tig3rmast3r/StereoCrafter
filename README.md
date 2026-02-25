@@ -15,13 +15,13 @@
 - Multithreaded RealESRGAN upscale script
 - Rejoin segments ps1 script (ffmpeg)
 - Added modified Forward-Warp cuda submodule, compatible with latest pytorch (need build)
+- Quick setup scripts (stage1 + stage2 for weights) for vast.ai docker with 5090 for the inpaint step (tested using vastai/pytorch:2.9.1-cuda-12.8.1-py310-24.04, tested only inpaint runner for now)
 
 THIS FORK IS STILL WIP IT WILL CHANGE A LOT OVERTIME<br>
 Objectives:<br>
 - Single gui panel from start to finish without user action + resume
 - Set up a curated preset for all steps that should work with most contents
 - Optional local run up to splatting + vast.ai inpaint + final local merge
-- Quick setup script for vast.ai docker with 5090 for the inpaint step
 
 ## Fork workflow example (1080p)
 
@@ -90,11 +90,33 @@ python analyze_inpaint_sharpness_newmask.py "./work/splat/hires" "./work/mask" -
 ```
 Will predict masked zone sharpness and save to csv.
 
+### Running inpaint on vast.ai
+
+Get an rtx5090 server with at least 48Gb ram and some disk space (i usually get 100GB but i cleanup overtime)<br>
+in terminal and workspace folder run:
+```
+git clone https://github.com/tig3rmast3r/StereoCrafter --recursive
+cd StereoCrafter
+chmod +x setup_vast_stage1.sh
+./setup_vast_stage1.sh
+```
+for weights (you need HF token with this method)
+
+```
+chmod +x setup_vast_stage2_weights.sh
+./setup_vast_stage2_weights.sh
+```
+insert token and say yes when asks to add to git credentials
+make a work folder inside StereoCrafter and upload your files, sharpness.csv into work/binarymasks into work/mask/ and splatted2 files into work/splat/, inpaint runner is configured already for those paths, just run step 6<br>
+only thing to configure is chunk size (run_inpaint_runner.sh line 16) depending on your vids resolution, usually 80 is fine. May be lower for full res 1920x1080 (no crop)<br>
+Default is 50 that is for RTX4090<br>
+Vids length is not a problem cause i've implemented full stream so it will read only what it needs for that chunk.
+
 ### Step 6 - Inpaint
 
 just run and wait (a lot).<br>
 for 24GB VRAM (RTX4090) i suggest tile 2, frame chunk size up to 50.<br>
-for 32GB VRAM (RTX5090) you can push up to 80 chunk size.<br>
+for 32GB VRAM (RTX5090) same tile 2 but you can push up to 80 chunk size.<br>
 default option on runner is with Color Transfer disabled (it will be done better during the merging and you do not have to re-inpaint to change it).<br>
 Inpainting runner uses binary ReplaceMask as default.
 ```bash
