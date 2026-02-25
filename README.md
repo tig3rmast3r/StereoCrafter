@@ -2,13 +2,25 @@
 
 - added sh + runners for headless batches (mainly for docker usage and handling errors/skip)
 - Depthcrafter script memory usage optimization (will allow larger files before OOM)
-- Splatting improvement, blur for left borders + clean mask for merge
+- Headless rebuild script for Depthcrafter (same options but no gui)
+- Splatting improvement, blur for left borders + pixel perfect binary mask (only 1 extra pixel on left edges)
 - Multithreaded Sharpness Analyzer Script - will analyze splat and predict sharpness inside the masked (inpaint) area (to be used relatively with inpaint steps)
-- Inpaint with dynamic step selector based on sharpness.csv + Stream behaviour (will allow much longer files)
-- Merging_gui using the new clean mask + single process button
+- Inpaint with optional binary mask and dynamic step selector based on sharpness.csv + Stream behaviour (will allow much longer files)
+- New configurable Color Transfer on merging_gui with 8 curated presets
+- New auto Color Transfer evaluation on the fly (best preset for each frame _TESTING_)
+- Merging_gui option for use the new binary mask + single process button
+- Directional shadow mask on merging_gui to fade right borders correctly
+- Headless rebuild scripts for merging with parallel support (same options but no gui)
 - Multithreaded RealESRGAN upscale script
 - Rejoin segments ps1 script (ffmpeg)
 - Added modified Forward-Warp cuda submodule, compatible with latest pytorch (need build)
+
+THIS FORK IS STILL WIP IT WILL CHANGE A LOT OVERTIME<br>
+Objectives:<br>
+-Single gui panel from start to finish without user action + resume
+-Set up a curated preset for all steps that should work with most contents
+-Optional local run up to splatting + vast.ai inpaint + final local merge
+-Quick setup script for vast.ai docker with 5090 for the inpaint step
 
 ## Fork workflow example (1080p)
 
@@ -37,6 +49,10 @@ scenedetect -i "$IN" detect-adaptive -t 2.0 split-video -o "$OUT_SCENES" -a "-ma
 ```
 scenedetect -i "$IN" detect-adaptive -t 2.0 split-video -o "$OUT_SCENES" -a "-map 0:v:0 -an -dn -sn -vf crop=iw:832:0:trunc((ih-832)/4)*2 -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p"
 ```
+ADDITIONAL NOTE: best option is to remove completely up/bottom bars, this will ensure higher chances for the right/left borders to be inpainted.<br>
+for the standard 16:9 letterbox option is usually better to sacrifice a couple of top and bottom rows and use 1920*800 instead of 1920*832.<br>
+will update commands when i'm fine with that.
+
 ### Step 2 - DepthCrafter
 
 just run
@@ -44,14 +60,14 @@ just run
 chmod +x run_depthcrafter_runner.sh
 ./run_depthcrafter_runner.sh
 ```
-If your work folder is ./work you don't need to do anything else
-It will output depthmap at exactly half size
+If your work folder is ./work you don't need to do anything else.<br>
+It will output depthmap at exactly half size.
 
 ### Step 3 - Upscale Depthmaps
 
-i use Real ESRGAN (not included) for upscaling, it will help a lot with precision compared to other upscales
-5th arg is tile size, i suggest vertical resolution as tile size (faster)
-it will launch 4 batches in parallel (can be changed by args or inside the script)
+i use Real ESRGAN (not included) for upscaling, it will help a lot with precision compared to other upscales.<br>
+5th arg is tile size, i suggest vertical resolution as tile size (faster).<br>
+it will launch 4 batches in parallel (can be changed by args or inside the script).
 ```
 ./upscale_esrgan.sh "./work/depthmap" "./work/depthmap/upscaled" 2 realesr-animevideov3-x2 416
 ```
@@ -63,21 +79,23 @@ just run with default values
 chmod +x run_splatting_bm_runner.sh
 ./run_splatting_bm_runner.sh
 ```
-or play with splatting_bm_gui.py to find your own and then change options inside sh and runner accordingly.
-this bm_gui version will have optional blur on left edges and optional extra binary mask to be used with merging_gui and mask analyze, saved in ./work/mask
+or play with splatting_bm_gui.py to find your own and then change options inside sh and runner accordingly.<br>
+this bm_gui version will have optional blur on left edges and optional extra binary mask to be used with merging_gui and mask analyze, saved in ./work/mask.
 
 ### Step 5 - Analyze mask sharpness
 
 ```
 python analyze_inpaint_sharpness_newmask.py "./work/splat/hires" "./work/mask" --out_csv "./work/sharpness.csv"
 ```
-Will predict masked zone sharpness and save to csv
+Will predict masked zone sharpness and save to csv.
 
 ### Step 6 - Inpaint
 
-just run and wait (a lot)
-for 24GB VRAM (RTX4090) i suggest tile 2, frame chunk size up to 50 and overlap to 4
-for 32GB VRAM (RTX5090) you can push up to 80 chunk size
+just run and wait (a lot).<br>
+for 24GB VRAM (RTX4090) i suggest tile 2, frame chunk size up to 50 and overlap to 4.<br>
+for 32GB VRAM (RTX5090) you can push up to 80 chunk size.<br>
+default option on runner is with Color Transfer disabled (it will be done better during the merging and you do not have to re-inpaint to change it).<br>
+Inpainting runner uses binary ReplaceMask as default.
 ```bash
 chmod +x run_inpainting_runner.sh
 ./run_inpainting_runner.sh
@@ -85,8 +103,10 @@ chmod +x run_inpainting_runner.sh
 
 ### Step 7 - Merge inpaint
 
-run or change settings using gui preview and apply on the runner script
-Runner uses ReplaceMask as default option.
+run or change settings using gui preview and apply on the runner script.<br>
+There is a new Color Transfer panel with 8 curated presetrs to choose from, sliders are usually fine at default.<br>
+You can enable auto CT evaluation, it works quite well but i'm still testing eventual flickerings due to repeated preset changes, it will incrase merging time a lot, you can use the "parallel" nogui script to recover some time, suggested workers are 2 for 48Gb RAM and rtx 4090 or 3 for 64Gb RAM and RTX 5090.<br>
+Runner uses Binary ReplaceMask as default option.<br>
 
 ```bash
 chmod +x run_merging_runner.sh
@@ -95,7 +115,7 @@ chmod +x run_merging_runner.sh
 
 ### Step 8 - Merge Scenes and Compress
 
-I merge in Windows with ffmpeg hevc nvenc
+I merge in Windows with ffmpeg hevc nvenc.
 
 ```
 Rejoin_HEVC_NVENC.ps1
@@ -103,12 +123,12 @@ Rejoin_HEVC_NVENC.ps1
 
 ### Step 9 - Remux other Streams (audio,subs,etc..)
 
-use mkvtoolnix to remux (i use gui version in Windows)
+use mkvtoolnix to remux (i use gui version in Windows).
 
 #### Dependencies (not included)
--RealESRGAN
--ffmpeg
--Scenedetect
+-RealESRGAN<br>
+-ffmpeg<br>
+-Scenedetect<br>
 -MKVToolNix
 
 # StereoCrafter GUI + DepthCrafter GUI Seg
