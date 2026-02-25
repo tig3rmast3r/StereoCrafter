@@ -386,8 +386,8 @@ DEFAULT_CHUNK_K = 3840 * 832 * 16  # reference: 1920x832 -> 16 frames_chunk
 def _steps_from_sharpness(val: float) -> int:
     """
     Rule:
-    raw <= 500 -> 5
-    +1 step every additional 500
+    raw <= 1100 -> 5
+    +1 step every additional 1100
     max 12
     """
     try:
@@ -395,10 +395,10 @@ def _steps_from_sharpness(val: float) -> int:
     except Exception:
         return 5
 
-    if v <= 1000:
+    if v <= 1100:
         return 5
 
-    steps = 5 + int(v // 1000)
+    steps = 5 + int(v // 1100)
     if steps > 11:
         steps = 11
     return steps

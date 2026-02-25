@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import av
 import cv2
 import numpy as np
+import torch
 
 try:
     from concurrent.futures.process import BrokenProcessPool
@@ -22,13 +23,15 @@ except Exception:
 # -------------------------
 DEFAULT_GLOB = "*.mp4"
 DEFAULT_OUT_CSV = "sharpness.csv"
-DEFAULT_SAMPLE_FRAMES = 48
+DEFAULT_FRAME_STRIDE = 6
+DEFAULT_MAX_SAMPLES = 0  # 0 = no cap, scan full video at stride
+DEFAULT_AGG_MODE = "upper_trimmed"  # upper_trimmed | median | mean
+DEFAULT_AGG_LOW_PCT = 20.0
+DEFAULT_AGG_HIGH_PCT = 98.0
+DEFAULT_AGG_TOP_RATIO = 0.40
 DEFAULT_THR = 100
 DEFAULT_MASK_DILATE_K = 0
 DEFAULT_MASK_DILATE_ITER = 0
-DEFAULT_BAND_MODE = "match_run"  # match_run | fixed
-DEFAULT_BAND_PX = 10
-DEFAULT_BAND_GAP_PX = 0
 DEFAULT_RIGHT_BORDER_TOL_PX = 2
 DEFAULT_MIN_ROI_PIXELS = 250
 DEFAULT_WORKERS = min(8, max(1, os.cpu_count() or 1))
@@ -58,102 +61,114 @@ def tenengrad(gray: np.ndarray) -> np.ndarray:
 def make_right_band_roi(
     mask_gray: np.ndarray,
     thr: int,
-    band_mode: str,
-    band_px: int,
-    band_gap_px: int,
 ) -> np.ndarray:
     """
-    Build a dynamic ROI immediately to the right of each white run in the mask.
+    Build analysis ROI from the same row/run ring-shift logic used by
+    merging_gui reference-mask generation.
 
-    Default behavior builds a right-side band per mask run.
-    For runs that touch the RIGHT border (with tolerance), build the band on
-    the LEFT side instead.
-
-    Direction is decided per row/run (not per connected component), so the
-    side can switch inside the same shape when rows stop touching the border.
+    ROI marks the source pixels selected for copy (not the destination run),
+    so sharpness is measured on real warped content.
     """
+    if mask_gray.ndim != 2:
+        return np.zeros((0, 0), dtype=np.uint8)
+
     _, m = cv2.threshold(mask_gray, int(thr), 255, cv2.THRESH_BINARY)
-    base = m.astype(np.uint8)
+    mask_bin = torch.as_tensor(m > 0, dtype=torch.bool, device="cpu")
+    h, w = mask_bin.shape
+    if h <= 0 or w <= 0:
+        return np.zeros((h, w), dtype=np.uint8)
+    if not bool(mask_bin.any().item()):
+        return np.zeros((h, w), dtype=np.uint8)
 
-    h, w = base.shape
-    roi = np.zeros((h, w), dtype=np.uint8)
-
-    if band_mode not in ("match_run", "fixed"):
-        band_mode = "match_run"
-    if band_mode == "fixed" and band_px <= 0:
-        return roi
-
+    roi = torch.zeros((h, w), dtype=torch.bool, device="cpu")
     border_cols = max(1, min(int(DEFAULT_RIGHT_BORDER_TOL_PX), w))
     right_touch_start = w - border_cols
 
-    row_has = np.any(base > 0, axis=1)
-    for y in np.where(row_has)[0]:
-        row = base[y] > 0
+    def _nearest_nonmask_x(y: int, start_x: int, step: int) -> int:
+        x = int(start_x)
+        while 0 <= x < w:
+            if not bool(mask_bin[y, x].item()):
+                return x
+            x += step
+        return -1
 
-        # Run starts/ends.
-        starts = np.where(row & np.r_[True, ~row[:-1]])[0]
-        ends = np.where(row & np.r_[~row[1:], True])[0]
-        if starts.size == 0 or ends.size == 0:
+    def _mark_block_if_valid(y: int, src_a: int, src_b: int) -> bool:
+        # [src_a, src_b)
+        if src_a < 0 or src_b > w or src_a >= src_b:
+            return False
+        if bool(mask_bin[y, src_a:src_b].any().item()):
+            return False
+        roi[y, src_a:src_b] = True
+        return True
+
+    for y in range(h):
+        xs = torch.where(mask_bin[y])[0]
+        if int(xs.numel()) == 0:
             continue
 
-        for xs, xe in zip(starts, ends):
-            run_len = int(xe - xs + 1)
-            width = run_len if band_mode == "match_run" else int(band_px)
-            if width <= 0:
-                continue
-            touches_left = int(xs) < border_cols
-            touches_right = int(xe) >= right_touch_start
+        run_start = int(xs[0].item())
+        prev = run_start
+
+        def _mark_run(a: int, b: int) -> None:
+            run_len = int(b - a + 1)
+            touches_left = a < border_cols
+            touches_right = b >= right_touch_start
             prefer_left = touches_right and not touches_left
 
+            marked = False
             if prefer_left:
-                x1 = int(xs) - int(band_gap_px)
-                x0 = x1 - width
-                x0c = max(0, x0)
-                x1c = min(w, x1)
-                if x0c < x1c:
-                    roi[y, x0c:x1c] = 255
-                    continue
-                # Fallback to right side if left side band is out of bounds.
+                marked = _mark_block_if_valid(y, a - run_len, a)
+                if not marked:
+                    marked = _mark_block_if_valid(y, b + 1, b + 1 + run_len)
+            else:
+                marked = _mark_block_if_valid(y, b + 1, b + 1 + run_len)
+                if not marked:
+                    marked = _mark_block_if_valid(y, a - run_len, a)
+            if marked:
+                return
 
-            x0 = int(xe) + 1 + int(band_gap_px)
-            x1 = min(w, x0 + width)
-            if x0 < x1:
-                roi[y, x0:x1] = 255
+            if prefer_left:
+                src_x = _nearest_nonmask_x(y, a - 1, -1)
+                if src_x < 0:
+                    src_x = _nearest_nonmask_x(y, b + 1, 1)
+            else:
+                src_x = _nearest_nonmask_x(y, b + 1, 1)
+                if src_x < 0:
+                    src_x = _nearest_nonmask_x(y, a - 1, -1)
+            if src_x >= 0:
+                roi[y, src_x] = True
 
-    # Ensure ROI excludes original mask pixels.
-    roi = cv2.bitwise_and(roi, cv2.bitwise_not(base))
-    return roi
+        for idx in range(1, int(xs.numel())):
+            cur = int(xs[idx].item())
+            if cur != prev + 1:
+                _mark_run(run_start, prev)
+                run_start = cur
+            prev = cur
+        _mark_run(run_start, prev)
+
+    roi = torch.logical_and(roi, ~mask_bin)
+    return (roi.to(torch.uint8).numpy() * 255).astype(np.uint8)
 
 
 def compute_file_sharpness(
     path: str,
     mask_path: Optional[str],
-    sample_frames: int,
+    frame_stride: int,
+    max_samples: int,
+    agg_mode: str,
+    agg_low_pct: float,
+    agg_high_pct: float,
+    agg_top_ratio: float,
     thr: int,
     mask_dilate_k: int,
     mask_dilate_iter: int,
-    band_mode: str,
-    band_px: int,
-    band_gap_px: int,
     min_roi_pixels: int,
 ) -> Tuple[float, int, float]:
     container = av.open(path)
-    stream = container.streams.video[0]
 
     mask_container = av.open(mask_path) if mask_path else None
-    mask_stream = mask_container.streams.video[0] if mask_container else None
 
-    fps = float(stream.average_rate) if stream.average_rate else None
-    total_est = None
-    if stream.duration is not None and fps is not None:
-        secs = float(stream.duration * stream.time_base)
-        if secs > 0:
-            total_est = int(secs * fps)
-
-    if total_est and total_est > 0:
-        stride = max(1, total_est // max(1, sample_frames))
-    else:
-        stride = 10
+    stride = max(1, int(frame_stride))
 
     sharp_vals: List[float] = []
     cov_vals: List[float] = []
@@ -212,9 +227,6 @@ def compute_file_sharpness(
         roi = make_right_band_roi(
             mask_gray=mask_gray,
             thr=thr,
-            band_mode=band_mode,
-            band_px=band_px,
-            band_gap_px=band_gap_px,
         )
         roi_pixels = int(np.count_nonzero(roi))
         if roi_pixels < int(min_roi_pixels):
@@ -229,7 +241,7 @@ def compute_file_sharpness(
         cov_vals.append(float(cov))
 
         picked += 1
-        if picked >= sample_frames:
+        if int(max_samples) > 0 and picked >= int(max_samples):
             break
 
     container.close()
@@ -239,9 +251,51 @@ def compute_file_sharpness(
     if not sharp_vals:
         return 0.0, 0, 0.0
 
-    sharp_raw = float(np.median(sharp_vals))
+    sharp_raw = aggregate_sharpness(
+        sharp_vals,
+        mode=agg_mode,
+        low_pct=agg_low_pct,
+        high_pct=agg_high_pct,
+        top_ratio=agg_top_ratio,
+    )
     cov_med = float(np.median(cov_vals)) if cov_vals else 0.0
     return sharp_raw, len(sharp_vals), cov_med
+
+
+def aggregate_sharpness(
+    values: List[float],
+    mode: str,
+    low_pct: float,
+    high_pct: float,
+    top_ratio: float,
+) -> float:
+    arr = np.array(values, dtype=np.float32)
+    if arr.size == 0:
+        return 0.0
+
+    mode = str(mode).strip().lower()
+    if mode == "mean":
+        return float(np.mean(arr))
+    if mode == "median":
+        return float(np.median(arr))
+
+    # upper_trimmed: drop extremes, then average top fraction to favor sharp regions.
+    lp = float(np.clip(low_pct, 0.0, 100.0))
+    hp = float(np.clip(high_pct, 0.0, 100.0))
+    if hp < lp:
+        lp, hp = hp, lp
+
+    lo = float(np.percentile(arr, lp))
+    hi = float(np.percentile(arr, hp))
+    core = arr[(arr >= lo) & (arr <= hi)]
+    if core.size == 0:
+        core = arr
+
+    ratio = float(np.clip(top_ratio, 1e-6, 1.0))
+    k = max(1, int(np.ceil(core.size * ratio)))
+    kth = max(0, int(core.size - k))
+    top = np.partition(core, kth)[kth:]
+    return float(np.mean(top))
 
 
 def robust_percent(values: List[float]) -> List[float]:
@@ -285,13 +339,15 @@ def _worker_compute(job):
     (
         p,
         mask_dir,
-        sample_frames,
+        frame_stride,
+        max_samples,
+        agg_mode,
+        agg_low_pct,
+        agg_high_pct,
+        agg_top_ratio,
         thr,
         mask_dilate_k,
         mask_dilate_iter,
-        band_mode,
-        band_px,
-        band_gap_px,
         min_roi_pixels,
     ) = job
     bn = os.path.basename(p)
@@ -302,13 +358,15 @@ def _worker_compute(job):
         sharp_raw, n, cov = compute_file_sharpness(
             path=p,
             mask_path=mask_path,
-            sample_frames=sample_frames,
+            frame_stride=frame_stride,
+            max_samples=max_samples,
+            agg_mode=agg_mode,
+            agg_low_pct=agg_low_pct,
+            agg_high_pct=agg_high_pct,
+            agg_top_ratio=agg_top_ratio,
             thr=thr,
             mask_dilate_k=mask_dilate_k,
             mask_dilate_iter=mask_dilate_iter,
-            band_mode=band_mode,
-            band_px=band_px,
-            band_gap_px=band_gap_px,
             min_roi_pixels=min_roi_pixels,
         )
         return (bn, float(sharp_raw), int(n), float(cov), "OK")
@@ -328,27 +386,49 @@ def _print_status(bn: str, raw: float, n: int, cov: float, status: str, mask_dir
 def main():
     ap = argparse.ArgumentParser(
         description=(
-            "Analyze sharpness on a dynamic right-side band next to each mask run "
-            "(per-row, no fixed global shift)."
+            "Analyze sharpness on a ring-shift source ROI aligned with "
+            "merging_gui reference-mask logic (row/run-aware)."
         )
     )
     ap.add_argument("in_dir")
     ap.add_argument("mask_dir", nargs="?", default=None)
     ap.add_argument("--glob", default=DEFAULT_GLOB)
     ap.add_argument("--out_csv", default=DEFAULT_OUT_CSV)
-    ap.add_argument("--sample_frames", type=int, default=DEFAULT_SAMPLE_FRAMES)
+    ap.add_argument("--frame_stride", type=int, default=DEFAULT_FRAME_STRIDE)
+    ap.add_argument(
+        "--max_samples",
+        type=int,
+        default=DEFAULT_MAX_SAMPLES,
+        help="Optional cap on sampled frames. 0 = no cap (full video at stride)",
+    )
+    ap.add_argument(
+        "--agg_mode",
+        type=str,
+        default=DEFAULT_AGG_MODE,
+        choices=["upper_trimmed", "median", "mean"],
+        help="How to aggregate per-frame sharpness into file sharpness",
+    )
+    ap.add_argument(
+        "--agg_low_pct",
+        type=float,
+        default=DEFAULT_AGG_LOW_PCT,
+        help="Lower percentile for upper_trimmed aggregation",
+    )
+    ap.add_argument(
+        "--agg_high_pct",
+        type=float,
+        default=DEFAULT_AGG_HIGH_PCT,
+        help="Upper percentile for upper_trimmed aggregation",
+    )
+    ap.add_argument(
+        "--agg_top_ratio",
+        type=float,
+        default=DEFAULT_AGG_TOP_RATIO,
+        help="Top fraction kept after percentile trim for upper_trimmed aggregation",
+    )
     ap.add_argument("--thr", type=int, default=DEFAULT_THR)
     ap.add_argument("--mask_dilate_k", type=int, default=DEFAULT_MASK_DILATE_K)
     ap.add_argument("--mask_dilate_iter", type=int, default=DEFAULT_MASK_DILATE_ITER)
-    ap.add_argument(
-        "--band_mode",
-        type=str,
-        default=DEFAULT_BAND_MODE,
-        choices=["match_run", "fixed"],
-        help="Right band width policy: match each mask-run width, or fixed width",
-    )
-    ap.add_argument("--band_px", type=int, default=DEFAULT_BAND_PX, help="Right-side analysis band width in pixels")
-    ap.add_argument("--band_gap_px", type=int, default=DEFAULT_BAND_GAP_PX, help="Gap from mask edge before band")
     ap.add_argument("--min_roi_pixels", type=int, default=DEFAULT_MIN_ROI_PIXELS)
     ap.add_argument(
         "--workers",
@@ -389,13 +469,15 @@ def main():
             (
                 p,
                 mask_dir,
-                args.sample_frames,
+                args.frame_stride,
+                args.max_samples,
+                args.agg_mode,
+                args.agg_low_pct,
+                args.agg_high_pct,
+                args.agg_top_ratio,
                 args.thr,
                 args.mask_dilate_k,
                 args.mask_dilate_iter,
-                args.band_mode,
-                args.band_px,
-                args.band_gap_px,
                 args.min_roi_pixels,
             )
         )
@@ -466,7 +548,9 @@ def main():
     print(
         f"\nDone: {out_csv}  "
         f"(reused={reused}, computed={computed}, total={len(tmp)})  "
-        f"band_mode={args.band_mode} band_px={args.band_px} gap={args.band_gap_px}"
+        f"stride={args.frame_stride} max_samples={args.max_samples} "
+        f"agg={args.agg_mode} "
+        "roi_mode=ring_shift_source"
     )
 
 
