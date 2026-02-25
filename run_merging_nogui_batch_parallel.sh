@@ -44,7 +44,7 @@ RETRY_SLEEP_SEC="${RETRY_SLEEP_SEC:-2}"
 # 139 = segfault
 # 132 = illegal instruction
 # 134 = abort
-RETRY_CODES_DEFAULT="137 139 132 134"
+RETRY_CODES_DEFAULT="136 137 139 132 134"
 RETRY_CODES="${RETRY_CODES:-$RETRY_CODES_DEFAULT}"
 
 # Number of parallel worker processes (each handles a deterministic slice of files)

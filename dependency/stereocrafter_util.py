@@ -4,7 +4,7 @@ import shutil
 import threading
 import tkinter as tk  # Required for Tooltip class
 from tkinter import Toplevel, Label, ttk
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Set
 import logging
 
 import numpy as np
@@ -44,6 +44,48 @@ DEFAULT_TICK_X_OFFSET_PX = 5
 
 # --- Global Flags ---
 CUDA_AVAILABLE = False
+_FFMPEG_ENCODERS_CACHE: Optional[Set[str]] = None
+
+
+def _list_ffmpeg_encoders_cached() -> Set[str]:
+    """
+    Returns the available ffmpeg video encoders (cached).
+    Empty set means "unknown/unavailable".
+    """
+    global _FFMPEG_ENCODERS_CACHE
+    if _FFMPEG_ENCODERS_CACHE is not None:
+        return _FFMPEG_ENCODERS_CACHE
+
+    try:
+        p = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True,
+            check=True,
+            timeout=10,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        encoders: Set[str] = set()
+        # Example line:
+        # " V..... h264_nvenc           NVIDIA NVENC H.264 encoder..."
+        for line in p.stdout.splitlines():
+            m = re.match(r"^\s*[VAS]\S*\s+([a-zA-Z0-9_]+)\s+", line)
+            if m:
+                encoders.add(m.group(1).strip())
+        _FFMPEG_ENCODERS_CACHE = encoders
+        return encoders
+    except Exception as e:
+        logger.debug(f"Unable to list ffmpeg encoders: {e}")
+        _FFMPEG_ENCODERS_CACHE = set()
+        return _FFMPEG_ENCODERS_CACHE
+
+
+def _ffmpeg_encoder_available(name: str) -> bool:
+    enc = _list_ffmpeg_encoders_cached()
+    if not enc:
+        # Unknown list: don't block startup just because detection failed.
+        return True
+    return name in enc
 
 
 class Tooltip:
@@ -1733,6 +1775,8 @@ def start_ffmpeg_pipe_process(
     user_output_crf: Optional[int] = None,
     pad_to_16_9: bool = False,
     debug_label: Optional[str] = None,
+    force_output_codec: Optional[str] = None,
+    ffmpeg_threads: Optional[int] = None,
 ) -> Optional[subprocess.Popen]:
     """
     Builds an FFmpeg command and starts a subprocess configured to accept
@@ -1872,6 +1916,49 @@ def start_ffmpeg_pipe_process(
             default_cpu_crf = "1"
         output_profile = "main"
 
+    forced_codec = (force_output_codec or "").strip().lower()
+    if forced_codec and forced_codec != "auto":
+        valid_forced = {"libx264", "h264_nvenc", "libx265", "hevc_nvenc"}
+        if forced_codec in valid_forced:
+            output_codec = forced_codec
+            if forced_codec in ("libx264", "h264_nvenc"):
+                output_pix_fmt = "yuv420p"
+                output_profile = "main"
+            else:
+                if is_hdr_source or is_original_10bit_or_higher:
+                    output_pix_fmt = "yuv420p10le"
+                    output_profile = "main10"
+                else:
+                    output_pix_fmt = "yuv420p"
+                    output_profile = "main"
+        else:
+            logger.warning(
+                f"Unknown force_output_codec='{force_output_codec}', using auto selection."
+            )
+
+    if output_codec == "h264_nvenc" and not _ffmpeg_encoder_available("h264_nvenc"):
+        logger.warning("h264_nvenc not available in ffmpeg, falling back to libx264.")
+        output_codec = "libx264"
+        output_pix_fmt = "yuv420p"
+        output_profile = "main"
+    if output_codec == "hevc_nvenc" and not _ffmpeg_encoder_available("hevc_nvenc"):
+        logger.warning("hevc_nvenc not available in ffmpeg, falling back to libx265.")
+        output_codec = "libx265"
+        if is_hdr_source or is_original_10bit_or_higher:
+            output_pix_fmt = "yuv420p10le"
+            output_profile = "main10"
+        else:
+            output_pix_fmt = "yuv420p"
+            output_profile = "main"
+
+    threads_num: Optional[int] = None
+    if ffmpeg_threads is not None:
+        try:
+            threads_num = int(ffmpeg_threads)
+        except (TypeError, ValueError):
+            logger.warning(f"Invalid ffmpeg_threads='{ffmpeg_threads}', using auto.")
+            threads_num = None
+
     ffmpeg_cmd.extend(["-c:v", output_codec])
     if "nvenc" in output_codec:
         ffmpeg_cmd.extend(["-preset", nvenc_preset, "-qp", default_nvenc_cq])
@@ -1881,6 +1968,8 @@ def start_ffmpeg_pipe_process(
     ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
     if output_profile:
         ffmpeg_cmd.extend(["-profile:v", output_profile])
+    if threads_num is not None and threads_num > 0:
+        ffmpeg_cmd.extend(["-threads", str(threads_num)])
 
     if output_codec == "libx265" and x265_params:
         ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
@@ -1923,11 +2012,13 @@ def start_ffmpeg_pipe_process(
 
     quality_mode = "qp" if "nvenc" in output_codec else "crf"
     quality_value = default_nvenc_cq if "nvenc" in output_codec else default_cpu_crf
+    threads_value = str(threads_num) if threads_num is not None and threads_num > 0 else "auto"
 
     sc_encode_flags = {
         "enc_codec": output_codec,
         "enc_pix_fmt": output_pix_fmt,
         "enc_profile": output_profile,
+        "enc_threads": threads_value,
         "enc_color_primaries": color_primaries,
         "enc_color_trc": transfer_characteristics,
         "enc_colorspace": color_space,
@@ -1940,6 +2031,12 @@ def start_ffmpeg_pipe_process(
         "quality_mode": quality_mode,
         "quality_value": quality_value,
     }
+
+    logger.info(
+        "FFmpeg encode config: "
+        f"codec={output_codec}, pix_fmt={output_pix_fmt}, profile={output_profile}, "
+        f"{quality_mode}={quality_value}, threads={threads_value}"
+    )
 
     if debug_label:
         logger.debug(

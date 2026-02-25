@@ -6,9 +6,10 @@
 - Splatting improvement, blur for left borders + pixel perfect binary mask (only 1 extra pixel on left edges)
 - Multithreaded Sharpness Analyzer Script - will analyze splat and predict sharpness inside the masked (inpaint) area (to be used relatively with inpaint steps)
 - Inpaint with optional binary mask and dynamic step selector based on sharpness.csv + Stream behaviour (will allow much longer files)
+- Tail for chunks and at file end during inpaint (extra frames that will be discarted to minimize color jumps between chunks and on the last frame) 
 - New configurable Color Transfer on merging_gui with 8 curated presets
 - New auto Color Transfer evaluation on the fly (best preset for each frame _TESTING_)
-- Merging_gui option for use the new binary mask + single process button
+- Merging_gui option to use the new binary mask + single process button
 - Directional shadow mask on merging_gui to fade right borders correctly
 - Headless rebuild scripts for merging with parallel support (same options but no gui)
 - Multithreaded RealESRGAN upscale script
@@ -17,10 +18,10 @@
 
 THIS FORK IS STILL WIP IT WILL CHANGE A LOT OVERTIME<br>
 Objectives:<br>
--Single gui panel from start to finish without user action + resume
--Set up a curated preset for all steps that should work with most contents
--Optional local run up to splatting + vast.ai inpaint + final local merge
--Quick setup script for vast.ai docker with 5090 for the inpaint step
+- Single gui panel from start to finish without user action + resume
+- Set up a curated preset for all steps that should work with most contents
+- Optional local run up to splatting + vast.ai inpaint + final local merge
+- Quick setup script for vast.ai docker with 5090 for the inpaint step
 
 ## Fork workflow example (1080p)
 
@@ -50,7 +51,7 @@ scenedetect -i "$IN" detect-adaptive -t 2.0 split-video -o "$OUT_SCENES" -a "-ma
 scenedetect -i "$IN" detect-adaptive -t 2.0 split-video -o "$OUT_SCENES" -a "-map 0:v:0 -an -dn -sn -vf crop=iw:832:0:trunc((ih-832)/4)*2 -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p"
 ```
 ADDITIONAL NOTE: best option is to remove completely up/bottom bars, this will ensure higher chances for the right/left borders to be inpainted.<br>
-for the standard 16:9 letterbox option is usually better to sacrifice a couple of top and bottom rows and use 1920*800 instead of 1920*832.<br>
+for the standard 16:9 letterbox option is usually better to sacrifice a couple of top and bottom rows and use 1920x800 instead of 1920x832.<br>
 will update commands when i'm fine with that.
 
 ### Step 2 - DepthCrafter
@@ -92,7 +93,7 @@ Will predict masked zone sharpness and save to csv.
 ### Step 6 - Inpaint
 
 just run and wait (a lot).<br>
-for 24GB VRAM (RTX4090) i suggest tile 2, frame chunk size up to 50 and overlap to 4.<br>
+for 24GB VRAM (RTX4090) i suggest tile 2, frame chunk size up to 50.<br>
 for 32GB VRAM (RTX5090) you can push up to 80 chunk size.<br>
 default option on runner is with Color Transfer disabled (it will be done better during the merging and you do not have to re-inpaint to change it).<br>
 Inpainting runner uses binary ReplaceMask as default.
