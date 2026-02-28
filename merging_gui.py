@@ -1,6 +1,7 @@
 import os
 import glob
 import json
+import csv
 import shutil
 import threading
 import gc
@@ -733,6 +734,256 @@ CT_PRESET_DEFAULT_LABEL = CT_PRESET_LABELS[0]
 # Auto-eval order optimized to reuse caches (stats/ref) across adjacent presets.
 CT_PRESET_AUTO_EVAL_ORDER = [1, 2, 8, 4, 5, 6, 3, 7]
 CT_AUTO_EVAL_MAX_WORKERS = 3
+CT_AUTO_MODE_OFF = "Off"
+CT_AUTO_MODE_ON = "On"
+CT_AUTO_MODE_CSV_BLEND = "CSV Blend"
+CT_AUTO_MODE_OPTIONS = [CT_AUTO_MODE_OFF, CT_AUTO_MODE_ON, CT_AUTO_MODE_CSV_BLEND]
+CT_CSV_BLEND_TRANSITION_ALPHAS = [0.24, 0.40, 0.60, 0.80]
+CT_CSV_BLEND_OSC_ALPHA = 0.80
+CT_CSV_BLEND_OSC_WINDOW = 6
+CT_CSV_BLEND_MAX_ACTIVE_PRESETS = 4
+CT_CSV_BLEND_PRUNE_EPS = 1e-3
+
+
+def _resolve_ct_auto_mode_label(value: Any) -> str:
+    raw = str(value or "").strip()
+    if raw in CT_AUTO_MODE_OPTIONS:
+        return raw
+    low = raw.lower()
+    if low in {"off", "false", "0", "disabled", "manual"}:
+        return CT_AUTO_MODE_OFF
+    if low in {"on", "true", "1", "auto", "auto_eval"}:
+        return CT_AUTO_MODE_ON
+    if low in {"csv", "csv_blend", "csv-blend", "csv blend"}:
+        return CT_AUTO_MODE_CSV_BLEND
+    return CT_AUTO_MODE_ON
+
+
+def _resolve_ct_auto_mode_from_settings(settings: Dict[str, Any]) -> str:
+    if "ct_auto_mode" in settings:
+        return _resolve_ct_auto_mode_label(settings.get("ct_auto_mode"))
+    return CT_AUTO_MODE_ON if bool(settings.get("auto_ct_eval", False)) else CT_AUTO_MODE_OFF
+
+
+def _parse_inpainted_basename(
+    base_name: str,
+) -> Tuple[Optional[str], Optional[str], bool]:
+    inpaint_suffix = "_inpainted_right_eye.mp4"
+    sbs_suffix = "_inpainted_sbs.mp4"
+    if str(base_name).endswith(inpaint_suffix):
+        core_with_width = str(base_name)[: -len(inpaint_suffix)]
+        is_sbs_input = False
+    elif str(base_name).endswith(sbs_suffix):
+        core_with_width = str(base_name)[: -len(sbs_suffix)]
+        is_sbs_input = True
+    else:
+        return None, None, False
+
+    last_underscore_idx = core_with_width.rfind("_")
+    if last_underscore_idx <= 0:
+        return core_with_width, None, is_sbs_input
+    core_name = core_with_width[:last_underscore_idx]
+    return core_with_width, core_name, is_sbs_input
+
+
+def _normalize_csv_blend_lookup_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    base = os.path.basename(text)
+    stem, _ext = os.path.splitext(base)
+    return stem if stem else base
+
+
+def _load_csv_blend_preset_map(csv_path: str) -> Dict[str, Dict[int, int]]:
+    preset_by_key: Dict[str, Dict[int, int]] = {}
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if not row:
+                continue
+            frame_raw = row.get("frame") or row.get("frame_idx") or row.get("frame_index") or ""
+            preset_raw = row.get("best_preset") or row.get("winner_preset") or row.get("preset") or ""
+            try:
+                frame_idx = int(float(str(frame_raw).strip()))
+                preset_id = int(float(str(preset_raw).strip()))
+            except Exception:
+                continue
+            if frame_idx < 0:
+                continue
+            if preset_id not in CT_PRESET_BY_ID:
+                continue
+
+            status = str(row.get("status", "") or "").strip().lower()
+            if status and status not in {"ok", "done", "complete"}:
+                # Keep deterministic fallback behavior for non-CT rows (e.g. low_mask).
+                continue
+
+            keys: List[str] = []
+            for col in (
+                "video",
+                "inpainted",
+                "filename",
+                "clip",
+                "core_with_width",
+                "core_name",
+            ):
+                v = str(row.get(col, "") or "").strip()
+                if v:
+                    keys.append(v)
+
+            for key in keys:
+                normalized = _normalize_csv_blend_lookup_key(key)
+                if normalized:
+                    preset_by_key.setdefault(normalized, {})[frame_idx] = preset_id
+                parsed_core_with_width, parsed_core_name, _ = _parse_inpainted_basename(
+                    os.path.basename(key)
+                )
+                for alias in (parsed_core_with_width, parsed_core_name):
+                    alias_norm = _normalize_csv_blend_lookup_key(alias)
+                    if alias_norm:
+                        preset_by_key.setdefault(alias_norm, {})[frame_idx] = preset_id
+    return preset_by_key
+
+
+def _lookup_csv_blend_preset_rows(
+    preset_by_key: Dict[str, Dict[int, int]],
+    inpainted_path: str,
+    core_with_width: Optional[str],
+    core_name: Optional[str],
+) -> Tuple[Dict[int, int], str]:
+    candidates: List[str] = []
+    base_name = os.path.basename(str(inpainted_path or ""))
+    if base_name:
+        candidates.append(base_name)
+        candidates.append(os.path.splitext(base_name)[0])
+        parsed_core_with_width, parsed_core_name, _ = _parse_inpainted_basename(base_name)
+        if parsed_core_with_width:
+            candidates.append(parsed_core_with_width)
+        if parsed_core_name:
+            candidates.append(parsed_core_name)
+    if core_with_width:
+        candidates.append(core_with_width)
+    if core_name:
+        candidates.append(core_name)
+
+    best_map: Dict[int, int] = {}
+    best_key = ""
+    for key in candidates:
+        normalized = _normalize_csv_blend_lookup_key(key)
+        if not normalized:
+            continue
+        rows = preset_by_key.get(normalized)
+        if rows and len(rows) > len(best_map):
+            best_map = rows
+            best_key = normalized
+    return dict(best_map), best_key
+
+
+def _compute_preset_oscillator_flags(
+    seq: List[int], min_len: int = 4
+) -> List[bool]:
+    flags = [False for _ in seq]
+    n = len(seq)
+    if n < max(4, int(min_len)):
+        return flags
+
+    i = 0
+    while i + 3 < n:
+        a = int(seq[i])
+        b = int(seq[i + 1])
+        if a == b:
+            i += 1
+            continue
+        if int(seq[i + 2]) != a or int(seq[i + 3]) != b:
+            i += 1
+            continue
+
+        j = i
+        while j < n:
+            expected = a if ((j - i) % 2 == 0) else b
+            if int(seq[j]) != expected:
+                break
+            j += 1
+        if (j - i) >= int(min_len):
+            for k in range(i, j):
+                flags[k] = True
+            i = j
+            continue
+        i += 1
+
+    return flags
+
+
+def _build_csv_blend_weights_by_frame(
+    target_preset_ids: List[int],
+    transition_alphas: Optional[List[float]] = None,
+    osc_alpha: float = CT_CSV_BLEND_OSC_ALPHA,
+    max_active_presets: int = CT_CSV_BLEND_MAX_ACTIVE_PRESETS,
+    prune_eps: float = CT_CSV_BLEND_PRUNE_EPS,
+) -> Tuple[List[Dict[int, float]], List[bool]]:
+    if transition_alphas is None or not transition_alphas:
+        transition_alphas = list(CT_CSV_BLEND_TRANSITION_ALPHAS)
+
+    if not target_preset_ids:
+        return [], []
+
+    out_weights: List[Dict[int, float]] = []
+    weights: Dict[int, float] = {}
+    run_pid: Optional[int] = None
+    run_len = 0
+
+    osc_flags = _compute_preset_oscillator_flags(target_preset_ids)
+
+    for idx, pid_raw in enumerate(target_preset_ids):
+        pid = int(pid_raw)
+        if pid not in CT_PRESET_BY_ID:
+            pid = int(CT_PRESET_AUTO_EVAL_ORDER[0])
+
+        if run_pid == pid:
+            run_len += 1
+        else:
+            run_pid = pid
+            run_len = 1
+
+        is_osc = bool(osc_flags[idx]) if idx < len(osc_flags) else False
+
+        if is_osc:
+            alpha = float(osc_alpha)
+        elif run_len <= len(transition_alphas):
+            alpha = float(transition_alphas[run_len - 1])
+        else:
+            alpha = 1.0
+        alpha = float(max(0.0, min(1.0, alpha)))
+
+        if not weights:
+            weights = {pid: 1.0}
+        elif alpha >= 0.999999:
+            weights = {pid: 1.0}
+        else:
+            for k in list(weights.keys()):
+                weights[k] = float(weights[k]) * (1.0 - alpha)
+            weights[pid] = float(weights.get(pid, 0.0)) + alpha
+
+        # Prune tiny tails.
+        weights = {int(k): float(v) for k, v in weights.items() if float(v) > float(prune_eps)}
+        if not weights:
+            weights = {pid: 1.0}
+
+        # Hard cap on active presets in one frame.
+        if len(weights) > int(max_active_presets):
+            top_items = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)[
+                : int(max_active_presets)
+            ]
+            weights = {int(k): float(v) for k, v in top_items}
+
+        s = float(sum(weights.values()))
+        if s <= 0.0:
+            weights = {pid: 1.0}
+            s = 1.0
+        out_weights.append({int(k): float(v) / s for k, v in weights.items()})
+
+    return out_weights, osc_flags
 
 
 def _build_auto_ct_eval_groups(
@@ -743,7 +994,7 @@ def _build_auto_ct_eval_groups(
     - parallel: ring, nonmask, global (max 3 workers)
     - serial: legacy/other
     """
-    grouped: Dict[str, List[int]] = {"ring": [], "nonmask": [], "global": []}
+    buckets: Dict[str, List[int]] = {"ring": [], "nonmask": [], "global": []}
     serial_ids: List[int] = []
     for pid in preset_order:
         preset = CT_PRESET_BY_ID[int(pid)]
@@ -752,15 +1003,15 @@ def _build_auto_ct_eval_groups(
             serial_ids.append(int(pid))
             continue
         sr = str(preset.get("stats_region", "ring"))
-        if sr in grouped:
-            grouped[sr].append(int(pid))
+        if sr in buckets:
+            buckets[sr].append(int(pid))
         else:
             serial_ids.append(int(pid))
 
     parallel_groups: List[List[int]] = []
     for key in ("ring", "nonmask", "global"):
-        if grouped[key]:
-            parallel_groups.append(grouped[key])
+        if buckets[key]:
+            parallel_groups.append(buckets[key])
     return parallel_groups, serial_ids
 
 
@@ -845,6 +1096,7 @@ def _select_best_auto_ct_preset_frame(
     mask_bin_1hw: torch.Tensor,
     settings: Dict[str, Any],
     fallback_preset_id: int,
+    candidate_preset_ids: Optional[List[int]] = None,
     executor: Optional[ThreadPoolExecutor] = None,
 ) -> Tuple[torch.Tensor, int]:
     mask_bool = mask_bin_1hw.squeeze(0).cpu().numpy() > 0.5
@@ -858,10 +1110,21 @@ def _select_best_auto_ct_preset_frame(
     else:
         eval_ref_lab = None
 
-    order_index = {int(pid): i for i, pid in enumerate(CT_PRESET_AUTO_EVAL_ORDER)}
+    if candidate_preset_ids:
+        allowed = {int(pid) for pid in candidate_preset_ids if int(pid) in CT_PRESET_BY_ID}
+        eval_order = [int(pid) for pid in CT_PRESET_AUTO_EVAL_ORDER if int(pid) in allowed]
+    else:
+        eval_order = [int(pid) for pid in CT_PRESET_AUTO_EVAL_ORDER]
+    if not eval_order:
+        eval_order = [int(CT_PRESET_AUTO_EVAL_ORDER[0])]
+
+    order_index = {int(pid): i for i, pid in enumerate(eval_order)}
+    parallel_groups, serial_ids = _build_auto_ct_eval_groups(eval_order)
     best_score = -1.0
     best_frame = inpainted_3
     best_preset_id = int(fallback_preset_id)
+    if best_preset_id not in order_index:
+        best_preset_id = int(eval_order[0])
 
     def _consider(candidate: Tuple[float, torch.Tensor, int]) -> None:
         nonlocal best_score, best_frame, best_preset_id
@@ -873,7 +1136,7 @@ def _select_best_auto_ct_preset_frame(
             best_frame = frame
             best_preset_id = int(pid)
 
-    if executor is not None and CT_AUTO_EVAL_PARALLEL_GROUPS:
+    if executor is not None and parallel_groups:
         futures = [
             executor.submit(
                 _eval_auto_ct_subset,
@@ -887,12 +1150,12 @@ def _select_best_auto_ct_preset_frame(
                 mask_bool=mask_bool,
                 order_index=order_index,
             )
-            for group in CT_AUTO_EVAL_PARALLEL_GROUPS
+            for group in parallel_groups
         ]
         for fut in futures:
             _consider(fut.result())
     else:
-        for group in CT_AUTO_EVAL_PARALLEL_GROUPS:
+        for group in parallel_groups:
             _consider(
                 _eval_auto_ct_subset(
                     preset_ids=group,
@@ -907,10 +1170,10 @@ def _select_best_auto_ct_preset_frame(
                 )
             )
 
-    if CT_AUTO_EVAL_SERIAL_IDS:
+    if serial_ids:
         _consider(
             _eval_auto_ct_subset(
-                preset_ids=CT_AUTO_EVAL_SERIAL_IDS,
+                preset_ids=serial_ids,
                 inpainted_3=inpainted_3,
                 original_left_3=original_left_3,
                 warped_3=warped_3,
@@ -1157,6 +1420,8 @@ class MergingGUI(ThemedTk):
         "enable_color_transfer": True,
         "ct_preset": "1) safe sr=ring ts=inpainted ref=warped",
         "auto_ct_eval": True,
+        "ct_auto_mode": CT_AUTO_MODE_ON,
+        "ct_csv_blend_path": "",
         "ct_strength": 1.0,
         "ct_black_thresh": 0.0,
         "ct_min_valid_ratio": 0,
@@ -1328,20 +1593,47 @@ class MergingGUI(ThemedTk):
                 )
             )
         )
+        legacy_auto_ct_eval = bool(
+            self.app_config.get(
+                "auto_ct_eval", self.APP_DEFAULTS.get("auto_ct_eval", True)
+            )
+        )
+        ct_auto_mode_raw = self.app_config.get(
+            "ct_auto_mode",
+            self.APP_DEFAULTS.get(
+                "ct_auto_mode",
+                CT_AUTO_MODE_ON if legacy_auto_ct_eval else CT_AUTO_MODE_OFF,
+            ),
+        )
+        self.ct_auto_mode_var = tk.StringVar(
+            value=_resolve_ct_auto_mode_label(ct_auto_mode_raw)
+        )
+        # Kept for backward compatibility with saved settings.
         self.auto_ct_eval_var = tk.BooleanVar(
-            value=bool(
+            value=(self.ct_auto_mode_var.get() == CT_AUTO_MODE_ON)
+        )
+        self.ct_csv_blend_path_var = tk.StringVar(
+            value=str(
                 self.app_config.get(
-                    "auto_ct_eval", self.APP_DEFAULTS.get("auto_ct_eval", True)
+                    "ct_csv_blend_path",
+                    self.APP_DEFAULTS.get("ct_csv_blend_path", ""),
                 )
             )
         )
         self.auto_ct_best_var = tk.StringVar(
             value=(
                 "Auto CT best: pending..."
-                if self.auto_ct_eval_var.get()
-                else "Auto CT best: (disabled)"
+                if self.ct_auto_mode_var.get() == CT_AUTO_MODE_ON
+                else (
+                    "Auto CT CSV Blend: pending..."
+                    if self.ct_auto_mode_var.get() == CT_AUTO_MODE_CSV_BLEND
+                    else "Auto CT best: (disabled)"
+                )
             )
         )
+        self._ct_csv_blend_cache_path = ""
+        self._ct_csv_blend_cache_mtime = -1.0
+        self._ct_csv_blend_cache: Dict[str, Dict[int, int]] = {}
         self.ct_strength_var = tk.DoubleVar(
             value=float(self.app_config.get("ct_strength", self.APP_DEFAULTS["ct_strength"]))
         )
@@ -1666,6 +1958,13 @@ class MergingGUI(ThemedTk):
                         f"Could not apply setting for '{key}' with value '{value}': {e}"
                     )
 
+        if "ct_auto_mode" not in settings_dict and "auto_ct_eval" in settings_dict:
+            self.ct_auto_mode_var.set(
+                CT_AUTO_MODE_ON
+                if bool(settings_dict.get("auto_ct_eval", False))
+                else CT_AUTO_MODE_OFF
+            )
+
         # Keep derived CT controls coherent after loading/applying settings.
         self._apply_ct_preset_to_controls(self.ct_preset_var.get())
         self._on_auto_ct_eval_toggle()
@@ -1801,7 +2100,7 @@ class MergingGUI(ThemedTk):
         self.widgets_to_disable.append(entry_mask)
         self.widgets_to_disable.append(btn_mask)
 
-        # --- Right column (2 paths) ---
+        # --- Right column (3 paths) ---
         # Replace Mask Folder (optional)
         ttk.Label(right_paths, text="Replace Mask Folder (optional):").grid(row=0, column=0, sticky="e", padx=5, pady=2)
         entry_rmask = ttk.Entry(right_paths, textvariable=self.replace_mask_folder_var)
@@ -1820,6 +2119,15 @@ class MergingGUI(ThemedTk):
         btn_out.grid(row=1, column=2, padx=5)
         self.widgets_to_disable.append(entry_out)
         self.widgets_to_disable.append(btn_out)
+
+        # CT CSV Blend Path (per-frame best preset map)
+        ttk.Label(right_paths, text="CT CSV Blend Path:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        entry_ctcsv = ttk.Entry(right_paths, textvariable=self.ct_csv_blend_path_var)
+        entry_ctcsv.grid(row=2, column=1, padx=5, sticky="ew")
+        btn_ctcsv = ttk.Button(right_paths, text="Browse", command=self._browse_ct_csv_blend_map)
+        btn_ctcsv.grid(row=2, column=2, padx=5)
+        self.widgets_to_disable.append(entry_ctcsv)
+        self.widgets_to_disable.append(btn_ctcsv)
 
         # --- PREVIEW FRAME (using the new module) ---
         # Moved back to its original position after the folder frame.
@@ -1981,7 +2289,7 @@ class MergingGUI(ThemedTk):
             row=0, column=0, columnspan=4, sticky="ew", padx=0, pady=(0, 4)
         )
         ct_preset_row.grid_columnconfigure(1, weight=1)
-        ct_preset_row.grid_columnconfigure(3, weight=1)
+        ct_preset_row.grid_columnconfigure(2, weight=1)
 
         ttk.Label(ct_preset_row, text="Preset:").grid(
             row=0, column=0, sticky="e", padx=5, pady=2
@@ -1996,32 +2304,42 @@ class MergingGUI(ThemedTk):
         ct_preset_combo.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
         self.widgets_to_disable.append(ct_preset_combo)
 
-        auto_ct_eval_check = ttk.Checkbutton(
-            ct_preset_row,
-            text="Auto CT Eval (test all 8 presets per frame and pick best)",
-            variable=self.auto_ct_eval_var,
-            command=self._on_auto_ct_eval_toggle,
-        )
-        auto_ct_eval_check.grid(row=0, column=2, sticky="w", padx=5, pady=2)
-        self.widgets_to_disable.append(auto_ct_eval_check)
-
         auto_ct_best_label = ttk.Label(
             ct_preset_row, textvariable=self.auto_ct_best_var, anchor="w"
         )
-        auto_ct_best_label.grid(row=0, column=3, sticky="w", padx=5, pady=2)
+        auto_ct_best_label.grid(row=0, column=2, sticky="w", padx=5, pady=2)
+
+        ct_auto_row = ttk.Frame(ct_frame)
+        ct_auto_row.grid(
+            row=1, column=0, columnspan=4, sticky="ew", padx=0, pady=(0, 4)
+        )
+        ct_auto_row.grid_columnconfigure(1, weight=0)
+
+        ttk.Label(ct_auto_row, text="Auto CT:").grid(
+            row=0, column=0, sticky="e", padx=5, pady=2
+        )
+        ct_auto_mode_combo = ttk.Combobox(
+            ct_auto_row,
+            textvariable=self.ct_auto_mode_var,
+            values=CT_AUTO_MODE_OPTIONS,
+            state="readonly",
+            width=14,
+        )
+        ct_auto_mode_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        self.widgets_to_disable.append(ct_auto_mode_combo)
 
         ct_excl = ttk.Checkbutton(
             ct_frame,
             text="Exclude near-black in target stats",
             variable=self.ct_exclude_black_in_target_var,
         )
-        ct_excl.grid(row=1, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        ct_excl.grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=2)
         self._create_hover_tooltip(ct_excl, "ct_exclude_black_in_target")
         self.widgets_to_disable.append(ct_excl)
 
         # Sliders (two columns) — keep preview updates on release
         ct_sliders_row = ttk.Frame(ct_frame)
-        ct_sliders_row.grid(row=2, column=0, columnspan=4, sticky="ew", padx=0, pady=(6, 0))
+        ct_sliders_row.grid(row=3, column=0, columnspan=4, sticky="ew", padx=0, pady=(6, 0))
         ct_sliders_row.grid_columnconfigure(0, weight=1)
         ct_sliders_row.grid_columnconfigure(1, weight=1)
 
@@ -2076,11 +2394,15 @@ class MergingGUI(ThemedTk):
         # Make comboboxes trigger preview refresh immediately on change
         for _v in (
             self.ct_preset_var,
+            self.ct_auto_mode_var,
+            self.ct_csv_blend_path_var,
             self.ct_exclude_black_in_target_var,
         ):
             try:
                 if _v is self.ct_preset_var:
                     _v.trace_add("write", self._on_ct_preset_changed)
+                elif _v is self.ct_auto_mode_var:
+                    _v.trace_add("write", self._on_auto_ct_eval_toggle)
                 else:
                     _v.trace_add("write", lambda *args: self.on_slider_release(None))
             except Exception:
@@ -2258,6 +2580,15 @@ class MergingGUI(ThemedTk):
         if folder:
             var.set(folder)
 
+    def _browse_ct_csv_blend_map(self):
+        path = filedialog.askopenfilename(
+            initialdir=os.path.dirname(self.ct_csv_blend_path_var.get() or "."),
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Select CSV Blend Auto CT Map",
+        )
+        if path:
+            self.ct_csv_blend_path_var.set(path)
+
     def _find_video_by_core_name(self, folder: str, core_name: str) -> Optional[str]:
         """Scans a folder for a file matching the core_name with any common video extension."""
         return find_video_by_core_name(folder, core_name)
@@ -2329,9 +2660,45 @@ class MergingGUI(ThemedTk):
         except Exception:
             pass
 
+    def _get_ct_csv_blend_preset_map_cached(
+        self, csv_path: str
+    ) -> Dict[str, Dict[int, int]]:
+        path = os.path.abspath(os.path.expanduser(str(csv_path or "").strip()))
+        if not path or not os.path.exists(path):
+            self._ct_csv_blend_cache_path = ""
+            self._ct_csv_blend_cache_mtime = -1.0
+            self._ct_csv_blend_cache = {}
+            return {}
+        try:
+            mtime = float(os.path.getmtime(path))
+        except Exception:
+            return {}
+
+        if (
+            path != self._ct_csv_blend_cache_path
+            or mtime != self._ct_csv_blend_cache_mtime
+        ):
+            try:
+                self._ct_csv_blend_cache = _load_csv_blend_preset_map(path)
+                self._ct_csv_blend_cache_path = path
+                self._ct_csv_blend_cache_mtime = mtime
+                logger.info(
+                    f"Loaded CSV Blend Auto CT map: keys={len(self._ct_csv_blend_cache)} from {path}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to load CSV Blend Auto CT map '{path}': {e}")
+                self._ct_csv_blend_cache = {}
+        return dict(self._ct_csv_blend_cache)
+
     def _on_auto_ct_eval_toggle(self):
-        if self.auto_ct_eval_var.get():
+        mode = _resolve_ct_auto_mode_label(self.ct_auto_mode_var.get())
+        if self.ct_auto_mode_var.get() != mode:
+            self.ct_auto_mode_var.set(mode)
+        self.auto_ct_eval_var.set(mode == CT_AUTO_MODE_ON)
+        if mode == CT_AUTO_MODE_ON:
             self.auto_ct_best_var.set("Auto CT best: pending...")
+        elif mode == CT_AUTO_MODE_CSV_BLEND:
+            self.auto_ct_best_var.set("Auto CT CSV Blend: pending...")
         else:
             self.auto_ct_best_var.set("Auto CT best: (disabled)")
         try:
@@ -2617,6 +2984,7 @@ class MergingGUI(ThemedTk):
         """Collects all GUI settings into a dictionary, performing type conversion."""
         try:
             selected_preset_label = _resolve_ct_preset_label(self.ct_preset_var.get())
+            selected_auto_mode = _resolve_ct_auto_mode_label(self.ct_auto_mode_var.get())
             settings = {
                 "inpainted_folder": self.inpainted_folder_var.get(),
                 "original_folder": self.original_folder_var.get(),
@@ -2631,7 +2999,10 @@ class MergingGUI(ThemedTk):
                 "batch_chunk_size": int(self.batch_chunk_size_var.get()),
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
                 "ct_preset": selected_preset_label,
-                "auto_ct_eval": bool(self.auto_ct_eval_var.get()),
+                "ct_auto_mode": selected_auto_mode,
+                "ct_csv_blend_path": str(self.ct_csv_blend_path_var.get() or "").strip(),
+                # Legacy key kept for backward compatibility with old configs/scripts.
+                "auto_ct_eval": bool(selected_auto_mode == CT_AUTO_MODE_ON),
                 "ct_strength": float(self.ct_strength_var.get()),
                 "ct_black_thresh": float(self.ct_black_thresh_var.get()),
                 "ct_min_valid_ratio": float(self.ct_min_valid_ratio_var.get()),
@@ -2700,6 +3071,41 @@ class MergingGUI(ThemedTk):
         if settings is None:
             self.after(0, self.processing_done, True)
             return
+
+        ct_auto_mode_global = _resolve_ct_auto_mode_from_settings(settings)
+        ct_csv_blend_preset_map: Dict[str, Dict[int, int]] = {}
+        if (
+            bool(settings.get("enable_color_transfer", False))
+            and ct_auto_mode_global == CT_AUTO_MODE_CSV_BLEND
+        ):
+            csv_blend_path = str(settings.get("ct_csv_blend_path", "") or "").strip()
+            if not csv_blend_path:
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "CSV Blend Auto CT",
+                        "CT mode is 'CSV Blend' but no CSV path was provided.",
+                    ),
+                )
+                self.after(0, self.processing_done, True)
+                return
+            if not os.path.exists(csv_blend_path):
+                self.after(
+                    0,
+                    lambda p=csv_blend_path: messagebox.showerror(
+                        "CSV Blend Auto CT",
+                        f"CSV Blend map not found:\n{p}",
+                    ),
+                )
+                self.after(0, self.processing_done, True)
+                return
+            ct_csv_blend_preset_map = self._get_ct_csv_blend_preset_map_cached(
+                csv_blend_path
+            )
+            if not ct_csv_blend_preset_map:
+                logger.warning(
+                    f"CSV Blend Auto CT map loaded but lookup map is empty: {csv_blend_path}"
+                )
 
         # Single video mode
         if single_video_path and os.path.exists(single_video_path):
@@ -2779,27 +3185,17 @@ class MergingGUI(ThemedTk):
             original_video_path_to_move = None  # To track which original file to move
             try:
                 # --- 1. Find corresponding files (same logic as preview) ---
-                inpaint_suffix = "_inpainted_right_eye.mp4"
-                sbs_suffix = "_inpainted_sbs.mp4"
-                is_sbs_input = base_name.endswith(sbs_suffix)
-                core_name_with_width = (
-                    base_name[: -len(sbs_suffix)]
-                    if is_sbs_input
-                    else base_name[: -len(inpaint_suffix)]
+                core_name_with_width, core_name, is_sbs_input = _parse_inpainted_basename(
+                    base_name
                 )
-
-                # --- FIX: Gracefully handle cases where the filename format is unexpected ---
-                last_underscore_idx = core_name_with_width.rfind("_")
-                if last_underscore_idx == -1:
+                if not core_name_with_width or not core_name:
                     logger.error(
-                        f"Could not parse core name from '{core_name_with_width}'. Skipping video '{base_name}'."
+                        f"Could not parse core name from '{base_name}'. Skipping video."
                     )
                     self.after(
                         0, self.progress_var.set, i + 1
                     )  # Still advance progress bar
                     continue
-                core_name = core_name_with_width[:last_underscore_idx]
-                # --- END FIX ---
 
                 # --- NEW: Read sidecar file for this clip ---
                 clip_sidecar_data = self._read_clip_sidecar(
@@ -2990,12 +3386,43 @@ class MergingGUI(ThemedTk):
 
                 # 4. Loop through chunks
                 chunk_size = settings.get("batch_chunk_size", 32)
-                ct_usage_counts = {int(p["id"]): 0 for p in CT_PRESETS}
+                ct_usage_counts = {int(p["id"]): 0.0 for p in CT_PRESETS}
                 selected_label = _resolve_ct_preset_label(
                     settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL)
                 )
                 selected_preset = CT_PRESET_BY_LABEL[selected_label]
-                auto_ct_eval = bool(settings.get("auto_ct_eval", False))
+                ct_auto_mode = _resolve_ct_auto_mode_from_settings(settings)
+                csv_blend_weights_by_frame: List[Dict[int, float]] = []
+                csv_blend_lookup_key = ""
+                if ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
+                    csv_rows_by_frame, csv_blend_lookup_key = _lookup_csv_blend_preset_rows(
+                        ct_csv_blend_preset_map,
+                        inpainted_video_path,
+                        core_name_with_width,
+                        core_name,
+                    )
+                    fallback_selected_id = int(selected_preset["id"])
+                    csv_target_ids = [fallback_selected_id for _ in range(num_frames)]
+                    applied_rows = 0
+                    for frame_i, preset_i in csv_rows_by_frame.items():
+                        fi = int(frame_i)
+                        pid = int(preset_i)
+                        if 0 <= fi < num_frames and pid in CT_PRESET_BY_ID:
+                            csv_target_ids[fi] = pid
+                            applied_rows += 1
+                    csv_blend_weights_by_frame, _csv_osc_flags = _build_csv_blend_weights_by_frame(
+                        csv_target_ids
+                    )
+                    if applied_rows <= 0:
+                        logger.warning(
+                            f"CSV Blend Auto CT: no per-frame presets found for {base_name}; "
+                            f"falling back to preset #{fallback_selected_id}."
+                        )
+                    else:
+                        logger.info(
+                            f"CSV Blend Auto CT: {base_name} loaded {applied_rows} frame presets "
+                            f"(lookup='{csv_blend_lookup_key}')."
+                        )
                 for frame_start in range(0, num_frames, chunk_size):
                     if self.stop_event.is_set():
                         break
@@ -3123,9 +3550,12 @@ class MergingGUI(ThemedTk):
 
                     if settings["enable_color_transfer"]:
                         adjusted_frames = []
+                        eval_candidate_ids: Optional[List[int]] = None
+                        if ct_auto_mode == CT_AUTO_MODE_ON:
+                            eval_candidate_ids = list(CT_PRESET_AUTO_EVAL_ORDER)
                         ct_eval_executor = (
                             ThreadPoolExecutor(max_workers=CT_AUTO_EVAL_MAX_WORKERS)
-                            if auto_ct_eval
+                            if eval_candidate_ids is not None
                             else None
                         )
                         try:
@@ -3135,7 +3565,7 @@ class MergingGUI(ThemedTk):
                                 warped_3 = warped_original[frame_idx].cpu()
                                 mask_bin_1hw = mask_bin[frame_idx].cpu()
 
-                                if auto_ct_eval:
+                                if eval_candidate_ids is not None:
                                     best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
                                         inpainted_3=inpainted_3,
                                         original_left_3=original_left_3,
@@ -3143,25 +3573,86 @@ class MergingGUI(ThemedTk):
                                         mask_bin_1hw=mask_bin_1hw,
                                         settings=settings,
                                         fallback_preset_id=int(selected_preset["id"]),
+                                        candidate_preset_ids=eval_candidate_ids,
                                         executor=ct_eval_executor,
                                     )
-                                    ct_usage_counts[best_preset_id] += 1
+                                    ct_usage_counts[best_preset_id] += 1.0
                                     adjusted_frames.append(best_frame.to(device))
                                 else:
-                                    stats_valid_cache: Dict[str, torch.Tensor] = {}
-                                    warped_ref_cache: Dict[str, torch.Tensor] = {}
-                                    adjusted_3 = _apply_ct_preset_frame(
-                                        preset=selected_preset,
-                                        inpainted_3=inpainted_3,
-                                        original_left_3=original_left_3,
-                                        warped_3=warped_3,
-                                        mask_bin_1hw=mask_bin_1hw,
-                                        settings=settings,
-                                        stats_valid_cache=stats_valid_cache,
-                                        warped_ref_cache=warped_ref_cache,
-                                    )
-                                    ct_usage_counts[int(selected_preset["id"])] += 1
-                                    adjusted_frames.append(adjusted_3.to(device))
+                                    if ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
+                                        global_frame_idx = int(frame_indices[frame_idx])
+                                        blend_weights = (
+                                            csv_blend_weights_by_frame[global_frame_idx]
+                                            if 0 <= global_frame_idx < len(csv_blend_weights_by_frame)
+                                            else {}
+                                        )
+                                        if not blend_weights:
+                                            fallback_selected_id = int(selected_preset["id"])
+                                            blend_weights = {fallback_selected_id: 1.0}
+                                        stats_valid_cache: Dict[str, torch.Tensor] = {}
+                                        warped_ref_cache: Dict[str, torch.Tensor] = {}
+                                        blended_3: Optional[torch.Tensor] = None
+                                        for pid_i, weight_i in sorted(
+                                            blend_weights.items(),
+                                            key=lambda kv: kv[1],
+                                            reverse=True,
+                                        ):
+                                            pid = int(pid_i)
+                                            w = float(max(0.0, min(1.0, float(weight_i))))
+                                            if w <= 0.0:
+                                                continue
+                                            preset_i = CT_PRESET_BY_ID.get(pid, selected_preset)
+                                            adjusted_3 = _apply_ct_preset_frame(
+                                                preset=preset_i,
+                                                inpainted_3=inpainted_3,
+                                                original_left_3=original_left_3,
+                                                warped_3=warped_3,
+                                                mask_bin_1hw=mask_bin_1hw,
+                                                settings=settings,
+                                                stats_valid_cache=stats_valid_cache,
+                                                warped_ref_cache=warped_ref_cache,
+                                            )
+                                            if blended_3 is None:
+                                                blended_3 = adjusted_3 * w
+                                            else:
+                                                blended_3 = blended_3 + (adjusted_3 * w)
+                                            ct_usage_counts[pid] += w
+                                        if blended_3 is None:
+                                            fallback_selected_id = int(selected_preset["id"])
+                                            fallback_preset = CT_PRESET_BY_ID[fallback_selected_id]
+                                            stats_valid_cache = {}
+                                            warped_ref_cache = {}
+                                            blended_3 = _apply_ct_preset_frame(
+                                                preset=fallback_preset,
+                                                inpainted_3=inpainted_3,
+                                                original_left_3=original_left_3,
+                                                warped_3=warped_3,
+                                                mask_bin_1hw=mask_bin_1hw,
+                                                settings=settings,
+                                                stats_valid_cache=stats_valid_cache,
+                                                warped_ref_cache=warped_ref_cache,
+                                            )
+                                            ct_usage_counts[fallback_selected_id] += 1.0
+                                        adjusted_frames.append(
+                                            torch.clamp(blended_3, 0.0, 1.0).to(device)
+                                        )
+                                    else:
+                                        selected_id_for_frame = int(selected_preset["id"])
+                                        selected_preset_for_frame = selected_preset
+                                        stats_valid_cache: Dict[str, torch.Tensor] = {}
+                                        warped_ref_cache: Dict[str, torch.Tensor] = {}
+                                        adjusted_3 = _apply_ct_preset_frame(
+                                            preset=selected_preset_for_frame,
+                                            inpainted_3=inpainted_3,
+                                            original_left_3=original_left_3,
+                                            warped_3=warped_3,
+                                            mask_bin_1hw=mask_bin_1hw,
+                                            settings=settings,
+                                            stats_valid_cache=stats_valid_cache,
+                                            warped_ref_cache=warped_ref_cache,
+                                        )
+                                        ct_usage_counts[selected_id_for_frame] += 1.0
+                                        adjusted_frames.append(adjusted_3.to(device))
                         finally:
                             if ct_eval_executor is not None:
                                 ct_eval_executor.shutdown(wait=True)
@@ -3298,7 +3789,7 @@ class MergingGUI(ThemedTk):
 
                 # 5. Finalize FFmpeg process
                 if settings.get("enable_color_transfer", False):
-                    total_ct = int(sum(ct_usage_counts.values()))
+                    total_ct = float(sum(ct_usage_counts.values()))
                     if total_ct > 0:
                         ct_line = " ".join(
                             [
@@ -3307,7 +3798,7 @@ class MergingGUI(ThemedTk):
                             ]
                         )
                         logger.info(f"CT usage [{base_name}] {ct_line}")
-                        if bool(settings.get("auto_ct_eval", False)):
+                        if ct_auto_mode == CT_AUTO_MODE_ON:
                             best_pid = max(
                                 range(1, 9), key=lambda pid: ct_usage_counts.get(pid, 0)
                             )
@@ -3317,6 +3808,19 @@ class MergingGUI(ThemedTk):
                             self.after(
                                 0,
                                 lambda t=f"Auto CT best: #{best_pid} ({best_pct:.1f}%)": self.auto_ct_best_var.set(
+                                    t
+                                ),
+                            )
+                        elif ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
+                            best_pid = max(
+                                range(1, 9), key=lambda pid: ct_usage_counts.get(pid, 0.0)
+                            )
+                            best_pct = (
+                                100.0 * ct_usage_counts.get(best_pid, 0.0) / total_ct
+                            )
+                            self.after(
+                                0,
+                                lambda t=f"Auto CT CSV Blend: #{best_pid} ({best_pct:.1f}%)": self.auto_ct_best_var.set(
                                     t
                                 ),
                             )
@@ -3790,7 +4294,50 @@ class MergingGUI(ThemedTk):
                     params.get("ct_preset", CT_PRESET_DEFAULT_LABEL)
                 )
                 selected_preset = CT_PRESET_BY_LABEL[selected_label]
-                auto_ct_eval = bool(params.get("auto_ct_eval", False))
+                ct_auto_mode = _resolve_ct_auto_mode_from_settings(params)
+                csv_blend_weights_for_frame: Dict[int, float] = {}
+                if ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
+                    csv_blend_path = str(params.get("ct_csv_blend_path", "") or "").strip()
+                    csv_blend_map = (
+                        self._get_ct_csv_blend_preset_map_cached(csv_blend_path)
+                        if csv_blend_path
+                        else {}
+                    )
+                    preview_inpainted_path = str(
+                        current_source_metadata.get("inpainted", "") or ""
+                    )
+                    preview_base_name = os.path.basename(preview_inpainted_path)
+                    preview_core_with_width, preview_core_name, _ = _parse_inpainted_basename(
+                        preview_base_name
+                    )
+                    csv_rows_by_frame, _csv_lookup_key = _lookup_csv_blend_preset_rows(
+                        csv_blend_map,
+                        preview_inpainted_path,
+                        preview_core_with_width,
+                        preview_core_name,
+                    )
+                    fallback_selected_id = int(selected_preset["id"])
+                    preview_frame_idx = int(self.previewer.frame_scrubber_var.get())
+                    seq_len = max(
+                        preview_frame_idx + 1,
+                        int(current_source_metadata.get("total_frames", 0) or 0),
+                        (max(csv_rows_by_frame.keys()) + 1) if csv_rows_by_frame else 0,
+                    )
+                    csv_target_ids = [fallback_selected_id for _ in range(seq_len)]
+                    for frame_i, preset_i in csv_rows_by_frame.items():
+                        fi = int(frame_i)
+                        pid = int(preset_i)
+                        if 0 <= fi < seq_len and pid in CT_PRESET_BY_ID:
+                            csv_target_ids[fi] = pid
+                    csv_blend_weights_by_frame, _csv_osc_flags = _build_csv_blend_weights_by_frame(
+                        csv_target_ids
+                    )
+                    if 0 <= preview_frame_idx < len(csv_blend_weights_by_frame):
+                        csv_blend_weights_for_frame = dict(
+                            csv_blend_weights_by_frame[preview_frame_idx]
+                        )
+                    if not csv_blend_weights_for_frame:
+                        csv_blend_weights_for_frame = {fallback_selected_id: 1.0}
 
                 # Preview uses the same clean binary CT mask strategy as batch.
                 if params.get("mask_binarize_threshold", -1.0) >= 0.0:
@@ -3809,7 +4356,8 @@ class MergingGUI(ThemedTk):
                 )
                 mask_bin_1hw = mask_bin[0].cpu() if mask_bin.dim() == 4 else mask_bin.cpu()
 
-                if auto_ct_eval:
+                if ct_auto_mode == CT_AUTO_MODE_ON:
+                    candidate_ids = list(CT_PRESET_AUTO_EVAL_ORDER)
                     with ThreadPoolExecutor(max_workers=CT_AUTO_EVAL_MAX_WORKERS) as ct_eval_executor:
                         best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
                             inpainted_3=inpainted_3,
@@ -3818,26 +4366,84 @@ class MergingGUI(ThemedTk):
                             mask_bin_1hw=mask_bin_1hw,
                             settings=params,
                             fallback_preset_id=int(selected_preset["id"]),
+                            candidate_preset_ids=candidate_ids,
                             executor=ct_eval_executor,
                         )
                     out_3 = best_frame.to(device)
                     self.auto_ct_best_var.set(f"Auto CT best: #{best_preset_id} (preview)")
                 else:
-                    stats_valid_cache = {}
-                    warped_ref_cache = {}
-                    out_3 = _apply_ct_preset_frame(
-                        preset=selected_preset,
-                        inpainted_3=inpainted_3,
-                        original_left_3=original_left_3,
-                        warped_3=warped_3,
-                        mask_bin_1hw=mask_bin_1hw,
-                        settings=params,
-                        stats_valid_cache=stats_valid_cache,
-                        warped_ref_cache=warped_ref_cache,
-                    ).to(device)
-                    self.auto_ct_best_var.set(
-                        f"Auto CT best: #{int(selected_preset['id'])} (manual)"
-                    )
+                    if ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
+                        stats_valid_cache: Dict[str, torch.Tensor] = {}
+                        warped_ref_cache: Dict[str, torch.Tensor] = {}
+                        out_mix: Optional[torch.Tensor] = None
+                        for pid_i, weight_i in sorted(
+                            csv_blend_weights_for_frame.items(),
+                            key=lambda kv: kv[1],
+                            reverse=True,
+                        ):
+                            pid = int(pid_i)
+                            w = float(max(0.0, min(1.0, float(weight_i))))
+                            if w <= 0.0:
+                                continue
+                            preset_i = CT_PRESET_BY_ID.get(pid, selected_preset)
+                            adjusted_3 = _apply_ct_preset_frame(
+                                preset=preset_i,
+                                inpainted_3=inpainted_3,
+                                original_left_3=original_left_3,
+                                warped_3=warped_3,
+                                mask_bin_1hw=mask_bin_1hw,
+                                settings=params,
+                                stats_valid_cache=stats_valid_cache,
+                                warped_ref_cache=warped_ref_cache,
+                            )
+                            if out_mix is None:
+                                out_mix = adjusted_3 * w
+                            else:
+                                out_mix = out_mix + (adjusted_3 * w)
+                        if out_mix is None:
+                            fallback_selected_id = int(selected_preset["id"])
+                            stats_valid_cache = {}
+                            warped_ref_cache = {}
+                            out_mix = _apply_ct_preset_frame(
+                                preset=CT_PRESET_BY_ID[fallback_selected_id],
+                                inpainted_3=inpainted_3,
+                                original_left_3=original_left_3,
+                                warped_3=warped_3,
+                                mask_bin_1hw=mask_bin_1hw,
+                                settings=params,
+                                stats_valid_cache=stats_valid_cache,
+                                warped_ref_cache=warped_ref_cache,
+                            )
+                        out_3 = torch.clamp(out_mix, 0.0, 1.0).to(device)
+                        blend_txt = ", ".join(
+                            [
+                                f"#{int(pid)}:{(100.0 * float(w)):.0f}%"
+                                for pid, w in sorted(
+                                    csv_blend_weights_for_frame.items(),
+                                    key=lambda kv: kv[1],
+                                    reverse=True,
+                                )[:3]
+                            ]
+                        )
+                        self.auto_ct_best_var.set(f"Auto CT CSV Blend: {blend_txt} (preview)")
+                    else:
+                        selected_id_for_frame = int(selected_preset["id"])
+                        selected_preset_for_frame = selected_preset
+                        stats_valid_cache = {}
+                        warped_ref_cache = {}
+                        out_3 = _apply_ct_preset_frame(
+                            preset=selected_preset_for_frame,
+                            inpainted_3=inpainted_3,
+                            original_left_3=original_left_3,
+                            warped_3=warped_3,
+                            mask_bin_1hw=mask_bin_1hw,
+                            settings=params,
+                            stats_valid_cache=stats_valid_cache,
+                            warped_ref_cache=warped_ref_cache,
+                        ).to(device)
+                        self.auto_ct_best_var.set(
+                            f"Auto CT best: #{selected_id_for_frame} (manual)"
+                        )
 
                 if inpainted.dim() == 4:
                     inpainted = out_3.unsqueeze(0)
