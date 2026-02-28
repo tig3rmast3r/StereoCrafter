@@ -19,6 +19,7 @@ import logging
 import time
 import queue
 import faulthandler
+import signal
 from concurrent.futures import ThreadPoolExecutor
 from dependency.stereocrafter_util import (
     Tooltip,
@@ -58,6 +59,13 @@ def _enable_debug_faulthandler() -> None:
         )
         _FAULTHANDLER_LOG.flush()
         faulthandler.enable(file=_FAULTHANDLER_LOG, all_threads=True)
+        # Optional on-demand dump while process is alive:
+        # kill -USR1 <pid>  -> writes full traceback of all threads to log.
+        try:
+            faulthandler.register(signal.SIGUSR1, file=_FAULTHANDLER_LOG, all_threads=True)
+        except Exception:
+            # Keep crash dumping even if signal registration is not available.
+            pass
         logger.info(f"Debug faulthandler active: {log_path}")
     except Exception as e:
         logger.warning(f"Failed to enable debug faulthandler: {e}")
@@ -126,122 +134,249 @@ def apply_gaussian_blur(
         return torch.stack(processed_frames).to(mask.device)
 
 
+def _shadow_curve_opacity(u: float, curve: float) -> float:
+    u = float(max(0.0, min(1.0, u)))
+    c = float(max(-1.0, min(1.0, curve)))
+    linear = 1.0 - u
+    if abs(c) <= 1e-6:
+        return linear
+    if c > 0.0:
+        # Positive: fuller at start, steeper tail near the end.
+        bulged = (1.0 - u) ** 0.5
+        return (1.0 - c) * linear + c * bulged
+    # Negative: faster drop at the beginning, softer tail.
+    t = -c
+    front_drop = (1.0 - u) ** 2.0
+    return (1.0 - t) * linear + t * front_drop
+
+
+def _bbox_intersection_area(
+    a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]
+) -> int:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    if ix2 < ix1 or iy2 < iy1:
+        return 0
+    return int((ix2 - ix1 + 1) * (iy2 - iy1 + 1))
+
+
 def apply_shadow_blur(
     mask: torch.Tensor,
-    shift_per_step: int,
-    start_opacity: float,
-    opacity_decay_per_step: float,
-    min_opacity: float,
-    decay_gamma: float = 1.0,
+    base_length_px: int,
+    curve: float,
+    motion_gain: float,
+    width_adaptive: bool = True,
     use_gpu: bool = True,
+    state: Optional[Dict[str, Any]] = None,
+    border_tolerance_px: int = 2,
+    width_ref_px: float = 20.0,
+    width_power: float = 1.0,
 ) -> torch.Tensor:
-    if shift_per_step <= 0:
-        return mask
-    # --- FIX: Prevent division by zero if opacity decay is zero ---
-    if opacity_decay_per_step <= 1e-6:  # Use a small epsilon for float comparison
-        return mask
-    # --- END FIX ---
-    num_steps = int((start_opacity - min_opacity) / opacity_decay_per_step) + 1
-    if num_steps <= 0:
+    if int(base_length_px) <= 0:
         return mask
 
-    # Row/run-aware direction:
-    # - default: propagate shadow to the RIGHT.
-    # - for runs touching RIGHT border (2px tolerance), propagate to the LEFT.
-    # This lets direction switch inside the same connected component when a row
-    # no longer touches the border.
-    border_tolerance_px = 2
-    border_cols = max(1, min(border_tolerance_px, mask.shape[-1]))
     component_thresh = 0.05
+    base_len = float(max(0.0, base_length_px))
+    curve = float(max(-1.0, min(1.0, curve)))
+    motion_gain = float(max(0.0, motion_gain))
+    width_adaptive = bool(width_adaptive)
+    width_ref_px = float(max(1.0, width_ref_px))
+    width_power = float(max(0.1, width_power))
+    border_tol = max(1, int(border_tolerance_px))
+    motion_deadzone_px = 3.0  # Ignore micro-jitter up to this displacement.
+    motion_ref_px = 6.0  # Additional px/frame (beyond deadzone) for full motion gain.
 
-    stamp_source_right = torch.zeros_like(mask)
-    stamp_source_left = torch.zeros_like(mask)
-    mask_cpu = mask.detach().to(device="cpu")
-    height = int(mask_cpu.shape[2])
-    width = int(mask_cpu.shape[3])
-    right_touch_start = width - border_cols
+    alpha_up = 0.45
+    alpha_down = 0.20
+    max_delta_up = max(1.0, 0.35 * base_len)
+    max_delta_down = max(1.0, 0.20 * base_len)
+    max_len_cap = int(max(100, 4 * base_len))
 
-    for t in range(mask_cpu.shape[0]):
-        frame = mask_cpu[t, 0]
-        frame_bin = frame > component_thresh
-        if not bool(frame_bin.any().item()):
-            continue
+    mask_cpu = mask.detach().to(device="cpu", dtype=torch.float32).numpy()  # T,1,H,W
+    t_count, _c, height, width = mask_cpu.shape
+    right_touch_start = width - border_tol
 
-        frame_right = torch.zeros_like(frame)
-        frame_left = torch.zeros_like(frame)
+    prev_components: List[Dict[str, Any]] = []
+    if state is not None:
+        prev_components = list(state.get("prev_components", []) or [])
 
-        # Process each row independently so direction can switch within a component.
-        for y in range(height):
-            xs = torch.where(frame_bin[y])[0]
-            n = int(xs.numel())
-            if n == 0:
-                continue
-            run_start = int(xs[0].item())
-            prev = run_start
-            for idx in range(1, n):
-                cur = int(xs[idx].item())
-                if cur != prev + 1:
-                    a, b = run_start, prev
-                    touches_left = a < border_cols
-                    touches_right = b >= right_touch_start
-                    if touches_right and not touches_left:
-                        frame_left[y, a : b + 1] = frame[y, a : b + 1]
+    out_frames: List[torch.Tensor] = []
+
+    for t in range(t_count):
+        frame = np.asarray(mask_cpu[t, 0], dtype=np.float32)
+        frame_bin = (frame > component_thresh).astype(np.uint8)
+        canvas = frame.copy()
+
+        if frame_bin.any():
+            n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                frame_bin, connectivity=8
+            )
+
+            curr_components: List[Dict[str, Any]] = []
+            comp_len_by_label: Dict[int, float] = {}
+
+            for lab in range(1, int(n_labels)):
+                x = int(stats[lab, cv2.CC_STAT_LEFT])
+                y = int(stats[lab, cv2.CC_STAT_TOP])
+                w = int(stats[lab, cv2.CC_STAT_WIDTH])
+                h = int(stats[lab, cv2.CC_STAT_HEIGHT])
+                area = int(stats[lab, cv2.CC_STAT_AREA])
+                if area <= 0 or w <= 0 or h <= 0:
+                    continue
+                bbox = (x, y, x + w - 1, y + h - 1)
+                cx = float(centroids[lab][0])
+                cy = float(centroids[lab][1])
+
+                matches: List[Tuple[float, Dict[str, Any]]] = []
+                for prev in prev_components:
+                    inter = _bbox_intersection_area(bbox, prev["bbox"])
+                    if inter > 0:
+                        matches.append((float(inter), prev))
+
+                if not matches and prev_components:
+                    # Fallback nearest match for mild displacements without overlap.
+                    best_prev = None
+                    best_d = 1e9
+                    max_dist = max(8.0, 0.5 * np.sqrt(float(area)))
+                    for prev in prev_components:
+                        dx = float(cx - prev["centroid"][0])
+                        dy = float(cy - prev["centroid"][1])
+                        d = float(np.hypot(dx, dy))
+                        if d < best_d and d <= max_dist:
+                            best_d = d
+                            best_prev = prev
+                    if best_prev is not None:
+                        matches.append((1.0, best_prev))
+
+                if matches:
+                    wsum = float(sum(mw for mw, _ in matches))
+                    prev_len = float(
+                        sum(mw * float(m["len_smooth"]) for mw, m in matches) / max(1e-6, wsum)
+                    )
+                    motion_px = float(
+                        sum(
+                            mw
+                            * float(
+                                np.hypot(
+                                    cx - float(m["centroid"][0]),
+                                    cy - float(m["centroid"][1]),
+                                )
+                            )
+                            for mw, m in matches
+                        )
+                        / max(1e-6, wsum)
+                    )
+                else:
+                    prev_len = float(base_len)
+                    motion_px = 0.0
+
+                motion_eff_px = max(0.0, motion_px - motion_deadzone_px)
+                motion_mult = 1.0 + motion_gain * min(1.0, motion_eff_px / motion_ref_px)
+                target_len = float(base_len) * motion_mult
+                target_len = float(max(0.0, min(float(max_len_cap), target_len)))
+
+                if target_len >= prev_len:
+                    alpha = alpha_up
+                    max_delta = max_delta_up
+                else:
+                    alpha = alpha_down
+                    max_delta = max_delta_down
+                smoothed = prev_len + alpha * (target_len - prev_len)
+                delta = float(smoothed - prev_len)
+                delta = float(max(-max_delta, min(max_delta, delta)))
+                len_smooth = float(max(0.0, min(float(max_len_cap), prev_len + delta)))
+
+                curr_components.append(
+                    {
+                        "label": int(lab),
+                        "bbox": bbox,
+                        "centroid": (cx, cy),
+                        "area": area,
+                        "len_smooth": len_smooth,
+                    }
+                )
+                comp_len_by_label[int(lab)] = len_smooth
+
+            # Row/run-aware dynamic shadow length + right-border inversion.
+            for y in range(height):
+                row_bin = frame_bin[y]
+                x = 0
+                while x < width:
+                    if row_bin[x] == 0:
+                        x += 1
+                        continue
+                    run_start = x
+                    while x + 1 < width and row_bin[x + 1] != 0:
+                        x += 1
+                    run_end = x
+                    x += 1
+
+                    run_vals = frame[y, run_start : run_end + 1]
+                    if run_vals.size <= 0:
+                        continue
+
+                    run_labels = labels[y, run_start : run_end + 1]
+                    lab_vals = run_labels[run_labels > 0]
+                    if lab_vals.size > 0:
+                        lab = int(np.bincount(lab_vals).argmax())
                     else:
-                        frame_right[y, a : b + 1] = frame[y, a : b + 1]
-                    run_start = cur
-                prev = cur
-            a, b = run_start, prev
-            touches_left = a < border_cols
-            touches_right = b >= right_touch_start
-            if touches_right and not touches_left:
-                frame_left[y, a : b + 1] = frame[y, a : b + 1]
-            else:
-                frame_right[y, a : b + 1] = frame[y, a : b + 1]
+                        lab = 0
 
-        stamp_source_right[t, 0] = frame_right
-        stamp_source_left[t, 0] = frame_left
+                    comp_len = float(comp_len_by_label.get(lab, base_len))
+                    run_w = int(run_end - run_start + 1)
+                    width_mult = (
+                        float((max(1.0, float(run_w)) / width_ref_px) ** width_power)
+                        if width_adaptive
+                        else 1.0
+                    )
+                    run_len = int(round(comp_len * width_mult))
+                    run_len = int(max(0, min(max_len_cap, run_len)))
+                    if run_len <= 0:
+                        continue
 
-    stamp_source_right = stamp_source_right.to(device=mask.device, dtype=mask.dtype)
-    stamp_source_left = stamp_source_left.to(device=mask.device, dtype=mask.dtype)
+                    touches_left = run_start < border_tol
+                    touches_right = run_end >= right_touch_start
+                    dir_left = bool(touches_right and not touches_left)
 
-    if use_gpu:
-        canvas_mask = mask.clone()
-        for i in range(num_steps):
-            t = 1.0 - (i / (num_steps - 1)) if num_steps > 1 else 1.0
-            curved_t = t**decay_gamma
-            current_opacity = min_opacity + (start_opacity - min_opacity) * curved_t
-            total_shift = (i + 1) * shift_per_step
+                    for s in range(1, run_len + 1):
+                        opacity = float(_shadow_curve_opacity(float(s) / float(run_len), curve))
+                        if opacity <= 0.0:
+                            continue
+                        if dir_left:
+                            dst_a = int(run_start - s)
+                            dst_b = int(run_end - s)
+                        else:
+                            dst_a = int(run_start + s)
+                            dst_b = int(run_end + s)
 
-            padded_right = F.pad(stamp_source_right, (total_shift, 0), "constant", 0)
-            shifted_right = padded_right[:, :, :, :-total_shift]
-            padded_left = F.pad(stamp_source_left, (0, total_shift), "constant", 0)
-            shifted_left = padded_left[:, :, :, total_shift:]
+                        clip_a = max(0, dst_a)
+                        clip_b = min(width - 1, dst_b)
+                        if clip_b < clip_a:
+                            continue
+                        src_start = int(clip_a - dst_a)
+                        src_end = int(src_start + (clip_b - clip_a + 1))
+                        src_slice = run_vals[src_start:src_end]
+                        if src_slice.size <= 0:
+                            continue
+                        dst_slice = canvas[y, clip_a : clip_b + 1]
+                        src_vals = src_slice * opacity
+                        # Avoid np.maximum in-place on overlapping views: observed to
+                        # trigger sporadic native crashes (SIGSEGV/SIGILL) on long runs.
+                        mask_gt = src_vals > dst_slice
+                        dst_slice[mask_gt] = src_vals[mask_gt]
 
-            shifted_stamp = torch.max(shifted_right, shifted_left)
-            canvas_mask = torch.max(canvas_mask, shifted_stamp * current_opacity)
-        return canvas_mask
-    else:
-        processed_frames = []
-        for t in range(mask.shape[0]):
-            canvas_np = mask[t].squeeze(0).cpu().numpy()  # Process one frame at a time
-            stamp_source_right_np = stamp_source_right[t].squeeze(0).cpu().numpy()
-            stamp_source_left_np = stamp_source_left[t].squeeze(0).cpu().numpy()
-            for i in range(num_steps):
-                time_step = 1.0 - (i / (num_steps - 1)) if num_steps > 1 else 1.0
-                curved_t = time_step**decay_gamma
-                current_opacity = min_opacity + (start_opacity - min_opacity) * curved_t
-                total_shift = (i + 1) * shift_per_step
-                shifted_r = np.zeros_like(stamp_source_right_np)
-                shifted_l = np.zeros_like(stamp_source_left_np)
+            prev_components = curr_components
 
-                if total_shift < shifted_r.shape[1]:
-                    shifted_r[:, total_shift:] = stamp_source_right_np[:, :-total_shift]
-                    shifted_l[:, :-total_shift] = stamp_source_left_np[:, total_shift:]
+        out_frames.append(torch.from_numpy(canvas).unsqueeze(0))
 
-                shifted_stamp = np.maximum(shifted_r, shifted_l)
-                canvas_np = np.maximum(canvas_np, shifted_stamp * current_opacity)
-            processed_frames.append(torch.from_numpy(canvas_np).unsqueeze(0))
-        return torch.stack(processed_frames).to(mask.device)
+    if state is not None:
+        state["prev_components"] = prev_components
+
+    return torch.stack(out_frames).to(device=mask.device, dtype=mask.dtype)
 
 
 
@@ -1398,6 +1533,8 @@ def _apply_ct_preset_frame(
 
 
 class MergingGUI(ThemedTk):
+    PREVIEW_SHADOW_WARMUP_FRAMES = 20
+
     # --- Centralized Default Settings ---
     APP_DEFAULTS = {
         "inpainted_folder": "./completed_output",
@@ -1409,19 +1546,21 @@ class MergingGUI(ThemedTk):
         "mask_binarize_threshold": -0.01,
         "mask_dilate_kernel_size": 2,
         "mask_blur_kernel_size": 4,
-        "shadow_shift": 1,
-        "shadow_decay_gamma": 1,
-        "shadow_start_opacity": 1,
-        "shadow_opacity_decay": 0.06,
-        "shadow_min_opacity": 0,
+        "shadow_length_px": 30,
+        "shadow_width_adaptive": True,
+        "shadow_curve": 0.0,
+        "shadow_motion_gain": 0.0,
+        "preview_shadow_temporal": False,
         "use_gpu": True,
         "output_format": "Full SBS (Left-Right)",
         "pad_to_16_9": False,
+        "add_borders": False,
         "enable_color_transfer": True,
         "ct_preset": "1) safe sr=ring ts=inpainted ref=warped",
         "auto_ct_eval": True,
         "ct_auto_mode": CT_AUTO_MODE_ON,
         "ct_csv_blend_path": "",
+        "show_blend_in_preview": True,
         "ct_strength": 1.0,
         "ct_black_thresh": 0.0,
         "ct_min_valid_ratio": 0,
@@ -1465,6 +1604,7 @@ class MergingGUI(ThemedTk):
         self._is_startup = True  # Flag to prevent resizing during initialization
         self.preview_original_left_tensor = None
         self.preview_blended_right_tensor = None
+        self._preview_shadow_temporal_cache: Optional[Dict[str, Any]] = None
         # --- GUI Variables ---
         self.pil_image_for_preview = None
         self.inpainted_folder_var = tk.StringVar(
@@ -1533,36 +1673,51 @@ class MergingGUI(ThemedTk):
                 )
             )
         )
-        self.shadow_shift_var = tk.DoubleVar(
+        # Backward compatibility: infer approximate length from legacy decay if needed.
+        legacy_length_fallback = float(self.APP_DEFAULTS["shadow_length_px"])
+        if "shadow_length_px" not in self.app_config:
+            try:
+                legacy_decay = float(self.app_config.get("shadow_opacity_decay", 0.0))
+                if legacy_decay > 1e-6:
+                    legacy_length_fallback = max(
+                        0.0, min(200.0, 1.0 / float(legacy_decay))
+                    )
+            except Exception:
+                pass
+        self.shadow_length_px_var = tk.DoubleVar(
             value=float(
-                self.app_config.get("shadow_shift", self.APP_DEFAULTS["shadow_shift"])
+                self.app_config.get("shadow_length_px", legacy_length_fallback)
             )
         )
-        self.shadow_decay_gamma_var = tk.DoubleVar(
-            value=float(
+        self.shadow_width_adaptive_var = tk.BooleanVar(
+            value=bool(
                 self.app_config.get(
-                    "shadow_decay_gamma", self.APP_DEFAULTS["shadow_decay_gamma"]
+                    "shadow_width_adaptive",
+                    self.APP_DEFAULTS["shadow_width_adaptive"],
                 )
             )
         )
-        self.shadow_start_opacity_var = tk.DoubleVar(
+        self.shadow_curve_var = tk.DoubleVar(
             value=float(
                 self.app_config.get(
-                    "shadow_start_opacity", self.APP_DEFAULTS["shadow_start_opacity"]
+                    "shadow_curve",
+                    self.APP_DEFAULTS["shadow_curve"],
                 )
             )
         )
-        self.shadow_opacity_decay_var = tk.DoubleVar(
+        self.shadow_motion_gain_var = tk.DoubleVar(
             value=float(
                 self.app_config.get(
-                    "shadow_opacity_decay", self.APP_DEFAULTS["shadow_opacity_decay"]
+                    "shadow_motion_gain",
+                    self.APP_DEFAULTS["shadow_motion_gain"],
                 )
             )
         )
-        self.shadow_min_opacity_var = tk.DoubleVar(
-            value=float(
+        self.preview_shadow_temporal_var = tk.BooleanVar(
+            value=bool(
                 self.app_config.get(
-                    "shadow_min_opacity", self.APP_DEFAULTS["shadow_min_opacity"]
+                    "preview_shadow_temporal",
+                    self.APP_DEFAULTS["preview_shadow_temporal"],
                 )
             )
         )
@@ -1617,6 +1772,14 @@ class MergingGUI(ThemedTk):
                 self.app_config.get(
                     "ct_csv_blend_path",
                     self.APP_DEFAULTS.get("ct_csv_blend_path", ""),
+                )
+            )
+        )
+        self.show_blend_in_preview_var = tk.BooleanVar(
+            value=bool(
+                self.app_config.get(
+                    "show_blend_in_preview",
+                    self.APP_DEFAULTS.get("show_blend_in_preview", True),
                 )
             )
         )
@@ -2230,15 +2393,23 @@ class MergingGUI(ThemedTk):
             self, param_frame, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 2
         )
         create_single_slider_with_label_updater(
-            self, param_frame, "Shadow Shift:", self.shadow_shift_var, 0, 50, 3
+            self,
+            param_frame,
+            "Shadow Length (px):",
+            self.shadow_length_px_var,
+            0,
+            100,
+            3,
+            decimals=0,
+            step_size=1.0,
         )
         create_single_slider_with_label_updater(
             self,
             param_frame,
-            "Shadow Gamma:",
-            self.shadow_decay_gamma_var,
-            0.1,
-            5.0,
+            "Shadow Curve (-1..1):",
+            self.shadow_curve_var,
+            -1.0,
+            1.0,
             4,
             decimals=2,
             step_size=0.01,
@@ -2246,36 +2417,36 @@ class MergingGUI(ThemedTk):
         create_single_slider_with_label_updater(
             self,
             param_frame,
-            "Shadow Opacity Start:",
-            self.shadow_start_opacity_var,
+            "Shadow Motion Gain:",
+            self.shadow_motion_gain_var,
             0.0,
-            1.0,
+            3.0,
             5,
             decimals=2,
             step_size=0.01,
         )
-        create_single_slider_with_label_updater(
-            self,
+
+        temporal_shadow_preview_check = ttk.Checkbutton(
             param_frame,
-            "Shadow Opacity Decay:",
-            self.shadow_opacity_decay_var,
-            0.0,
-            1.0,
-            6,
-            decimals=2,
-            step_size=0.01,
+            text=f"Temporal Shadow Preview ({self.PREVIEW_SHADOW_WARMUP_FRAMES}f)",
+            variable=self.preview_shadow_temporal_var,
+            command=lambda: self.on_slider_release(None),
         )
-        create_single_slider_with_label_updater(
-            self,
+        temporal_shadow_preview_check.grid(
+            row=6, column=0, columnspan=3, sticky="w", padx=5, pady=(8, 2)
+        )
+        self.widgets_to_disable.append(temporal_shadow_preview_check)
+
+        shadow_width_adaptive_check = ttk.Checkbutton(
             param_frame,
-            "Shadow Opacity Min:",
-            self.shadow_min_opacity_var,
-            0.0,
-            1.0,
-            7,
-            decimals=2,
-            step_size=0.01,
+            text="Dynamic shadow by mask width",
+            variable=self.shadow_width_adaptive_var,
+            command=lambda: self.on_slider_release(None),
         )
+        shadow_width_adaptive_check.grid(
+            row=7, column=0, columnspan=3, sticky="w", padx=5, pady=(2, 2)
+        )
+        self.widgets_to_disable.append(shadow_width_adaptive_check)
 
         
         # --- COLOR TRANSFER (PRESET-ONLY) PARAMETERS ---
@@ -2314,6 +2485,7 @@ class MergingGUI(ThemedTk):
             row=1, column=0, columnspan=4, sticky="ew", padx=0, pady=(0, 4)
         )
         ct_auto_row.grid_columnconfigure(1, weight=0)
+        ct_auto_row.grid_columnconfigure(2, weight=1)
 
         ttk.Label(ct_auto_row, text="Auto CT:").grid(
             row=0, column=0, sticky="e", padx=5, pady=2
@@ -2327,6 +2499,15 @@ class MergingGUI(ThemedTk):
         )
         ct_auto_mode_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
         self.widgets_to_disable.append(ct_auto_mode_combo)
+
+        show_blend_preview_check = ttk.Checkbutton(
+            ct_auto_row,
+            text="Show blend in preview",
+            variable=self.show_blend_in_preview_var,
+            command=lambda: self.on_slider_release(None),
+        )
+        show_blend_preview_check.grid(row=0, column=2, sticky="w", padx=(12, 5), pady=2)
+        self.widgets_to_disable.append(show_blend_preview_check)
 
         ct_excl = ttk.Checkbutton(
             ct_frame,
@@ -2397,6 +2578,7 @@ class MergingGUI(ThemedTk):
             self.ct_auto_mode_var,
             self.ct_csv_blend_path_var,
             self.ct_exclude_black_in_target_var,
+            self.show_blend_in_preview_var,
         ):
             try:
                 if _v is self.ct_preset_var:
@@ -2498,7 +2680,14 @@ class MergingGUI(ThemedTk):
         self.widgets_to_disable.append(pad_check)
 
         # Add Borders
-        self.add_borders_var = tk.BooleanVar(value=True)
+        self.add_borders_var = tk.BooleanVar(
+            value=bool(
+                self.app_config.get(
+                    "add_borders",
+                    self.APP_DEFAULTS.get("add_borders", False),
+                )
+            )
+        )
         self.add_borders_var.trace_add("write", self._on_add_borders_changed)
         borders_check = ttk.Checkbutton(
             options_frame, text="Borders", variable=self.add_borders_var
@@ -2690,7 +2879,7 @@ class MergingGUI(ThemedTk):
                 self._ct_csv_blend_cache = {}
         return dict(self._ct_csv_blend_cache)
 
-    def _on_auto_ct_eval_toggle(self):
+    def _on_auto_ct_eval_toggle(self, *args):
         mode = _resolve_ct_auto_mode_label(self.ct_auto_mode_var.get())
         if self.ct_auto_mode_var.get() != mode:
             self.ct_auto_mode_var.set(mode)
@@ -3001,6 +3190,7 @@ class MergingGUI(ThemedTk):
                 "ct_preset": selected_preset_label,
                 "ct_auto_mode": selected_auto_mode,
                 "ct_csv_blend_path": str(self.ct_csv_blend_path_var.get() or "").strip(),
+                "show_blend_in_preview": bool(self.show_blend_in_preview_var.get()),
                 # Legacy key kept for backward compatibility with old configs/scripts.
                 "auto_ct_eval": bool(selected_auto_mode == CT_AUTO_MODE_ON),
                 "ct_strength": float(self.ct_strength_var.get()),
@@ -3023,11 +3213,14 @@ class MergingGUI(ThemedTk):
                 ),
                 "mask_dilate_kernel_size": int(self.mask_dilate_kernel_size_var.get()),
                 "mask_blur_kernel_size": int(self.mask_blur_kernel_size_var.get()),
-                "shadow_shift": int(self.shadow_shift_var.get()),
-                "shadow_start_opacity": float(self.shadow_start_opacity_var.get()),
-                "shadow_opacity_decay": float(self.shadow_opacity_decay_var.get()),
-                "shadow_min_opacity": float(self.shadow_min_opacity_var.get()),
-                "shadow_decay_gamma": float(self.shadow_decay_gamma_var.get()),
+                "shadow_length_px": int(self.shadow_length_px_var.get()),
+                "shadow_width_adaptive": bool(self.shadow_width_adaptive_var.get()),
+                "shadow_curve": float(self.shadow_curve_var.get()),
+                "shadow_motion_gain": float(self.shadow_motion_gain_var.get()),
+                "preview_shadow_temporal": bool(self.preview_shadow_temporal_var.get()),
+                "preview_shadow_warmup_frames": int(
+                    self.PREVIEW_SHADOW_WARMUP_FRAMES
+                ),
             }
             return settings
         except (ValueError, TypeError) as e:
@@ -3423,6 +3616,7 @@ class MergingGUI(ThemedTk):
                             f"CSV Blend Auto CT: {base_name} loaded {applied_rows} frame presets "
                             f"(lookup='{csv_blend_lookup_key}')."
                         )
+                shadow_state: Dict[str, Any] = {"prev_components": []}
                 for frame_start in range(0, num_frames, chunk_size):
                     if self.stop_event.is_set():
                         break
@@ -3675,15 +3869,20 @@ class MergingGUI(ThemedTk):
                             processed_mask, settings["mask_blur_kernel_size"], use_gpu
                         )
 
-                    if settings["shadow_shift"] > 0:
+                    if int(settings.get("shadow_length_px", 0)) > 0:
                         processed_mask = apply_shadow_blur(
                             processed_mask,
-                            settings["shadow_shift"],
-                            settings["shadow_start_opacity"],
-                            settings["shadow_opacity_decay"],
-                            settings["shadow_min_opacity"],
-                            settings["shadow_decay_gamma"],
-                            use_gpu,
+                            base_length_px=int(settings.get("shadow_length_px", 0)),
+                            curve=float(settings.get("shadow_curve", 0.0)),
+                            motion_gain=float(settings.get("shadow_motion_gain", 0.0)),
+                            width_adaptive=bool(
+                                settings.get("shadow_width_adaptive", True)
+                            ),
+                            use_gpu=use_gpu,
+                            state=shadow_state,
+                            border_tolerance_px=2,
+                            width_ref_px=20.0,
+                            width_power=1.0,
                         )
 
                     blended_right_eye = (
@@ -4223,19 +4422,59 @@ class MergingGUI(ThemedTk):
                 preview_options.append("Depth Map")
             self.previewer.set_preview_source_options(preview_options)
 
+            def _gray_mask_from_tensor(frame_tensor: torch.Tensor) -> torch.Tensor:
+                frame_np = frame_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                gray_np = np.mean(frame_np[..., :3], axis=2) if frame_np.ndim == 3 else frame_np
+                if gray_np.size > 0 and float(np.nanmax(gray_np)) > 1.5:
+                    gray_np = gray_np / 255.0
+                gray_np = np.clip(gray_np, 0.0, 1.0)
+                return torch.from_numpy(gray_np).float().unsqueeze(0).unsqueeze(0)
+
+            def _mask_from_splatted_tensor(sp_tensor: torch.Tensor) -> torch.Tensor:
+                _h = int(sp_tensor.shape[2])
+                _w = int(sp_tensor.shape[3])
+                if is_quad_input:
+                    _half_h, _half_w = _h // 2, _w // 2
+                    _mask_raw = sp_tensor[:, :, _half_h:, :_half_w]
+                else:
+                    _half_w = _w // 2
+                    _mask_raw = sp_tensor[:, :, :, :_half_w]
+                return _gray_mask_from_tensor(_mask_raw)
+
+            def _load_mask_for_preview_frame(frame_idx: int) -> Optional[torch.Tensor]:
+                readers = getattr(self.previewer, "source_readers", {}) or {}
+                if params.get("use_replace_mask", False):
+                    rm_reader = readers.get("replace_mask")
+                    if rm_reader is not None:
+                        try:
+                            rm_np = rm_reader.get_batch([int(frame_idx)]).asnumpy()
+                            rm_tensor = (
+                                torch.from_numpy(rm_np).permute(0, 3, 1, 2).float() / 255.0
+                            )
+                            return _gray_mask_from_tensor(rm_tensor)
+                        except Exception as e_rm:
+                            logger.debug(
+                                f"Preview temporal shadow: replace_mask read failed at frame {frame_idx}: {e_rm}"
+                            )
+                sp_reader = readers.get("splatted")
+                if sp_reader is None:
+                    return None
+                try:
+                    sp_np = sp_reader.get_batch([int(frame_idx)]).asnumpy()
+                    sp_tensor = torch.from_numpy(sp_np).permute(0, 3, 1, 2).float() / 255.0
+                    return _mask_from_splatted_tensor(sp_tensor)
+                except Exception as e_sp:
+                    logger.debug(
+                        f"Preview temporal shadow: splatted read failed at frame {frame_idx}: {e_sp}"
+                    )
+                    return None
+
             # Convert mask to grayscale (optionally using an external replace-mask video)
             replace_mask_tensor = source_frames.get("replace_mask")
             if params.get("use_replace_mask", False) and replace_mask_tensor is not None:
-                rm_np = replace_mask_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-                rm_gray = np.mean(rm_np[..., :3], axis=2) if rm_np.ndim == 3 else rm_np
-                # Normalize if needed (VideoPreviewer typically provides 0..1 floats)
-                if rm_gray.max() > 1.5:
-                    rm_gray = rm_gray / 255.0
-                mask = torch.from_numpy(rm_gray).float().unsqueeze(0).unsqueeze(0)
+                mask = _gray_mask_from_tensor(replace_mask_tensor)
             else:
-                mask_frame_np = mask_raw.squeeze(0).permute(1, 2, 0).cpu().numpy()
-                mask_gray_np = np.mean(mask_frame_np, axis=2)
-                mask = torch.from_numpy(mask_gray_np).float().unsqueeze(0).unsqueeze(0)
+                mask = _gray_mask_from_tensor(mask_raw)
 
             # 3. Process the frames
             # Define the processing device based on the 'use_gpu' parameter
@@ -4263,30 +4502,134 @@ class MergingGUI(ThemedTk):
                     mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False
                 )
 
-            # --- Process the mask (using a simplified chain from test.py) ---
-            processed_mask = mask.clone()  # No need to unsqueeze, it's already 4D
-            if params.get("mask_binarize_threshold", -1.0) >= 0.0:
-                processed_mask = (
-                    processed_mask > params["mask_binarize_threshold"]
-                ).float()
-            if params.get("mask_dilate_kernel_size", 0) > 0:
-                processed_mask = apply_mask_dilation(
-                    processed_mask, int(params["mask_dilate_kernel_size"]), use_gpu
-                )
-            if params.get("mask_blur_kernel_size", 0) > 0:
-                processed_mask = apply_gaussian_blur(
-                    processed_mask, int(params["mask_blur_kernel_size"]), use_gpu
-                )
-            if params.get("shadow_shift", 0) > 0:
-                processed_mask = apply_shadow_blur(
-                    processed_mask,
-                    params["shadow_shift"],
-                    params["shadow_start_opacity"],
-                    params["shadow_opacity_decay"],
-                    params["shadow_min_opacity"],
-                    params["shadow_decay_gamma"],
-                    use_gpu,
-                )
+            def _preprocess_mask_for_shadow(mask_in: torch.Tensor) -> torch.Tensor:
+                proc = mask_in.clone()
+                if params.get("mask_binarize_threshold", -1.0) >= 0.0:
+                    proc = (proc > params["mask_binarize_threshold"]).float()
+                if params.get("mask_dilate_kernel_size", 0) > 0:
+                    proc = apply_mask_dilation(
+                        proc, int(params["mask_dilate_kernel_size"]), use_gpu
+                    )
+                if params.get("mask_blur_kernel_size", 0) > 0:
+                    proc = apply_gaussian_blur(
+                        proc, int(params["mask_blur_kernel_size"]), use_gpu
+                    )
+                return proc
+
+            processed_mask = _preprocess_mask_for_shadow(mask)
+            current_pre_shadow_mask = processed_mask
+            shadow_len_px = int(params.get("shadow_length_px", 0))
+            use_temporal_shadow_preview = bool(
+                params.get("preview_shadow_temporal", False)
+            )
+            warmup_frames = int(params.get("preview_shadow_warmup_frames", 20))
+            shadow_motion_gain = float(params.get("shadow_motion_gain", 0.0))
+
+            if shadow_len_px > 0:
+                if use_temporal_shadow_preview and shadow_motion_gain > 0.0 and warmup_frames > 0:
+                    preview_frame_idx = int(self.previewer.frame_scrubber_var.get())
+                    source_key = str(current_source_metadata.get("inpainted", "") or "")
+                    shadow_cache_key = (
+                        source_key,
+                        bool(params.get("use_replace_mask", False)),
+                        float(params.get("mask_binarize_threshold", -1.0)),
+                        int(params.get("mask_dilate_kernel_size", 0)),
+                        int(params.get("mask_blur_kernel_size", 0)),
+                        int(shadow_len_px),
+                        float(params.get("shadow_curve", 0.0)),
+                        float(shadow_motion_gain),
+                        bool(params.get("shadow_width_adaptive", True)),
+                        int(warmup_frames),
+                        int(hires_H),
+                        int(hires_W),
+                    )
+
+                    cache = self._preview_shadow_temporal_cache
+                    can_step_forward = (
+                        cache is not None
+                        and cache.get("key") == shadow_cache_key
+                        and int(cache.get("frame_idx", -999999)) + 1 == int(preview_frame_idx)
+                        and isinstance(cache.get("state"), dict)
+                    )
+
+                    if can_step_forward:
+                        # Fast path for sequential frame navigation: re-use previous temporal state.
+                        shadow_state = cache["state"]
+                        processed_mask = apply_shadow_blur(
+                            current_pre_shadow_mask,
+                            base_length_px=shadow_len_px,
+                            curve=float(params.get("shadow_curve", 0.0)),
+                            motion_gain=shadow_motion_gain,
+                            width_adaptive=bool(
+                                params.get("shadow_width_adaptive", True)
+                            ),
+                            use_gpu=use_gpu,
+                            state=shadow_state,
+                            border_tolerance_px=2,
+                            width_ref_px=20.0,
+                            width_power=1.0,
+                        )
+                    else:
+                        # Fallback: rebuild from a short warmup window so preview remains close to batch.
+                        warmup_start_idx = max(0, preview_frame_idx - warmup_frames)
+                        shadow_state = {"prev_components": []}
+                        for warmup_idx in range(warmup_start_idx, preview_frame_idx + 1):
+                            if warmup_idx == preview_frame_idx:
+                                warmup_mask = current_pre_shadow_mask
+                            else:
+                                warmup_raw_mask = _load_mask_for_preview_frame(warmup_idx)
+                                if warmup_raw_mask is None:
+                                    continue
+                                warmup_raw_mask = warmup_raw_mask.to(device)
+                                if (
+                                    warmup_raw_mask.shape[2] != hires_H
+                                    or warmup_raw_mask.shape[3] != hires_W
+                                ):
+                                    warmup_raw_mask = F.interpolate(
+                                        warmup_raw_mask,
+                                        size=(hires_H, hires_W),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    )
+                                warmup_mask = _preprocess_mask_for_shadow(warmup_raw_mask)
+                            processed_mask = apply_shadow_blur(
+                                warmup_mask,
+                                base_length_px=shadow_len_px,
+                                curve=float(params.get("shadow_curve", 0.0)),
+                                motion_gain=shadow_motion_gain,
+                                width_adaptive=bool(
+                                    params.get("shadow_width_adaptive", True)
+                                ),
+                                use_gpu=use_gpu,
+                                state=shadow_state,
+                                border_tolerance_px=2,
+                                width_ref_px=20.0,
+                                width_power=1.0,
+                            )
+
+                    self._preview_shadow_temporal_cache = {
+                        "key": shadow_cache_key,
+                        "frame_idx": int(preview_frame_idx),
+                        "state": shadow_state,
+                    }
+                else:
+                    self._preview_shadow_temporal_cache = None
+                    processed_mask = apply_shadow_blur(
+                        processed_mask,
+                        base_length_px=shadow_len_px,
+                        curve=float(params.get("shadow_curve", 0.0)),
+                        motion_gain=shadow_motion_gain,
+                        width_adaptive=bool(
+                            params.get("shadow_width_adaptive", True)
+                        ),
+                        use_gpu=use_gpu,
+                        state=None,  # Fast stateless preview path.
+                        border_tolerance_px=2,
+                        width_ref_px=20.0,
+                            width_power=1.0,
+                    )
+            else:
+                self._preview_shadow_temporal_cache = None
             processed_mask = processed_mask.squeeze(0)  # Remove batch dim
 
             if params.get("enable_color_transfer", False) and original_left is not None:
@@ -4296,6 +4639,7 @@ class MergingGUI(ThemedTk):
                 selected_preset = CT_PRESET_BY_LABEL[selected_label]
                 ct_auto_mode = _resolve_ct_auto_mode_from_settings(params)
                 csv_blend_weights_for_frame: Dict[int, float] = {}
+                csv_detected_preset_for_frame = int(selected_preset["id"])
                 if ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
                     csv_blend_path = str(params.get("ct_csv_blend_path", "") or "").strip()
                     csv_blend_map = (
@@ -4329,6 +4673,10 @@ class MergingGUI(ThemedTk):
                         pid = int(preset_i)
                         if 0 <= fi < seq_len and pid in CT_PRESET_BY_ID:
                             csv_target_ids[fi] = pid
+                    if 0 <= preview_frame_idx < len(csv_target_ids):
+                        csv_detected_preset_for_frame = int(
+                            csv_target_ids[preview_frame_idx]
+                        )
                     csv_blend_weights_by_frame, _csv_osc_flags = _build_csv_blend_weights_by_frame(
                         csv_target_ids
                     )
@@ -4373,11 +4721,30 @@ class MergingGUI(ThemedTk):
                     self.auto_ct_best_var.set(f"Auto CT best: #{best_preset_id} (preview)")
                 else:
                     if ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
+                        show_blend_preview = bool(
+                            params.get("show_blend_in_preview", True)
+                        )
+                        weights_sorted = sorted(
+                            csv_blend_weights_for_frame.items(),
+                            key=lambda kv: kv[1],
+                            reverse=True,
+                        )
+                        if weights_sorted:
+                            main_pid = int(weights_sorted[0][0])
+                            main_pct = float(weights_sorted[0][1]) * 100.0
+                        else:
+                            main_pid = int(selected_preset["id"])
+                            main_pct = 100.0
+                        apply_weights = (
+                            dict(csv_blend_weights_for_frame)
+                            if show_blend_preview
+                            else {int(csv_detected_preset_for_frame): 1.0}
+                        )
                         stats_valid_cache: Dict[str, torch.Tensor] = {}
                         warped_ref_cache: Dict[str, torch.Tensor] = {}
                         out_mix: Optional[torch.Tensor] = None
                         for pid_i, weight_i in sorted(
-                            csv_blend_weights_for_frame.items(),
+                            apply_weights.items(),
                             key=lambda kv: kv[1],
                             reverse=True,
                         ):
@@ -4418,14 +4785,17 @@ class MergingGUI(ThemedTk):
                         blend_txt = ", ".join(
                             [
                                 f"#{int(pid)}:{(100.0 * float(w)):.0f}%"
-                                for pid, w in sorted(
-                                    csv_blend_weights_for_frame.items(),
-                                    key=lambda kv: kv[1],
-                                    reverse=True,
-                                )[:3]
+                                for pid, w in weights_sorted[:4]
                             ]
-                        )
-                        self.auto_ct_best_var.set(f"Auto CT CSV Blend: {blend_txt} (preview)")
+                        ) or f"#{main_pid}:100%"
+                        if show_blend_preview:
+                            self.auto_ct_best_var.set(
+                                f"Auto CT CSV preview BLEND | main=#{main_pid} ({main_pct:.0f}%) | detected=#{int(csv_detected_preset_for_frame)} | {blend_txt}"
+                            )
+                        else:
+                            self.auto_ct_best_var.set(
+                                f"Auto CT CSV preview DETECTED | #{int(csv_detected_preset_for_frame)} (blend off) | planned {blend_txt}"
+                            )
                     else:
                         selected_id_for_frame = int(selected_preset["id"])
                         selected_preset_for_frame = selected_preset
@@ -4755,15 +5125,20 @@ class MergingGUI(ThemedTk):
 
 
 if __name__ == "__main__":
-    debug_enabled = _env_flag("MERGE_DEBUG", False)
+    debug_enabled = _env_flag("MERGE_DEBUG", True)
+    # By default, faulthandler follows debug mode. You can still override explicitly:
+    # MERGE_FAULTHANDLER=1 to force ON, MERGE_FAULTHANDLER=0 to force OFF.
+    faulthandler_enabled = _env_flag("MERGE_FAULTHANDLER", debug_enabled)
     # Basic logging setup
     logging.basicConfig(
         level=logging.DEBUG if debug_enabled else logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%H:%M:%S",
     )
-    if debug_enabled:
+    if faulthandler_enabled:
         _enable_debug_faulthandler()
+        logger.info("Faulthandler enabled (set MERGE_FAULTHANDLER=0 to disable).")
+    if debug_enabled:
         logger.info("Debug mode enabled (MERGE_DEBUG=1).")
     app = MergingGUI()
     app.mainloop()

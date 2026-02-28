@@ -28,7 +28,8 @@ REPLACE_MASK_FOLDER="./work/mask/fixed/"
 
 # Behavior toggles (non-path)
 CT_PRESET="${CT_PRESET:-1}"               # 1..8 or full preset label
-AUTO_CT_EVAL="${AUTO_CT_EVAL:-1}"         # 1=enable per-frame auto preset evaluation
+CT_AUTO_MODE="${CT_AUTO_MODE:-On}"        # Off | On | CSV Blend
+CT_CSV_BLEND_PATH="./autoct.csv"
 ENABLE_COLOR_TRANSFER="${ENABLE_COLOR_TRANSFER:-1}"  # 1=on,0=off
 ADD_BORDERS="${ADD_BORDERS:-0}"           # 1=apply sidecar borders, 0=disable
 MERGE_DEBUG="${MERGE_DEBUG:-0}"           # 1=enable Python debug mode/logging
@@ -44,7 +45,7 @@ RETRY_SLEEP_SEC="${RETRY_SLEEP_SEC:-2}"
 # 139 = segfault
 # 132 = illegal instruction
 # 134 = abort
-RETRY_CODES_DEFAULT="136 137 139 132 134"
+RETRY_CODES_DEFAULT="133 135 136 137 139 132 134"
 RETRY_CODES="${RETRY_CODES:-$RETRY_CODES_DEFAULT}"
 
 # Number of parallel worker processes (each handles a deterministic slice of files)
@@ -67,16 +68,15 @@ CMD=(
   --output-folder "$OUTPUT_FOLDER"
   --stop-marker "$STOP_MARKER"
   --ct-preset "$CT_PRESET"
+  --ct-auto-mode "$CT_AUTO_MODE"
 )
 
 # Replace-mask is optional; enable only if a non-empty folder is provided
 if [ -n "${REPLACE_MASK_FOLDER// }" ]; then
   CMD+=(--use-replace-mask --replace-mask-folder "$REPLACE_MASK_FOLDER")
 fi
-if [ "${AUTO_CT_EVAL}" = "1" ]; then
-  CMD+=(--auto-ct-eval)
-else
-  CMD+=(--no-auto-ct-eval)
+if [ "${CT_AUTO_MODE}" = "CSV Blend" ] && [ -n "${CT_CSV_BLEND_PATH// }" ]; then
+  CMD+=(--ct-csv-blend-path "$CT_CSV_BLEND_PATH")
 fi
 if [ "${ENABLE_COLOR_TRANSFER}" != "1" ]; then
   CMD+=(--no-color-transfer)

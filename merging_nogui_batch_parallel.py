@@ -15,6 +15,7 @@ Designed to be driven by an outer .sh that sets directories and adds extra crash
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import glob
 import logging
@@ -119,7 +120,8 @@ DEFAULTS: Dict[str, object] = {
     # Color transfer
     "enable_color_transfer": True,
     "ct_preset": "1) safe sr=ring ts=inpainted ref=warped",
-    "auto_ct_eval": True,
+    "ct_auto_mode": "On",
+    "ct_csv_blend_path": "",
     "ct_strength": 1.0,
     "ct_black_thresh": 0.0,
     "ct_min_valid_ratio": 0.0,
@@ -140,11 +142,10 @@ DEFAULTS: Dict[str, object] = {
     "mask_blur_kernel_size": 4,
 
     # Shadow (soft edge) post-processing
-    "shadow_shift": 1,
-    "shadow_start_opacity": 1.0,
-    "shadow_opacity_decay": 0.05,
-    "shadow_min_opacity": 0.0,
-    "shadow_decay_gamma": 1.0,
+    "shadow_length_px": 30,
+    "shadow_width_adaptive": True,
+    "shadow_curve": 0.0,
+    "shadow_motion_gain": 1.0,
 
     # Robustness / workflow
     "retries": 1,
@@ -532,6 +533,222 @@ CT_PRESET_DEFAULT_LABEL = CT_PRESET_LABELS[0]
 # Auto-eval order optimized to reuse caches (stats/ref) across adjacent presets.
 CT_PRESET_AUTO_EVAL_ORDER = [1, 2, 8, 4, 5, 6, 3, 7]
 CT_AUTO_EVAL_MAX_WORKERS = 3
+CT_AUTO_MODE_OFF = "Off"
+CT_AUTO_MODE_ON = "On"
+CT_AUTO_MODE_CSV_BLEND = "CSV Blend"
+CT_AUTO_MODE_OPTIONS = [CT_AUTO_MODE_OFF, CT_AUTO_MODE_ON, CT_AUTO_MODE_CSV_BLEND]
+CT_CSV_BLEND_TRANSITION_ALPHAS = [0.24, 0.40, 0.60, 0.80]
+CT_CSV_BLEND_OSC_ALPHA = 0.80
+CT_CSV_BLEND_OSC_WINDOW = 6
+CT_CSV_BLEND_MAX_ACTIVE_PRESETS = 4
+CT_CSV_BLEND_PRUNE_EPS = 1e-3
+
+
+def _resolve_ct_auto_mode_label(value: Any) -> str:
+    raw = str(value or "").strip()
+    if raw in CT_AUTO_MODE_OPTIONS:
+        return raw
+    low = raw.lower()
+    if low in {"off", "false", "0", "disabled", "manual"}:
+        return CT_AUTO_MODE_OFF
+    if low in {"on", "true", "1", "auto", "auto_eval"}:
+        return CT_AUTO_MODE_ON
+    if low in {"csv", "csv_blend", "csv-blend", "csv blend"}:
+        return CT_AUTO_MODE_CSV_BLEND
+    return CT_AUTO_MODE_ON
+
+
+def _resolve_ct_auto_mode_from_settings(settings: Dict[str, Any]) -> str:
+    if "ct_auto_mode" in settings:
+        return _resolve_ct_auto_mode_label(settings.get("ct_auto_mode"))
+    return CT_AUTO_MODE_ON
+
+
+def _normalize_csv_blend_lookup_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    base = os.path.basename(text)
+    stem, _ext = os.path.splitext(base)
+    return stem if stem else base
+
+
+def _load_csv_blend_preset_map(csv_path: str) -> Dict[str, Dict[int, int]]:
+    preset_by_key: Dict[str, Dict[int, int]] = {}
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if not row:
+                continue
+            frame_raw = row.get("frame") or row.get("frame_idx") or row.get("frame_index") or ""
+            preset_raw = row.get("best_preset") or row.get("winner_preset") or row.get("preset") or ""
+            try:
+                frame_idx = int(float(str(frame_raw).strip()))
+                preset_id = int(float(str(preset_raw).strip()))
+            except Exception:
+                continue
+            if frame_idx < 0 or preset_id not in CT_PRESET_BY_ID:
+                continue
+            status = str(row.get("status", "") or "").strip().lower()
+            if status and status not in {"ok", "done", "complete"}:
+                continue
+
+            keys: List[str] = []
+            for col in ("video", "inpainted", "filename", "clip", "core_with_width", "core_name"):
+                v = str(row.get(col, "") or "").strip()
+                if v:
+                    keys.append(v)
+
+            for key in keys:
+                norm = _normalize_csv_blend_lookup_key(key)
+                if norm:
+                    preset_by_key.setdefault(norm, {})[frame_idx] = preset_id
+                base = os.path.basename(key)
+                stem, _ext = os.path.splitext(base)
+                for alias in (base, stem):
+                    anorm = _normalize_csv_blend_lookup_key(alias)
+                    if anorm:
+                        preset_by_key.setdefault(anorm, {})[frame_idx] = preset_id
+                if base.endswith("_inpainted_right_eye.mp4") or base.endswith("_inpainted_sbs.mp4"):
+                    core_with_width, _is_sbs = parse_inpainted_name(base)
+                    core_name, _w = parse_core_and_width(core_with_width)
+                    for alias in (core_with_width, core_name):
+                        anorm = _normalize_csv_blend_lookup_key(alias)
+                        if anorm:
+                            preset_by_key.setdefault(anorm, {})[frame_idx] = preset_id
+    return preset_by_key
+
+
+def _lookup_csv_blend_preset_rows(
+    preset_by_key: Dict[str, Dict[int, int]],
+    inpainted_path: str,
+    core_with_width: Optional[str],
+    core_name: Optional[str],
+) -> Tuple[Dict[int, int], str]:
+    candidates: List[str] = []
+    base_name = os.path.basename(str(inpainted_path or ""))
+    if base_name:
+        candidates.append(base_name)
+        candidates.append(os.path.splitext(base_name)[0])
+        if base_name.endswith("_inpainted_right_eye.mp4") or base_name.endswith("_inpainted_sbs.mp4"):
+            parsed_core_with_width, _ = parse_inpainted_name(base_name)
+            parsed_core_name, _w = parse_core_and_width(parsed_core_with_width)
+            candidates.extend([parsed_core_with_width, parsed_core_name])
+    if core_with_width:
+        candidates.append(core_with_width)
+    if core_name:
+        candidates.append(core_name)
+
+    best_map: Dict[int, int] = {}
+    best_key = ""
+    for key in candidates:
+        norm = _normalize_csv_blend_lookup_key(key)
+        if not norm:
+            continue
+        rows = preset_by_key.get(norm)
+        if rows and len(rows) > len(best_map):
+            best_map = rows
+            best_key = norm
+    return dict(best_map), best_key
+
+
+def _compute_preset_oscillator_flags(seq: List[int], min_len: int = 4) -> List[bool]:
+    flags = [False for _ in seq]
+    n = len(seq)
+    if n < max(4, int(min_len)):
+        return flags
+
+    i = 0
+    while i + 3 < n:
+        a = int(seq[i])
+        b = int(seq[i + 1])
+        if a == b:
+            i += 1
+            continue
+        if int(seq[i + 2]) != a or int(seq[i + 3]) != b:
+            i += 1
+            continue
+
+        j = i
+        while j < n:
+            expected = a if ((j - i) % 2 == 0) else b
+            if int(seq[j]) != expected:
+                break
+            j += 1
+        if (j - i) >= int(min_len):
+            for k in range(i, j):
+                flags[k] = True
+            i = j
+            continue
+        i += 1
+
+    return flags
+
+
+def _build_csv_blend_weights_by_frame(
+    target_preset_ids: List[int],
+    transition_alphas: Optional[List[float]] = None,
+    osc_alpha: float = CT_CSV_BLEND_OSC_ALPHA,
+    max_active_presets: int = CT_CSV_BLEND_MAX_ACTIVE_PRESETS,
+    prune_eps: float = CT_CSV_BLEND_PRUNE_EPS,
+) -> Tuple[List[Dict[int, float]], List[bool]]:
+    if transition_alphas is None or not transition_alphas:
+        transition_alphas = list(CT_CSV_BLEND_TRANSITION_ALPHAS)
+    if not target_preset_ids:
+        return [], []
+
+    out_weights: List[Dict[int, float]] = []
+    weights: Dict[int, float] = {}
+    run_pid: Optional[int] = None
+    run_len = 0
+    osc_flags = _compute_preset_oscillator_flags(target_preset_ids)
+
+    for idx, pid_raw in enumerate(target_preset_ids):
+        pid = int(pid_raw)
+        if pid not in CT_PRESET_BY_ID:
+            pid = int(CT_PRESET_AUTO_EVAL_ORDER[0])
+
+        if run_pid == pid:
+            run_len += 1
+        else:
+            run_pid = pid
+            run_len = 1
+
+        is_osc = bool(osc_flags[idx]) if idx < len(osc_flags) else False
+        if is_osc:
+            alpha = float(osc_alpha)
+        elif run_len <= len(transition_alphas):
+            alpha = float(transition_alphas[run_len - 1])
+        else:
+            alpha = 1.0
+        alpha = float(max(0.0, min(1.0, alpha)))
+
+        if not weights:
+            weights = {pid: 1.0}
+        elif alpha >= 0.999999:
+            weights = {pid: 1.0}
+        else:
+            for k in list(weights.keys()):
+                weights[k] = float(weights[k]) * (1.0 - alpha)
+            weights[pid] = float(weights.get(pid, 0.0)) + alpha
+
+        weights = {int(k): float(v) for k, v in weights.items() if float(v) > float(prune_eps)}
+        if not weights:
+            weights = {pid: 1.0}
+
+        if len(weights) > int(max_active_presets):
+            top_items = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)[
+                : int(max_active_presets)
+            ]
+            weights = {int(k): float(v) for k, v in top_items}
+
+        s = float(sum(weights.values()))
+        if s <= 0.0:
+            weights = {pid: 1.0}
+            s = 1.0
+        out_weights.append({int(k): float(v) / s for k, v in weights.items()})
+
+    return out_weights, osc_flags
 
 
 def _build_auto_ct_eval_groups(
@@ -928,120 +1145,250 @@ def _apply_ct_preset_frame(
     )
 
 
+def _shadow_curve_opacity(u: float, curve: float) -> float:
+    u = float(max(0.0, min(1.0, u)))
+    c = float(max(-1.0, min(1.0, curve)))
+    linear = 1.0 - u
+    if abs(c) <= 1e-6:
+        return linear
+    if c > 0.0:
+        # Positive: fuller at start, steeper tail near the end.
+        bulged = (1.0 - u) ** 0.5
+        return (1.0 - c) * linear + c * bulged
+    # Negative: faster drop at the beginning, softer tail.
+    t = -c
+    front_drop = (1.0 - u) ** 2.0
+    return (1.0 - t) * linear + t * front_drop
+
+
+def _bbox_intersection_area(
+    a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]
+) -> int:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    if ix2 < ix1 or iy2 < iy1:
+        return 0
+    return int((ix2 - ix1 + 1) * (iy2 - iy1 + 1))
+
+
 def apply_shadow_blur(
     mask: torch.Tensor,
-    shift_per_step: int,
-    start_opacity: float,
-    opacity_decay_per_step: float,
-    min_opacity: float,
-    decay_gamma: float = 1.0,
+    base_length_px: int,
+    curve: float,
+    motion_gain: float,
+    width_adaptive: bool = True,
     use_gpu: bool = True,
+    state: Optional[Dict[str, Any]] = None,
+    border_tolerance_px: int = 2,
+    width_ref_px: float = 20.0,
+    width_power: float = 1.0,
 ) -> torch.Tensor:
-    if shift_per_step <= 0:
-        return mask
-    if opacity_decay_per_step <= 1e-6:
-        return mask
-    num_steps = int((start_opacity - min_opacity) / opacity_decay_per_step) + 1
-    if num_steps <= 0:
+    if int(base_length_px) <= 0:
         return mask
 
-    # Row/run-aware direction:
-    # - default: propagate shadow to the RIGHT.
-    # - for runs touching RIGHT border (2px tolerance), propagate to the LEFT.
-    # This lets direction switch inside the same connected component when a row
-    # no longer touches the border.
-    border_tolerance_px = 2
-    border_cols = max(1, min(border_tolerance_px, mask.shape[-1]))
     component_thresh = 0.05
+    base_len = float(max(0.0, base_length_px))
+    curve = float(max(-1.0, min(1.0, curve)))
+    motion_gain = float(max(0.0, motion_gain))
+    width_adaptive = bool(width_adaptive)
+    width_ref_px = float(max(1.0, width_ref_px))
+    width_power = float(max(0.1, width_power))
+    border_tol = max(1, int(border_tolerance_px))
+    motion_deadzone_px = 3.0  # Ignore micro-jitter up to this displacement.
+    motion_ref_px = 6.0  # Additional px/frame (beyond deadzone) for full motion gain.
 
-    stamp_source_right = torch.zeros_like(mask)
-    stamp_source_left = torch.zeros_like(mask)
-    mask_cpu = mask.detach().to(device="cpu")
-    height = int(mask_cpu.shape[2])
-    width = int(mask_cpu.shape[3])
-    right_touch_start = width - border_cols
+    alpha_up = 0.45
+    alpha_down = 0.20
+    max_delta_up = max(1.0, 0.35 * base_len)
+    max_delta_down = max(1.0, 0.20 * base_len)
+    max_len_cap = int(max(100, 4 * base_len))
 
-    for t in range(mask_cpu.shape[0]):
-        frame = mask_cpu[t, 0]
-        frame_bin = frame > component_thresh
-        if not bool(frame_bin.any().item()):
-            continue
+    mask_cpu = mask.detach().to(device="cpu", dtype=torch.float32).numpy()  # T,1,H,W
+    t_count, _c, height, width = mask_cpu.shape
+    right_touch_start = width - border_tol
 
-        frame_right = torch.zeros_like(frame)
-        frame_left = torch.zeros_like(frame)
+    prev_components: List[Dict[str, Any]] = []
+    if state is not None:
+        prev_components = list(state.get("prev_components", []) or [])
 
-        # Process each row independently so direction can switch within a component.
-        for y in range(height):
-            xs = torch.where(frame_bin[y])[0]
-            n = int(xs.numel())
-            if n == 0:
-                continue
-            run_start = int(xs[0].item())
-            prev = run_start
-            for idx in range(1, n):
-                cur = int(xs[idx].item())
-                if cur != prev + 1:
-                    a, b = run_start, prev
-                    touches_left = a < border_cols
-                    touches_right = b >= right_touch_start
-                    if touches_right and not touches_left:
-                        frame_left[y, a : b + 1] = frame[y, a : b + 1]
+    out_frames: List[torch.Tensor] = []
+
+    for t in range(t_count):
+        frame = np.asarray(mask_cpu[t, 0], dtype=np.float32)
+        frame_bin = (frame > component_thresh).astype(np.uint8)
+        canvas = frame.copy()
+
+        if frame_bin.any():
+            n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                frame_bin, connectivity=8
+            )
+
+            curr_components: List[Dict[str, Any]] = []
+            comp_len_by_label: Dict[int, float] = {}
+
+            for lab in range(1, int(n_labels)):
+                x = int(stats[lab, cv2.CC_STAT_LEFT])
+                y = int(stats[lab, cv2.CC_STAT_TOP])
+                w = int(stats[lab, cv2.CC_STAT_WIDTH])
+                h = int(stats[lab, cv2.CC_STAT_HEIGHT])
+                area = int(stats[lab, cv2.CC_STAT_AREA])
+                if area <= 0 or w <= 0 or h <= 0:
+                    continue
+                bbox = (x, y, x + w - 1, y + h - 1)
+                cx = float(centroids[lab][0])
+                cy = float(centroids[lab][1])
+
+                matches: List[Tuple[float, Dict[str, Any]]] = []
+                for prev in prev_components:
+                    inter = _bbox_intersection_area(bbox, prev["bbox"])
+                    if inter > 0:
+                        matches.append((float(inter), prev))
+
+                if not matches and prev_components:
+                    # Fallback nearest match for mild displacements without overlap.
+                    best_prev = None
+                    best_d = 1e9
+                    max_dist = max(8.0, 0.5 * np.sqrt(float(area)))
+                    for prev in prev_components:
+                        dx = float(cx - prev["centroid"][0])
+                        dy = float(cy - prev["centroid"][1])
+                        d = float(np.hypot(dx, dy))
+                        if d < best_d and d <= max_dist:
+                            best_d = d
+                            best_prev = prev
+                    if best_prev is not None:
+                        matches.append((1.0, best_prev))
+
+                if matches:
+                    wsum = float(sum(mw for mw, _ in matches))
+                    prev_len = float(
+                        sum(mw * float(m["len_smooth"]) for mw, m in matches)
+                        / max(1e-6, wsum)
+                    )
+                    motion_px = float(
+                        sum(
+                            mw
+                            * float(
+                                np.hypot(
+                                    cx - float(m["centroid"][0]),
+                                    cy - float(m["centroid"][1]),
+                                )
+                            )
+                            for mw, m in matches
+                        )
+                        / max(1e-6, wsum)
+                    )
+                else:
+                    prev_len = float(base_len)
+                    motion_px = 0.0
+
+                motion_eff_px = max(0.0, motion_px - motion_deadzone_px)
+                motion_mult = 1.0 + motion_gain * min(1.0, motion_eff_px / motion_ref_px)
+                target_len = float(base_len) * motion_mult
+                target_len = float(max(0.0, min(float(max_len_cap), target_len)))
+
+                if target_len >= prev_len:
+                    alpha = alpha_up
+                    max_delta = max_delta_up
+                else:
+                    alpha = alpha_down
+                    max_delta = max_delta_down
+                smoothed = prev_len + alpha * (target_len - prev_len)
+                delta = float(smoothed - prev_len)
+                delta = float(max(-max_delta, min(max_delta, delta)))
+                len_smooth = float(max(0.0, min(float(max_len_cap), prev_len + delta)))
+
+                curr_components.append(
+                    {
+                        "label": int(lab),
+                        "bbox": bbox,
+                        "centroid": (cx, cy),
+                        "area": area,
+                        "len_smooth": len_smooth,
+                    }
+                )
+                comp_len_by_label[int(lab)] = len_smooth
+
+            # Row/run-aware dynamic shadow length + right-border inversion.
+            for y in range(height):
+                row_bin = frame_bin[y]
+                x = 0
+                while x < width:
+                    if row_bin[x] == 0:
+                        x += 1
+                        continue
+                    run_start = x
+                    while x + 1 < width and row_bin[x + 1] != 0:
+                        x += 1
+                    run_end = x
+                    x += 1
+
+                    run_vals = frame[y, run_start : run_end + 1]
+                    if run_vals.size <= 0:
+                        continue
+
+                    run_labels = labels[y, run_start : run_end + 1]
+                    lab_vals = run_labels[run_labels > 0]
+                    if lab_vals.size > 0:
+                        lab = int(np.bincount(lab_vals).argmax())
                     else:
-                        frame_right[y, a : b + 1] = frame[y, a : b + 1]
-                    run_start = cur
-                prev = cur
-            a, b = run_start, prev
-            touches_left = a < border_cols
-            touches_right = b >= right_touch_start
-            if touches_right and not touches_left:
-                frame_left[y, a : b + 1] = frame[y, a : b + 1]
-            else:
-                frame_right[y, a : b + 1] = frame[y, a : b + 1]
+                        lab = 0
 
-        stamp_source_right[t, 0] = frame_right
-        stamp_source_left[t, 0] = frame_left
+                    comp_len = float(comp_len_by_label.get(lab, base_len))
+                    run_w = int(run_end - run_start + 1)
+                    width_mult = (
+                        float((max(1.0, float(run_w)) / width_ref_px) ** width_power)
+                        if width_adaptive
+                        else 1.0
+                    )
+                    run_len = int(round(comp_len * width_mult))
+                    run_len = int(max(0, min(max_len_cap, run_len)))
+                    if run_len <= 0:
+                        continue
 
-    stamp_source_right = stamp_source_right.to(device=mask.device, dtype=mask.dtype)
-    stamp_source_left = stamp_source_left.to(device=mask.device, dtype=mask.dtype)
+                    touches_left = run_start < border_tol
+                    touches_right = run_end >= right_touch_start
+                    dir_left = bool(touches_right and not touches_left)
 
-    if use_gpu:
-        canvas = mask.clone()
-        for i in range(num_steps):
-            t = 1.0 - (i / (num_steps - 1)) if num_steps > 1 else 1.0
-            curved = t ** decay_gamma
-            cur_op = min_opacity + (start_opacity - min_opacity) * curved
-            total_shift = (i + 1) * shift_per_step
+                    for s in range(1, run_len + 1):
+                        opacity = float(_shadow_curve_opacity(float(s) / float(run_len), curve))
+                        if opacity <= 0.0:
+                            continue
+                        if dir_left:
+                            dst_a = int(run_start - s)
+                            dst_b = int(run_end - s)
+                        else:
+                            dst_a = int(run_start + s)
+                            dst_b = int(run_end + s)
 
-            padded_right = F.pad(stamp_source_right, (total_shift, 0), "constant", 0)
-            shifted_right = padded_right[:, :, :, :-total_shift]
-            padded_left = F.pad(stamp_source_left, (0, total_shift), "constant", 0)
-            shifted_left = padded_left[:, :, :, total_shift:]
+                        clip_a = max(0, dst_a)
+                        clip_b = min(width - 1, dst_b)
+                        if clip_b < clip_a:
+                            continue
+                        src_start = int(clip_a - dst_a)
+                        src_end = int(src_start + (clip_b - clip_a + 1))
+                        src_slice = run_vals[src_start:src_end]
+                        if src_slice.size <= 0:
+                            continue
+                        dst_slice = canvas[y, clip_a : clip_b + 1]
+                        src_vals = src_slice * opacity
+                        # Avoid np.maximum in-place on overlapping views: observed to
+                        # trigger sporadic native crashes (SIGSEGV/SIGILL) on long runs.
+                        mask_gt = src_vals > dst_slice
+                        dst_slice[mask_gt] = src_vals[mask_gt]
 
-            shifted = torch.max(shifted_right, shifted_left)
-            canvas = torch.max(canvas, shifted * cur_op)
-        return canvas
+            prev_components = curr_components
 
-    out = []
-    for t in range(mask.shape[0]):
-        canvas_np = mask[t].squeeze(0).cpu().numpy()
-        stamp_source_right_np = stamp_source_right[t].squeeze(0).cpu().numpy()
-        stamp_source_left_np = stamp_source_left[t].squeeze(0).cpu().numpy()
-        for i in range(num_steps):
-            time_step = 1.0 - (i / (num_steps - 1)) if num_steps > 1 else 1.0
-            curved_t = time_step ** decay_gamma
-            cur_op = min_opacity + (start_opacity - min_opacity) * curved_t
-            total_shift = (i + 1) * shift_per_step
+        out_frames.append(torch.from_numpy(canvas).unsqueeze(0))
 
-            shifted_r = np.zeros_like(stamp_source_right_np)
-            shifted_l = np.zeros_like(stamp_source_left_np)
-            if total_shift < shifted_r.shape[1]:
-                shifted_r[:, total_shift:] = stamp_source_right_np[:, :-total_shift]
-                shifted_l[:, :-total_shift] = stamp_source_left_np[:, total_shift:]
+    if state is not None:
+        state["prev_components"] = prev_components
 
-            shifted = np.maximum(shifted_r, shifted_l)
-            canvas_np = np.maximum(canvas_np, shifted * cur_op)
-        out.append(torch.from_numpy(canvas_np).unsqueeze(0))
-    return torch.stack(out).to(mask.device)
+    return torch.stack(out_frames).to(device=mask.device, dtype=mask.dtype)
 
     
 def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
@@ -1731,10 +2078,24 @@ def process_one_job(
     chunk_size = int(settings.get("batch_chunk_size", 32))
     device = torch.device(str(settings.get("device", "cuda")) if torch.cuda.is_available() else "cpu")
     use_gpu_mask_ops = bool(settings.get("use_gpu_mask_ops", True)) and torch.cuda.is_available()
-    ct_usage_counts = {int(p["id"]): 0 for p in CT_PRESETS}
-    selected_ct_label = _resolve_ct_preset_label(str(settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL)))
+    ct_usage_counts = {int(p["id"]): 0.0 for p in CT_PRESETS}
+    selected_ct_label = _resolve_ct_preset_label(
+        str(settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL))
+    )
     selected_ct_preset = CT_PRESET_BY_LABEL[selected_ct_label]
-    auto_ct_eval = bool(settings.get("auto_ct_eval", False))
+    ct_auto_mode = _resolve_ct_auto_mode_from_settings(settings)
+    ct_csv_blend_preset_map: Dict[str, Dict[int, int]] = {}
+    if bool(settings.get("enable_color_transfer", False)) and ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
+        csv_blend_path = str(settings.get("ct_csv_blend_path", "") or "").strip()
+        if not csv_blend_path:
+            raise RuntimeError("CT mode is 'CSV Blend' but no CSV path was provided.")
+        if not os.path.exists(csv_blend_path):
+            raise RuntimeError(f"CSV Blend Auto CT map not found: {csv_blend_path}")
+        ct_csv_blend_preset_map = _load_csv_blend_preset_map(csv_blend_path)
+        if not ct_csv_blend_preset_map:
+            LOG.warning(
+                f"CSV Blend Auto CT map loaded but lookup map is empty: {csv_blend_path}"
+            )
     encode_ok = False
 
     try:
@@ -1763,6 +2124,39 @@ def process_one_job(
         stdout_thread.start()
         stderr_thread.start()
 
+        csv_blend_weights_by_frame: List[Dict[int, float]] = []
+        csv_blend_lookup_key = ""
+        if ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
+            csv_rows_by_frame, csv_blend_lookup_key = _lookup_csv_blend_preset_rows(
+                ct_csv_blend_preset_map,
+                inpainted_video_path,
+                core_with_width,
+                core_name,
+            )
+            fallback_selected_id = int(selected_ct_preset["id"])
+            csv_target_ids = [fallback_selected_id for _ in range(num_frames)]
+            applied_rows = 0
+            for frame_i, preset_i in csv_rows_by_frame.items():
+                fi = int(frame_i)
+                pid = int(preset_i)
+                if 0 <= fi < num_frames and pid in CT_PRESET_BY_ID:
+                    csv_target_ids[fi] = pid
+                    applied_rows += 1
+            csv_blend_weights_by_frame, _csv_osc_flags = _build_csv_blend_weights_by_frame(
+                csv_target_ids
+            )
+            if applied_rows <= 0:
+                LOG.warning(
+                    f"CSV Blend Auto CT: no per-frame presets found for {os.path.basename(inpainted_video_path)}; "
+                    f"falling back to preset #{fallback_selected_id}."
+                )
+            else:
+                LOG.info(
+                    f"CSV Blend Auto CT: {os.path.basename(inpainted_video_path)} loaded {applied_rows} frame presets "
+                    f"(lookup='{csv_blend_lookup_key}')."
+                )
+
+        shadow_state: Dict[str, Any] = {"prev_components": []}
         for frame_start in range(0, num_frames, chunk_size):
             frame_end = min(frame_start + chunk_size, num_frames)
             frame_indices = list(range(frame_start, frame_end))
@@ -1843,15 +2237,18 @@ def process_one_job(
             if int(settings.get("mask_blur_kernel_size", 0)) > 0:
                 processed_mask = apply_gaussian_blur(processed_mask, int(settings["mask_blur_kernel_size"]), use_gpu_mask_ops)
 
-            if int(settings.get("shadow_shift", 0)) > 0:
+            if int(settings.get("shadow_length_px", 0)) > 0:
                 processed_mask = apply_shadow_blur(
                     processed_mask,
-                    int(settings["shadow_shift"]),
-                    float(settings.get("shadow_start_opacity", 0.0)),
-                    float(settings.get("shadow_opacity_decay", 0.0)),
-                    float(settings.get("shadow_min_opacity", 0.0)),
-                    float(settings.get("shadow_decay_gamma", 1.0)),
-                    use_gpu_mask_ops,
+                    base_length_px=int(settings.get("shadow_length_px", 0)),
+                    curve=float(settings.get("shadow_curve", 0.0)),
+                    motion_gain=float(settings.get("shadow_motion_gain", 0.0)),
+                    width_adaptive=bool(settings.get("shadow_width_adaptive", True)),
+                    use_gpu=use_gpu_mask_ops,
+                    state=shadow_state,
+                    border_tolerance_px=2,
+                    width_ref_px=20.0,
+                    width_power=1.0,
                 )
 
             warped_original = warped_original.to(device)
@@ -1864,7 +2261,7 @@ def process_one_job(
                 adjusted_frames: List[torch.Tensor] = []
                 ct_eval_executor = (
                     ThreadPoolExecutor(max_workers=CT_AUTO_EVAL_MAX_WORKERS)
-                    if auto_ct_eval
+                    if ct_auto_mode == CT_AUTO_MODE_ON
                     else None
                 )
                 try:
@@ -1874,7 +2271,7 @@ def process_one_job(
                         warped_3 = warped_original[fi].cpu()
                         mask_bin_1hw = mask_bin[fi].cpu()
 
-                        if auto_ct_eval:
+                        if ct_auto_mode == CT_AUTO_MODE_ON:
                             best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
                                 inpainted_3=inpainted_3,
                                 original_left_3=original_left_3,
@@ -1884,23 +2281,77 @@ def process_one_job(
                                 fallback_preset_id=int(selected_ct_preset["id"]),
                                 executor=ct_eval_executor,
                             )
-                            ct_usage_counts[best_preset_id] += 1
+                            ct_usage_counts[best_preset_id] += 1.0
                             adjusted_frames.append(best_frame.to(device))
                         else:
-                            stats_valid_cache = {}
-                            warped_ref_cache = {}
-                            adjusted_3 = _apply_ct_preset_frame(
-                                preset=selected_ct_preset,
-                                inpainted_3=inpainted_3,
-                                original_left_3=original_left_3,
-                                warped_3=warped_3,
-                                mask_bin_1hw=mask_bin_1hw,
-                                settings=settings,
-                                stats_valid_cache=stats_valid_cache,
-                                warped_ref_cache=warped_ref_cache,
-                            )
-                            ct_usage_counts[int(selected_ct_preset["id"])] += 1
-                            adjusted_frames.append(adjusted_3.to(device))
+                            if ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
+                                global_frame_idx = int(frame_indices[fi])
+                                blend_weights = (
+                                    csv_blend_weights_by_frame[global_frame_idx]
+                                    if 0 <= global_frame_idx < len(csv_blend_weights_by_frame)
+                                    else {}
+                                )
+                                if not blend_weights:
+                                    fallback_selected_id = int(selected_ct_preset["id"])
+                                    blend_weights = {fallback_selected_id: 1.0}
+                                stats_valid_cache: Dict[str, torch.Tensor] = {}
+                                warped_ref_cache: Dict[str, torch.Tensor] = {}
+                                blended_3: Optional[torch.Tensor] = None
+                                for pid_i, weight_i in sorted(
+                                    blend_weights.items(), key=lambda kv: kv[1], reverse=True
+                                ):
+                                    pid = int(pid_i)
+                                    w = float(max(0.0, min(1.0, float(weight_i))))
+                                    if w <= 0.0:
+                                        continue
+                                    preset_i = CT_PRESET_BY_ID.get(pid, selected_ct_preset)
+                                    adjusted_3 = _apply_ct_preset_frame(
+                                        preset=preset_i,
+                                        inpainted_3=inpainted_3,
+                                        original_left_3=original_left_3,
+                                        warped_3=warped_3,
+                                        mask_bin_1hw=mask_bin_1hw,
+                                        settings=settings,
+                                        stats_valid_cache=stats_valid_cache,
+                                        warped_ref_cache=warped_ref_cache,
+                                    )
+                                    if blended_3 is None:
+                                        blended_3 = adjusted_3 * w
+                                    else:
+                                        blended_3 = blended_3 + (adjusted_3 * w)
+                                    ct_usage_counts[pid] += w
+                                if blended_3 is None:
+                                    fallback_selected_id = int(selected_ct_preset["id"])
+                                    fallback_preset = CT_PRESET_BY_ID[fallback_selected_id]
+                                    stats_valid_cache = {}
+                                    warped_ref_cache = {}
+                                    blended_3 = _apply_ct_preset_frame(
+                                        preset=fallback_preset,
+                                        inpainted_3=inpainted_3,
+                                        original_left_3=original_left_3,
+                                        warped_3=warped_3,
+                                        mask_bin_1hw=mask_bin_1hw,
+                                        settings=settings,
+                                        stats_valid_cache=stats_valid_cache,
+                                        warped_ref_cache=warped_ref_cache,
+                                    )
+                                    ct_usage_counts[fallback_selected_id] += 1.0
+                                adjusted_frames.append(torch.clamp(blended_3, 0.0, 1.0).to(device))
+                            else:
+                                stats_valid_cache = {}
+                                warped_ref_cache = {}
+                                adjusted_3 = _apply_ct_preset_frame(
+                                    preset=selected_ct_preset,
+                                    inpainted_3=inpainted_3,
+                                    original_left_3=original_left_3,
+                                    warped_3=warped_3,
+                                    mask_bin_1hw=mask_bin_1hw,
+                                    settings=settings,
+                                    stats_valid_cache=stats_valid_cache,
+                                    warped_ref_cache=warped_ref_cache,
+                                )
+                                ct_usage_counts[int(selected_ct_preset["id"])] += 1.0
+                                adjusted_frames.append(adjusted_3.to(device))
                 finally:
                     if ct_eval_executor is not None:
                         ct_eval_executor.shutdown(wait=True)
@@ -1933,8 +2384,8 @@ def process_one_job(
                 torch.cuda.empty_cache()
 
         if bool(settings.get("enable_color_transfer", False)):
-            total_ct = int(sum(ct_usage_counts.values()))
-            if total_ct > 0:
+            total_ct = float(sum(ct_usage_counts.values()))
+            if total_ct > 0.0:
                 ct_line = " ".join(
                     [
                         f"{pid}:{(100.0 * ct_usage_counts.get(pid, 0) / total_ct):.1f}%"
@@ -2041,8 +2492,17 @@ def main() -> int:
     # Color transfer
     ap.add_argument("--no-color-transfer", action="store_true", default=False, help="Disable color transfer entirely")
     ap.add_argument("--ct-preset", default=None, help="CT preset label or id (1..8)")
-    ap.add_argument("--auto-ct-eval", action="store_true", default=None, help="Try all CT presets per-frame and pick the best score.")
-    ap.add_argument("--no-auto-ct-eval", action="store_true", default=False)
+    ap.add_argument(
+        "--ct-auto-mode",
+        choices=CT_AUTO_MODE_OPTIONS,
+        default=None,
+        help="Auto CT mode: Off | On | CSV Blend",
+    )
+    ap.add_argument(
+        "--ct-csv-blend-path",
+        default=None,
+        help="CSV path for per-frame preset map used by 'CSV Blend' mode.",
+    )
     ap.add_argument("--ct-strength", type=float, default=None)
     ap.add_argument("--ct-black-thresh", type=float, default=None)
     ap.add_argument("--ct-min-valid-ratio", type=float, default=None)
@@ -2099,10 +2559,10 @@ def main() -> int:
         settings["enable_color_transfer"] = False
     if args.ct_preset is not None:
         settings["ct_preset"] = _parse_ct_preset_arg(args.ct_preset)
-    if args.auto_ct_eval is True:
-        settings["auto_ct_eval"] = True
-    if args.no_auto_ct_eval is True:
-        settings["auto_ct_eval"] = False
+    if args.ct_auto_mode is not None:
+        settings["ct_auto_mode"] = _resolve_ct_auto_mode_label(args.ct_auto_mode)
+    if args.ct_csv_blend_path is not None:
+        settings["ct_csv_blend_path"] = str(args.ct_csv_blend_path).strip()
     if args.ct_strength is not None:
         settings["ct_strength"] = float(args.ct_strength)
     if args.ct_black_thresh is not None:
@@ -2129,7 +2589,7 @@ def main() -> int:
         settings["mask_binarize_threshold"] = float(args.mask_binarize_threshold)
 
     settings["ct_preset"] = _parse_ct_preset_arg(str(settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL)))
-    selected_ct = CT_PRESET_BY_LABEL[_resolve_ct_preset_label(str(settings["ct_preset"]))]
+    settings["ct_auto_mode"] = _resolve_ct_auto_mode_from_settings(settings)
 
     if args.use_replace_mask is True:
         settings["use_replace_mask"] = True
