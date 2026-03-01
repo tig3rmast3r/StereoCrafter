@@ -128,10 +128,11 @@ wait_for_pid() {
   local pid="$1"
   local code=0
   while true; do
-    set +e
-    wait "$pid"
-    code=$?
-    set -e
+    if wait "$pid"; then
+      code=0
+    else
+      code=$?
+    fi
     if ! kill -0 "$pid" 2>/dev/null; then
       break
     fi

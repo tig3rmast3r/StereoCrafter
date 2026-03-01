@@ -49,14 +49,18 @@ LOG = logging.getLogger("merge_runner")
 _FAULTHANDLER_LOG = None
 
 
-def _enable_debug_faulthandler() -> None:
+def _enable_debug_faulthandler(worker_id: Optional[int] = None) -> None:
     """Enable crash stack dumps for nogui runs when debug mode is enabled."""
     global _FAULTHANDLER_LOG
     try:
         os.makedirs("logs", exist_ok=True)
-        log_path = os.path.join(
-            "logs", "merging_nogui_batch_parallel_faulthandler.log"
-        )
+        if worker_id is None:
+            log_name = "merging_nogui_batch_parallel_faulthandler.log"
+        else:
+            log_name = (
+                f"merging_nogui_batch_parallel_faulthandler_w{int(worker_id)}.log"
+            )
+        log_path = os.path.join("logs", log_name)
         _FAULTHANDLER_LOG = open(log_path, "a", buffering=1)
         _FAULTHANDLER_LOG.write(
             f"\n=== debug session {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} ===\n"
@@ -652,6 +656,32 @@ def _lookup_csv_blend_preset_rows(
     return dict(best_map), best_key
 
 
+def _prepare_ct_csv_blend_map_once(
+    settings: Dict[str, object]
+) -> Dict[str, Dict[int, int]]:
+    if not bool(settings.get("enable_color_transfer", False)):
+        return {}
+    if _resolve_ct_auto_mode_from_settings(settings) != CT_AUTO_MODE_CSV_BLEND:
+        return {}
+
+    csv_blend_path = str(settings.get("ct_csv_blend_path", "") or "").strip()
+    if not csv_blend_path:
+        raise RuntimeError("CT mode is 'CSV Blend' but no CSV path was provided.")
+    if not os.path.exists(csv_blend_path):
+        raise RuntimeError(f"CSV Blend Auto CT map not found: {csv_blend_path}")
+
+    ct_csv_blend_preset_map = _load_csv_blend_preset_map(csv_blend_path)
+    if not ct_csv_blend_preset_map:
+        LOG.warning(
+            f"CSV Blend Auto CT map loaded but lookup map is empty: {csv_blend_path}"
+        )
+    else:
+        LOG.info(
+            f"CSV Blend Auto CT map preloaded once: keys={len(ct_csv_blend_preset_map)}"
+        )
+    return ct_csv_blend_preset_map
+
+
 def _compute_preset_oscillator_flags(seq: List[int], min_len: int = 4) -> List[bool]:
     flags = [False for _ in seq]
     n = len(seq)
@@ -1215,7 +1245,8 @@ def apply_shadow_blur(
     if state is not None:
         prev_components = list(state.get("prev_components", []) or [])
 
-    out_frames: List[torch.Tensor] = []
+    # Keep shadow processing fully on NumPy buffers and convert back to torch once.
+    out_np = np.empty_like(mask_cpu, dtype=np.float32)
 
     for t in range(t_count):
         frame = np.asarray(mask_cpu[t, 0], dtype=np.float32)
@@ -1383,12 +1414,12 @@ def apply_shadow_blur(
 
             prev_components = curr_components
 
-        out_frames.append(torch.from_numpy(canvas).unsqueeze(0))
+        out_np[t, 0] = canvas
 
     if state is not None:
         state["prev_components"] = prev_components
 
-    return torch.stack(out_frames).to(device=mask.device, dtype=mask.dtype)
+    return torch.from_numpy(out_np).to(device=mask.device, dtype=mask.dtype)
 
     
 def apply_mask_dilation(mask: torch.Tensor, kernel_size: int, use_gpu: bool = True) -> torch.Tensor:
@@ -1920,6 +1951,7 @@ def process_one_job(
     output_folder: str,
     settings: Dict[str, object],
     stop_marker_path: str = "",
+    preloaded_ct_csv_blend_preset_map: Optional[Dict[str, Dict[int, int]]] = None,
 ) -> JobPaths:
     """
     Open readers and run the streaming merge pipeline for one video.
@@ -2084,18 +2116,16 @@ def process_one_job(
     )
     selected_ct_preset = CT_PRESET_BY_LABEL[selected_ct_label]
     ct_auto_mode = _resolve_ct_auto_mode_from_settings(settings)
-    ct_csv_blend_preset_map: Dict[str, Dict[int, int]] = {}
-    if bool(settings.get("enable_color_transfer", False)) and ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
-        csv_blend_path = str(settings.get("ct_csv_blend_path", "") or "").strip()
-        if not csv_blend_path:
-            raise RuntimeError("CT mode is 'CSV Blend' but no CSV path was provided.")
-        if not os.path.exists(csv_blend_path):
-            raise RuntimeError(f"CSV Blend Auto CT map not found: {csv_blend_path}")
-        ct_csv_blend_preset_map = _load_csv_blend_preset_map(csv_blend_path)
-        if not ct_csv_blend_preset_map:
-            LOG.warning(
-                f"CSV Blend Auto CT map loaded but lookup map is empty: {csv_blend_path}"
-            )
+    ct_csv_blend_preset_map: Dict[str, Dict[int, int]] = (
+        preloaded_ct_csv_blend_preset_map or {}
+    )
+    if (
+        bool(settings.get("enable_color_transfer", False))
+        and ct_auto_mode == CT_AUTO_MODE_CSV_BLEND
+        and not ct_csv_blend_preset_map
+    ):
+        # Fallback for direct callers that do not pass the preloaded map.
+        ct_csv_blend_preset_map = _prepare_ct_csv_blend_map_once(settings)
     encode_ok = False
 
     try:
@@ -2526,7 +2556,7 @@ def main() -> int:
     verbosity = int(args.verbosity) if args.verbosity is not None else (2 if debug_enabled else 1)
     setup_logging(verbosity)
     if debug_enabled:
-        _enable_debug_faulthandler()
+        _enable_debug_faulthandler(args.worker_id)
         LOG.info("Debug mode enabled (MERGE_DEBUG/--debug).")
 
     # Build settings
@@ -2629,6 +2659,12 @@ def main() -> int:
         LOG.warning("No matching jobs found.")
         return 0
 
+    try:
+        preloaded_ct_csv_blend_preset_map = _prepare_ct_csv_blend_map_once(settings)
+    except Exception as e:
+        LOG.error(str(e))
+        return 2
+
     LOG.info(f"Jobs: {len(pairs)}")
     finished_root = os.path.join(args.inpainted_folder, "finished")
     failed_root = os.path.join(args.inpainted_folder, "failed")
@@ -2666,6 +2702,7 @@ def main() -> int:
                     output_folder=args.output_folder,
                     settings=settings,
                     stop_marker_path=stop_marker_path,
+                    preloaded_ct_csv_blend_preset_map=preloaded_ct_csv_blend_preset_map,
                 )
                 ok = True
                 break

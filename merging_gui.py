@@ -204,7 +204,8 @@ def apply_shadow_blur(
     if state is not None:
         prev_components = list(state.get("prev_components", []) or [])
 
-    out_frames: List[torch.Tensor] = []
+    # Keep shadow processing fully on NumPy buffers and convert back to torch once.
+    out_np = np.empty_like(mask_cpu, dtype=np.float32)
 
     for t in range(t_count):
         frame = np.asarray(mask_cpu[t, 0], dtype=np.float32)
@@ -371,12 +372,12 @@ def apply_shadow_blur(
 
             prev_components = curr_components
 
-        out_frames.append(torch.from_numpy(canvas).unsqueeze(0))
+        out_np[t, 0] = canvas
 
     if state is not None:
         state["prev_components"] = prev_components
 
-    return torch.stack(out_frames).to(device=mask.device, dtype=mask.dtype)
+    return torch.from_numpy(out_np).to(device=mask.device, dtype=mask.dtype)
 
 
 
@@ -1561,6 +1562,7 @@ class MergingGUI(ThemedTk):
         "ct_auto_mode": CT_AUTO_MODE_ON,
         "ct_csv_blend_path": "",
         "show_blend_in_preview": True,
+        "ct_advanced": False,
         "ct_strength": 1.0,
         "ct_black_thresh": 0.0,
         "ct_min_valid_ratio": 0,
@@ -1780,6 +1782,14 @@ class MergingGUI(ThemedTk):
                 self.app_config.get(
                     "show_blend_in_preview",
                     self.APP_DEFAULTS.get("show_blend_in_preview", True),
+                )
+            )
+        )
+        self.ct_advanced_var = tk.BooleanVar(
+            value=bool(
+                self.app_config.get(
+                    "ct_advanced",
+                    self.APP_DEFAULTS.get("ct_advanced", False),
                 )
             )
         )
@@ -2131,11 +2141,31 @@ class MergingGUI(ThemedTk):
         # Keep derived CT controls coherent after loading/applying settings.
         self._apply_ct_preset_to_controls(self.ct_preset_var.get())
         self._on_auto_ct_eval_toggle()
+        self._toggle_ct_advanced_controls()
 
         # After setting all variables, manually update the slider labels to match.
         for updater in self.slider_label_updaters:
             updater()
         logger.info("Applied settings to GUI and updated labels.")
+
+    def _toggle_ct_advanced_controls(self) -> None:
+        """Show/hide advanced CT sliders based on the Advanced checkbox."""
+        row = getattr(self, "_ct_sliders_row", None)
+        if row is None:
+            return
+        try:
+            # Keep the toplevel geometry stable when toggling advanced controls.
+            current_w = int(self.winfo_width())
+            current_h = int(self.winfo_height())
+            if bool(self.ct_advanced_var.get()):
+                row.grid()
+            else:
+                row.grid_remove()
+            if current_w > 1 and current_h > 1:
+                self.update_idletasks()
+                self.geometry(f"{current_w}x{current_h}")
+        except Exception:
+            pass
 
     def _configure_logging(self):
         """Sets the logging level based on the debug_logging_var."""
@@ -2327,6 +2357,12 @@ class MergingGUI(ThemedTk):
         )
         param_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         param_frame.grid_columnconfigure(1, weight=1)
+        # Keep sliders and checkboxes in separate sub-frames for stable vertical layout.
+        mask_sliders_frame = ttk.Frame(param_frame)
+        mask_sliders_frame.grid(row=0, column=0, columnspan=3, sticky="ew")
+        mask_sliders_frame.grid_columnconfigure(1, weight=1)
+        # Vertical spacer that pushes checkbox row to the bottom of the panel.
+        param_frame.grid_rowconfigure(1, weight=1)
 
         # def create_slider_with_label_updater(parent, text, var, from_, to, row, decimals=0) -> None:
         #     """Creates a slider, its value label, and all necessary event bindings."""
@@ -2371,7 +2407,7 @@ class MergingGUI(ThemedTk):
 
         create_single_slider_with_label_updater(
             self,
-            param_frame,
+            mask_sliders_frame,
             "Binarize Thresh (<0=Off):",
             self.mask_binarize_threshold_var,
             -0.01,
@@ -2382,7 +2418,7 @@ class MergingGUI(ThemedTk):
         )
         create_single_slider_with_label_updater(
             self,
-            param_frame,
+            mask_sliders_frame,
             "Dilate Kernel:",
             self.mask_dilate_kernel_size_var,
             0,
@@ -2390,11 +2426,11 @@ class MergingGUI(ThemedTk):
             1,
         )
         create_single_slider_with_label_updater(
-            self, param_frame, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 2
+            self, mask_sliders_frame, "Blur Kernel:", self.mask_blur_kernel_size_var, 0, 101, 2
         )
         create_single_slider_with_label_updater(
             self,
-            param_frame,
+            mask_sliders_frame,
             "Shadow Length (px):",
             self.shadow_length_px_var,
             0,
@@ -2405,7 +2441,7 @@ class MergingGUI(ThemedTk):
         )
         create_single_slider_with_label_updater(
             self,
-            param_frame,
+            mask_sliders_frame,
             "Shadow Curve (-1..1):",
             self.shadow_curve_var,
             -1.0,
@@ -2416,7 +2452,7 @@ class MergingGUI(ThemedTk):
         )
         create_single_slider_with_label_updater(
             self,
-            param_frame,
+            mask_sliders_frame,
             "Shadow Motion Gain:",
             self.shadow_motion_gain_var,
             0.0,
@@ -2426,29 +2462,33 @@ class MergingGUI(ThemedTk):
             step_size=0.01,
         )
 
+        mask_checks_row = ttk.Frame(param_frame)
+        mask_checks_row.grid(row=2, column=0, columnspan=3, sticky="ew", padx=5, pady=(8, 2))
         temporal_shadow_preview_check = ttk.Checkbutton(
-            param_frame,
+            mask_checks_row,
             text=f"Temporal Shadow Preview ({self.PREVIEW_SHADOW_WARMUP_FRAMES}f)",
             variable=self.preview_shadow_temporal_var,
             command=lambda: self.on_slider_release(None),
         )
-        temporal_shadow_preview_check.grid(
-            row=6, column=0, columnspan=3, sticky="w", padx=5, pady=(8, 2)
-        )
-        self.widgets_to_disable.append(temporal_shadow_preview_check)
-
         shadow_width_adaptive_check = ttk.Checkbutton(
-            param_frame,
+            mask_checks_row,
             text="Dynamic shadow by mask width",
             variable=self.shadow_width_adaptive_var,
             command=lambda: self.on_slider_release(None),
         )
-        shadow_width_adaptive_check.grid(
-            row=7, column=0, columnspan=3, sticky="w", padx=5, pady=(2, 2)
+        replace_mask_check = ttk.Checkbutton(
+            mask_checks_row,
+            text="Use Replace Mask",
+            variable=self.use_replace_mask_var,
+            command=self._on_use_replace_mask_changed,
         )
+        temporal_shadow_preview_check.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=2)
+        shadow_width_adaptive_check.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=2)
+        replace_mask_check.grid(row=0, column=2, sticky="w", pady=2)
+        self.widgets_to_disable.append(temporal_shadow_preview_check)
         self.widgets_to_disable.append(shadow_width_adaptive_check)
+        self.widgets_to_disable.append(replace_mask_check)
 
-        
         # --- COLOR TRANSFER (PRESET-ONLY) PARAMETERS ---
         ct_frame = ttk.LabelFrame(params_ct_row, text="Color Transfer (Safe)", padding=10)
         ct_frame.grid(row=0, column=1, sticky="nsew")
@@ -2460,7 +2500,7 @@ class MergingGUI(ThemedTk):
             row=0, column=0, columnspan=4, sticky="ew", padx=0, pady=(0, 4)
         )
         ct_preset_row.grid_columnconfigure(1, weight=1)
-        ct_preset_row.grid_columnconfigure(2, weight=1)
+        ct_preset_row.grid_columnconfigure(2, weight=0)
 
         ttk.Label(ct_preset_row, text="Preset:").grid(
             row=0, column=0, sticky="e", padx=5, pady=2
@@ -2470,9 +2510,9 @@ class MergingGUI(ThemedTk):
             textvariable=self.ct_preset_var,
             values=CT_PRESET_LABELS,
             state="readonly",
-            width=48,
+            width=60,
         )
-        ct_preset_combo.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+        ct_preset_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
         self.widgets_to_disable.append(ct_preset_combo)
 
         auto_ct_best_label = ttk.Label(
@@ -2485,7 +2525,9 @@ class MergingGUI(ThemedTk):
             row=1, column=0, columnspan=4, sticky="ew", padx=0, pady=(0, 4)
         )
         ct_auto_row.grid_columnconfigure(1, weight=0)
-        ct_auto_row.grid_columnconfigure(2, weight=1)
+        ct_auto_row.grid_columnconfigure(2, weight=0)
+        ct_auto_row.grid_columnconfigure(3, weight=0)
+        ct_auto_row.grid_columnconfigure(4, weight=1)
 
         ttk.Label(ct_auto_row, text="Auto CT:").grid(
             row=0, column=0, sticky="e", padx=5, pady=2
@@ -2500,29 +2542,39 @@ class MergingGUI(ThemedTk):
         ct_auto_mode_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
         self.widgets_to_disable.append(ct_auto_mode_combo)
 
+        ct_excl = ttk.Checkbutton(
+            ct_auto_row,
+            text="Exclude near-black in target stats",
+            variable=self.ct_exclude_black_in_target_var,
+        )
+        ct_excl.grid(row=0, column=2, sticky="w", padx=(12, 8), pady=2)
+        self._create_hover_tooltip(ct_excl, "ct_exclude_black_in_target")
+        self.widgets_to_disable.append(ct_excl)
+
         show_blend_preview_check = ttk.Checkbutton(
             ct_auto_row,
             text="Show blend in preview",
             variable=self.show_blend_in_preview_var,
             command=lambda: self.on_slider_release(None),
         )
-        show_blend_preview_check.grid(row=0, column=2, sticky="w", padx=(12, 5), pady=2)
+        show_blend_preview_check.grid(row=0, column=3, sticky="w", padx=(0, 5), pady=2)
         self.widgets_to_disable.append(show_blend_preview_check)
 
-        ct_excl = ttk.Checkbutton(
-            ct_frame,
-            text="Exclude near-black in target stats",
-            variable=self.ct_exclude_black_in_target_var,
+        ct_advanced_check = ttk.Checkbutton(
+            ct_auto_row,
+            text="Advanced",
+            variable=self.ct_advanced_var,
+            command=self._toggle_ct_advanced_controls,
         )
-        ct_excl.grid(row=2, column=0, columnspan=4, sticky="w", padx=5, pady=2)
-        self._create_hover_tooltip(ct_excl, "ct_exclude_black_in_target")
-        self.widgets_to_disable.append(ct_excl)
+        ct_advanced_check.grid(row=0, column=4, sticky="w", padx=(8, 5), pady=2)
+        self.widgets_to_disable.append(ct_advanced_check)
 
         # Sliders (two columns) — keep preview updates on release
         ct_sliders_row = ttk.Frame(ct_frame)
-        ct_sliders_row.grid(row=3, column=0, columnspan=4, sticky="ew", padx=0, pady=(6, 0))
+        ct_sliders_row.grid(row=2, column=0, columnspan=4, sticky="ew", padx=0, pady=(6, 0))
         ct_sliders_row.grid_columnconfigure(0, weight=1)
         ct_sliders_row.grid_columnconfigure(1, weight=1)
+        self._ct_sliders_row = ct_sliders_row
 
         ct_sliders_left = ttk.Frame(ct_sliders_row)
         ct_sliders_right = ttk.Frame(ct_sliders_row)
@@ -2589,20 +2641,9 @@ class MergingGUI(ThemedTk):
                     _v.trace_add("write", lambda *args: self.on_slider_release(None))
             except Exception:
                 pass
+        self._toggle_ct_advanced_controls()
         # --- END COLOR TRANSFER (PRESET-ONLY) PARAMETERS ---
-
-# --- NEW: Option to use external replace-mask video instead of embedded mask ---
-        replace_mask_check = ttk.Checkbutton(
-            param_frame,
-            text="Use Replace Mask (_replace_mask.mkv) instead of embedded mask",
-            variable=self.use_replace_mask_var,
-            command=self._on_use_replace_mask_changed,
-        )
-        replace_mask_check.grid(
-            row=8, column=0, columnspan=3, sticky="w", padx=5, pady=(8, 2)
-        )
-        self.widgets_to_disable.append(replace_mask_check)
-                # --- OPTIONS FRAME ---
+        # --- OPTIONS FRAME ---
         # Dock Options beside the preview controls row (Preview Source / Prev/Next / Jump / Scale).
         # The most reliable anchor is the parent frame that owns preview_source_combo.
         options_parent = getattr(self.previewer, "preview_source_combo", None)
@@ -3191,6 +3232,7 @@ class MergingGUI(ThemedTk):
                 "ct_auto_mode": selected_auto_mode,
                 "ct_csv_blend_path": str(self.ct_csv_blend_path_var.get() or "").strip(),
                 "show_blend_in_preview": bool(self.show_blend_in_preview_var.get()),
+                "ct_advanced": bool(self.ct_advanced_var.get()),
                 # Legacy key kept for backward compatibility with old configs/scripts.
                 "auto_ct_eval": bool(selected_auto_mode == CT_AUTO_MODE_ON),
                 "ct_strength": float(self.ct_strength_var.get()),
