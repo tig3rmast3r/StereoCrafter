@@ -177,14 +177,14 @@ You can learn more about DepthCrafter GUI Seg <a href="https://github.com/Billyn
 
 
 #### INSTALL:
-   - Run <a href="https://github.com/enoky/StereoCrafter/blob/main/_install/StereoCrafter_1click_Installer.bat">script</a> from folder where you want StereoCrafter installed
+   - Run <a href="https://github.com/enoky/StereoCrafter/blob/main/legacy/_install/StereoCrafter_1click_Installer.bat">script</a> from folder where you want StereoCrafter installed
    - Download and extract <a href="https://mega.nz/file/Fw1GgJrL#bPplu2Y1PT4G-TM29zcGNENUYVySEk2NENT4krkjEso">model</a> "weights" to StereoCrafter folder (use <a href="https://www.qbittorrent.org">qBittorrent</a> to download)
 
 <hr>
 
 ### Option 2: Manual Install
 
-For Manual Install Instructions <a href="https://github.com/enoky/StereoCrafter/blob/main/_install/StereoCrafter_Manual_Install.md">Click Here</a>
+For Manual Install Instructions <a href="https://github.com/enoky/StereoCrafter/blob/main/legacy/_install/StereoCrafter_Manual_Install.md">Click Here</a>
 
 <hr>
 <div align="center">
@@ -296,7 +296,7 @@ python depth_splatting_inference.py --pre_trained_path [PATH] --unet_path [PATH]
 Arguments:
 - `--pre_trained_path`: Path to the SVD img2vid model weights (e.g., `./weights/stable-video-diffusion-img2vid-xt-1-1`).
 - `--unet_path`: Path to the DepthCrafter model weights (e.g., `./weights/DepthCrafter`).
-- `--input_video_path`: Path to the input video (e.g., `./source_video/camel.mp4`).
+- `--input_video_path`: Path to the input video (e.g., `./legacy/source_video/camel.mp4`).
 - `--output_video_path`: Path to the output video (e.g., `./outputs/camel_splatting_results.mp4`).
 - `--max_disp`: Parameter controlling the maximum disparity between the generated right video and the input left video. Default value is `20` pixels.
 
