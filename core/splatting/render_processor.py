@@ -66,6 +66,7 @@ class RenderProcessor:
         batch_size: int,
         dual_output: bool,
         zero_disparity_anchor_val: float,
+        output_layout: str,
         video_stream_info: Optional[dict],
         input_bias: float,
         assume_raw_input: bool,
@@ -113,7 +114,8 @@ class RenderProcessor:
             target_output_width: Target width
             max_disp: Max disparity percentage
             batch_size: Frames per batch
-            dual_output: Whether to output left/right eyes
+            dual_output: Legacy bool flag (True=dual, False=quad)
+            output_layout: Output layout ("quad" | "dual" | "single_warp")
             zero_disparity_anchor_val: Convergence anchor (0-1)
             video_stream_info: Metadata for source video
             input_bias: Depth input bias
@@ -145,9 +147,20 @@ class RenderProcessor:
         height, width = target_output_height, target_output_width
         os.makedirs(os.path.dirname(output_video_path_base), exist_ok=True)
 
-        # Determine output grid dimensions and final path
-        grid_height, grid_width = (height, width * 2) if dual_output else (height * 2, width * 2)
-        suffix = "_splatted2" if dual_output else "_splatted4"
+        # Determine output layout and final path
+        layout = str(output_layout or "").strip().lower()
+        if layout not in {"quad", "dual", "single_warp"}:
+            layout = "dual" if bool(dual_output) else "quad"
+
+        if layout == "single_warp":
+            grid_height, grid_width = height, width
+            suffix = "_splatted1"
+        elif layout == "dual":
+            grid_height, grid_width = height, width * 2
+            suffix = "_splatted2"
+        else:
+            grid_height, grid_width = height * 2, width * 2
+            suffix = "_splatted4"
         res_suffix = f"_{width}"
         final_output_video_path = f"{os.path.splitext(output_video_path_base)[0]}{res_suffix}{suffix}.mp4"
 
@@ -164,7 +177,7 @@ class RenderProcessor:
                 fps=processed_fps,
                 video_stream_info=encode_stream_info,
                 user_output_crf=user_output_crf,
-                output_format_str="splatted_grid",
+                output_format_str="splatted_single_warp" if layout == "single_warp" else "splatted_grid",
                 debug_label=task_name,
             )
             if ffmpeg_process is None:
@@ -359,9 +372,9 @@ class RenderProcessor:
 
                 # 5. Handle results (diag tests or FFmpeg write)
                 if is_test_mode and test_target_frame_idx is not None:
-                    self._handle_diagnostic_capture(batch_processed_frames, dual_output)
+                    self._handle_diagnostic_capture(batch_processed_frames, layout)
                 elif ffmpeg_process:
-                    self._write_to_ffmpeg(ffmpeg_process, batch_processed_frames, dual_output)
+                    self._write_to_ffmpeg(ffmpeg_process, batch_processed_frames, layout)
 
                 frame_count += len(batch_indices)
                 self.progress_queue.put(("processed", frame_count))
@@ -616,28 +629,28 @@ class RenderProcessor:
         return results
 
 
-    def _handle_diagnostic_capture(self, batch_results: List[dict], dual_output: bool):
+    def _handle_diagnostic_capture(self, batch_results: List[dict], output_layout: str):
         # In test mode, we usually only have one frame
         res = batch_results[0]
         # This is a bit tricky since we don't have direct access to GUI previewer here.
         # We'll put it in the queue for the GUI to handle.
-        grid = self._construct_grid(res, dual_output)
+        grid = self._construct_grid(res, output_layout)
         self.progress_queue.put(("diagnostic_capture", grid))
 
-    def _write_to_ffmpeg(self, process: Any, batch_results: List[dict], dual_output: bool):
+    def _write_to_ffmpeg(self, process: Any, batch_results: List[dict], output_layout: str):
         for res in batch_results:
-            grid = self._construct_grid(res, dual_output)
+            grid = self._construct_grid(res, output_layout)
             # Convert to 16-bit and BGR for FFmpeg
             grid_uint16 = (np.clip(grid, 0.0, 1.0) * 65535.0).astype(np.uint16)
             grid_bgr = cv2.cvtColor(grid_uint16, cv2.COLOR_RGB2BGR)
             process.stdin.write(grid_bgr.tobytes())
 
-    def _construct_grid(self, res: dict, dual_output: bool) -> np.ndarray:
+    def _construct_grid(self, res: dict, output_layout: str) -> np.ndarray:
         """Construct output grid for encoding.
         
-        dual_output=True: [occlusion_mask | right_eye] (2-panel)
-        dual_output=False: [left_eye | depth_vis]
-                           [occlusion_mask | right_eye] (4-panel)
+        output_layout='dual': [occlusion_mask | right_eye] (2-panel)
+        output_layout='quad': [left_eye | depth_vis] / [occlusion_mask | right_eye] (4-panel)
+        output_layout='single_warp': [right_eye] only (1-panel)
         
         Returns float32 array in range [0, 1]
         """
@@ -653,11 +666,14 @@ class RenderProcessor:
         if depth.ndim == 2 or (depth.ndim == 3 and depth.shape[-1] == 1):
             depth = np.stack([depth.squeeze()] * 3, axis=-1)
         
-        if dual_output:
+        layout = str(output_layout or "").strip().lower()
+        if layout == "single_warp":
+            # 1-panel: warped right eye only
+            return right
+        if layout == "dual":
             # 2-panel: occlusion on left, warped right eye on right
             return np.concatenate([occlusion, right], axis=1)
-        else:
-            # 4-panel: top row (left, depth), bottom row (occlusion, right)
-            top_row = np.concatenate([left, depth], axis=1)
-            bot_row = np.concatenate([occlusion, right], axis=1)
-            return np.concatenate([top_row, bot_row], axis=0)
+        # 4-panel: top row (left, depth), bottom row (occlusion, right)
+        top_row = np.concatenate([left, depth], axis=1)
+        bot_row = np.concatenate([occlusion, right], axis=1)
+        return np.concatenate([top_row, bot_row], axis=0)

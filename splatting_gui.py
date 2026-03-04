@@ -113,6 +113,26 @@ REPLACE_MASK_GAP_TOL = 0
 REPLACE_MASK_CODEC = "ffv1"
 REPLACE_MASK_DRAW_EDGE = True
 
+OUTPUT_LAYOUT_CHOICES = ("Quad", "Dual", "Single Warp")
+
+
+def _normalize_output_layout_value(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace("-", " ").replace("_", " ")
+    if raw in {"dual", "dual output"}:
+        return "dual"
+    if raw in {"single warp", "single", "warp", "splatted1"}:
+        return "single_warp"
+    return "quad"
+
+
+def _output_layout_to_gui_value(value: Any) -> str:
+    norm = _normalize_output_layout_value(value)
+    if norm == "dual":
+        return "Dual"
+    if norm == "single_warp":
+        return "Single Warp"
+    return "Quad"
+
 
 # [REFACTORED] FusionSidecarGenerator class replaced with core import
 from core.splatting import FusionSidecarGenerator
@@ -268,7 +288,16 @@ class SplatterGUI(ThemedTk):
         self.process_from_var = tk.StringVar(value="")
         self.process_to_var = tk.StringVar(value="")
         self.batch_size_var = tk.StringVar(value=defaults["BATCH_SIZE_FULL"])
-        self.dual_output_var = tk.BooleanVar(value=False)
+        legacy_dual_default = bool(self.app_config.get("dual_output", False))
+        layout_default = self.app_config.get(
+            "output_layout",
+            "Dual" if legacy_dual_default else "Quad",
+        )
+        self.output_layout_var = tk.StringVar(value=_output_layout_to_gui_value(layout_default))
+        self.dual_output_var = tk.BooleanVar(
+            value=_normalize_output_layout_value(self.output_layout_var.get()) == "dual"
+        )  # legacy compatibility
+        self.output_layout_var.trace_add("write", self._on_output_layout_changed)
         self.enable_global_norm_var = tk.BooleanVar(value=False)
         self.enable_full_res_var = tk.BooleanVar(value=True)
         self.enable_low_res_var = tk.BooleanVar(value=False)
@@ -365,6 +394,17 @@ class SplatterGUI(ThemedTk):
             self.enable_full_res_var.set(bool(self.app_config["enable_full_resolution"]))
         if "enable_low_resolution" in self.app_config:
             self.enable_low_res_var.set(bool(self.app_config["enable_low_resolution"]))
+
+        # Output layout migration/normalization:
+        # - Prefer explicit output_layout when present.
+        # - Fallback to legacy dual_output when output_layout is missing.
+        if "output_layout" in self.app_config:
+            self.output_layout_var.set(_output_layout_to_gui_value(self.app_config.get("output_layout")))
+        else:
+            self.output_layout_var.set(
+                _output_layout_to_gui_value("Dual" if bool(self.app_config.get("dual_output", False)) else "Quad")
+            )
+        self.dual_output_var.set(_normalize_output_layout_value(self.output_layout_var.get()) == "dual")
 
         # Add traces for automatic border calculation (Auto Basic mode)
         self.zero_disparity_anchor_var.trace_add("write", self._on_convergence_or_disparity_changed)
@@ -629,6 +669,13 @@ class SplatterGUI(ThemedTk):
             return float(val)
         except (ValueError, TypeError, tk.TclError):
             return default
+
+    def _on_output_layout_changed(self, *_args):
+        """Keep legacy dual_output flag aligned with layout selection."""
+        try:
+            self.dual_output_var.set(_normalize_output_layout_value(self.output_layout_var.get()) == "dual")
+        except Exception:
+            pass
 
     def _get_staircase_settings(self) -> dict:
         """Parse staircase-smoothing controls with safe defaults."""
@@ -1706,7 +1753,7 @@ class SplatterGUI(ThemedTk):
 
         # --- Enable Full/Low Resolution + Tests (Compact 3x3 Grid) ---
         # Layout:
-        #   Row 0: [Enable Full Res]  [Batch Size]  [Dual Output Only]
+        #   Row 0: [Enable Full Res]  [Batch Size]  [Output Layout]
         #   Row 1: [Enable Low Res ]  [Batch Size]  [Splat Test]
         #   Row 2: [Width]           [Height]      [Map Test]
         # Keep vertical padding minimal so preview area can expand.
@@ -1736,11 +1783,21 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.lbl_full_res_batch_size, "full_res_batch_size")
         self._create_hover_tooltip(self.entry_full_res_batch_size, "full_res_batch_size")
 
-        self.dual_output_checkbox = ttk.Checkbutton(
-            self.preprocessing_frame, text="Dual Output Only", variable=self.dual_output_var
+        self.output_layout_frame = ttk.Frame(self.preprocessing_frame)
+        self.output_layout_frame.grid(row=0, column=2, sticky="w", padx=5, pady=0)
+        self.output_layout_label = ttk.Label(self.output_layout_frame, text="Layout:")
+        self.output_layout_label.pack(side="left", padx=(0, 3))
+        self.output_layout_combo = ttk.Combobox(
+            self.output_layout_frame,
+            textvariable=self.output_layout_var,
+            values=OUTPUT_LAYOUT_CHOICES,
+            state="readonly",
+            width=12,
         )
-        self.dual_output_checkbox.grid(row=0, column=2, sticky="w", padx=5, pady=0)
-        self._create_hover_tooltip(self.dual_output_checkbox, "dual_output")
+        self.output_layout_combo.pack(side="left")
+        self._create_hover_tooltip(self.output_layout_label, "dual_output")
+        self._create_hover_tooltip(self.output_layout_combo, "dual_output")
+        self.widgets_to_disable.append(self.output_layout_combo)
 
         # --- Row 1: Low res ---
         self.enable_low_res_checkbox = ttk.Checkbutton(
@@ -2899,6 +2956,9 @@ class SplatterGUI(ThemedTk):
         config["dark_mode_enabled"] = self.dark_mode_var.get()
         config["enable_full_resolution"] = self.enable_full_res_var.get()
         config["enable_low_resolution"] = self.enable_low_res_var.get()
+        layout_norm = _normalize_output_layout_value(config.get("output_layout", self.output_layout_var.get()))
+        config["output_layout"] = _output_layout_to_gui_value(layout_norm)
+        config["dual_output"] = layout_norm == "dual"
 
         # Add special cases not directly mapped to _var
         config["window_width"] = self.winfo_width()
@@ -2929,6 +2989,7 @@ class SplatterGUI(ThemedTk):
         config = self._get_current_config()
         stair = self._get_staircase_settings()
         rep = self._get_replace_mask_settings()
+        output_layout = _normalize_output_layout_value(config.get("output_layout"))
         return ProcessingSettings(
             input_source_clips=config["input_source_clips"],
             input_depth_maps=config["input_depth_maps"],
@@ -2941,7 +3002,8 @@ class SplatterGUI(ThemedTk):
             low_res_width=int(config["pre_res_width"]),
             low_res_height=int(config["pre_res_height"]),
             low_res_batch_size=int(config["low_res_batch_size"]),
-            dual_output=config["dual_output"],
+            dual_output=(output_layout == "dual"),
+            output_layout=output_layout,
             zero_disparity_anchor=float(config["convergence_point"]),
             enable_global_norm=config["enable_global_norm"],
             move_to_finished=config["move_to_finished"],

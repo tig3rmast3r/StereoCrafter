@@ -74,7 +74,8 @@ class ProcessingSettings:
         low_res_width: Width for low resolution output
         low_res_height: Height for low resolution output
         low_res_batch_size: Batch size for low resolution
-        dual_output: Whether to output both left and right eyes
+        dual_output: Legacy bool flag (True=dual, False=quad)
+        output_layout: Output layout ("quad" | "dual" | "single_warp")
         zero_disparity_anchor: Convergence plane value (0.0-1.0)
         enable_global_norm: Whether to enable global normalization
         match_depth_res: Whether to match depth resolution to video
@@ -108,6 +109,7 @@ class ProcessingSettings:
     low_res_height: int = 1080
     low_res_batch_size: int = 50
     dual_output: bool = False
+    output_layout: str = "quad"
     zero_disparity_anchor: float = 0.5
     enable_global_norm: bool = False
     match_depth_res: bool = True
@@ -437,6 +439,9 @@ class BatchProcessor:
                 continue
 
             # Run Rendering
+            output_layout = str(getattr(settings, "output_layout", "") or "").strip().lower()
+            if output_layout not in {"quad", "dual", "single_warp"}:
+                output_layout = "dual" if bool(getattr(settings, "dual_output", False)) else "quad"
             success = renderer.render_video(
                 input_video_reader=readers["source"],
                 depth_map_reader=readers["depth"],
@@ -447,7 +452,8 @@ class BatchProcessor:
                 target_output_width=readers["target_w"],
                 max_disp=vid_settings["max_disparity_percentage"],
                 batch_size=task.batch_size,
-                dual_output=settings.dual_output,
+                dual_output=(output_layout == "dual"),
+                output_layout=output_layout,
                 zero_disparity_anchor_val=conv_val,
                 video_stream_info=readers["source_info"],
                 input_bias=vid_settings["input_bias"],
@@ -679,6 +685,11 @@ class BatchProcessor:
         # Check gamma
         if settings.depth_gamma <= 0:
             return False, "Depth Gamma must be positive."
+
+        # Check output layout
+        layout = str(getattr(settings, "output_layout", "") or "").strip().lower()
+        if layout and layout not in {"quad", "dual", "single_warp"}:
+            return False, "Output layout must be one of: quad, dual, single_warp."
 
         # Check dilate/blur values
         if (

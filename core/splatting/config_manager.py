@@ -23,6 +23,7 @@ SPLATTER_DEFAULT_CONFIG = {
     "process_length": "-1",
     "batch_size": "10",
     "dual_output": False,
+    "output_layout": "Quad",
     "enable_global_norm": False,
     "enable_full_resolution": True,
     "enable_low_resolution": False,
@@ -264,6 +265,21 @@ def _apply_backward_compat(config: Dict[str, Any]) -> None:
                     config[key] = str(-(val - 30.0))
             except (ValueError, TypeError):
                 pass
+
+    # Handle output layout migration.
+    # Legacy config only had dual_output (False=Quad, True=Dual).
+    if "output_layout" not in config:
+        dual = bool(config.get("dual_output", False))
+        config["output_layout"] = "Dual" if dual else "Quad"
+    else:
+        raw = str(config.get("output_layout", "")).strip().lower()
+        raw = raw.replace("-", " ").replace("_", " ")
+        if raw in {"dual", "dual output"}:
+            config["output_layout"] = "Dual"
+        elif raw in {"single warp", "single", "warp", "splatted1"}:
+            config["output_layout"] = "Single Warp"
+        else:
+            config["output_layout"] = "Quad"
 
 
 def _get_tk_var_value(var) -> Any:

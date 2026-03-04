@@ -18,6 +18,8 @@ import traceback
 import argparse
 import csv
 import logging
+import queue
+import threading
 import numpy as np
 import re
 from pathlib import Path
@@ -38,7 +40,7 @@ def _normalize_output_root(p: Path) -> Path:
 SPLAT_GUI_PY = "./splatting_gui.py"  # path to your splatting GUI script
 
 INPUT_SOURCE_CLIPS = "./work/seg/"
-INPUT_DEPTH_MAPS   = "./work/depthmap/"
+INPUT_DEPTH_MAPS   = "./work/depthmap/upscaled/"
 OUTPUT_SPLATTED    = "./work/splat/"
 MASK_OUTPUT        = "./work/mask/"   # empty => same folder as main output
 
@@ -56,13 +58,19 @@ LOW_RES_W = 1024
 LOW_RES_H = 512
 LOW_RES_BATCH_SIZE = 15
 
-DUAL_OUTPUT = True  # False => _splatted4, True => _splatted2
+OUTPUT_LAYOUT = "dual"  # "quad" => _splatted4, "dual" => _splatted2, "single_warp" => _splatted1
+DUAL_OUTPUT = True      # legacy fallback if OUTPUT_LAYOUT is invalid
 ENABLE_GLOBAL_NORM = False
 MATCH_DEPTH_RES = True
 
 # Output encode CRF (separate hi/lo)
 OUTPUT_CRF_FULL = 1
 OUTPUT_CRF_LOW  = 23
+FFMPEG_CODEC = ""
+FFMPEG_CRF = OUTPUT_CRF_FULL
+FFMPEG_PRESET = ""
+FFMPEG_PIX_FMT = ""
+FFMPEG_EXTRA_ARGS = ""
 
 # Depth pre-processing
 DEPTH_GAMMA = 1.0
@@ -102,14 +110,6 @@ CLEANUP_ON_FAIL = True     # delete leftover corrupted output(s) before retry / 
 # Hires skip target width (matches your naming: <name>_1920_splatted2.mp4) (matches your naming: <name>_1920_splatted2.mp4)
 HIRES_SKIP_WIDTH = 1920
 
-# Optional in-memory pre-crop on source + depth before splatting.
-# Useful to remove tiny top/bottom bars without creating new files.
-PRE_CROP_TOP = 16
-PRE_CROP_BOTTOM = 16
-PRE_CROP_MULTIPLE_OF = 8
-
-
-
 # -------------------------
 # Blur / Stair smoothing (module-level knobs in splatting_gui)
 # -------------------------
@@ -128,7 +128,37 @@ REPLACE_MASK_SCALE = 1.0
 REPLACE_MASK_MIN_PX = 1
 REPLACE_MASK_MAX_PX = 32
 REPLACE_MASK_GAP_TOL = 0            # not needed anymore
-REPLACE_MASK_DRAW_EDGE = True       # must be True (removes ondulations)
+REPLACE_MASK_DRAW_EDGE = True       # adds one extra-left edge line (stability stays active even when False)
+REPLACE_MASK_CODEC = "ffv1"
+STOP_MARKER = ""
+
+
+def _parse_bool_arg(value):
+    if isinstance(value, bool):
+        return bool(value)
+    txt = str(value or "").strip().lower()
+    if txt in {"1", "true", "yes", "y", "on"}:
+        return True
+    if txt in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def _normalize_auto_convergence_mode(value: str) -> str:
+    raw = str(value or "").strip().lower().replace("-", " ").replace("_", " ")
+    if raw in {"off", "0", "false", "none"}:
+        return "Off"
+    if raw in {"manual"}:
+        return "Manual"
+    if raw in {"average", "avg"}:
+        return "Average"
+    if raw in {"peak"}:
+        return "Peak"
+    if raw in {"hybrid"}:
+        return "Hybrid"
+    if raw in {"minborders", "min borders", "minborder"}:
+        return "MinBorders"
+    return "MinBorders"
 
 
 def _parse_args():
@@ -139,6 +169,72 @@ def _parse_args():
     p.add_argument("--output_splatted", default=OUTPUT_SPLATTED, help="Output folder root for splatted videos.")
     p.add_argument("--mask_output", default=MASK_OUTPUT, help="Output folder for exported clean masks.")
     p.add_argument("--full_res_batch_size", type=int, default=FULL_RES_BATCH_SIZE, help="Batch size for full-res processing.")
+    p.add_argument("--disparity", type=float, default=MAX_DISP, help="Max disparity percent.")
+    p.add_argument("--process_length", type=int, default=PROCESS_LENGTH, help="Frames to process (-1 = full).")
+    p.add_argument(
+        "--enable_full_res",
+        type=_parse_bool_arg,
+        default=ENABLE_FULL_RES,
+        help="Enable full-res task.",
+    )
+    p.add_argument(
+        "--enable_low_res",
+        type=_parse_bool_arg,
+        default=ENABLE_LOW_RES,
+        help="Enable low-res task.",
+    )
+    p.add_argument(
+        "--output_layout",
+        default=OUTPUT_LAYOUT,
+        choices=["quad", "dual", "single_warp"],
+        help="Output layout.",
+    )
+    p.add_argument(
+        "--convergence",
+        type=float,
+        default=ZERO_DISPARITY_ANCHOR,
+        help="Manual convergence anchor used when auto convergence is Off.",
+    )
+    p.add_argument("--dilate_x", type=float, default=DEPTH_DILATE_X)
+    p.add_argument("--dilate_y", type=float, default=DEPTH_DILATE_Y)
+    p.add_argument("--blur_x", type=float, default=DEPTH_BLUR_X)
+    p.add_argument("--blur_y", type=float, default=DEPTH_BLUR_Y)
+    p.add_argument("--dilate_left", type=float, default=DEPTH_DILATE_LEFT)
+    p.add_argument("--blur_balance", type=float, default=0.5)
+    p.add_argument("--gamma", type=float, default=DEPTH_GAMMA)
+    p.add_argument(
+        "--stair_smooth",
+        type=_parse_bool_arg,
+        default=SPLAT_STAIR_SMOOTH_ENABLED,
+        help="Enable stair smoothing.",
+    )
+    p.add_argument("--stair_smooth_kernel", type=int, default=SPLAT_BLUR_KERNEL)
+    p.add_argument("--stair_smooth_x_off", type=int, default=SPLAT_STAIR_EDGE_X_OFFSET)
+    p.add_argument("--stair_smooth_strip", type=int, default=SPLAT_STAIR_STRIP_PX)
+    p.add_argument("--stair_smooth_strength", type=float, default=SPLAT_STAIR_STRENGTH)
+    p.add_argument(
+        "--use_replace_mask",
+        type=_parse_bool_arg,
+        default=REPLACE_MASK_ENABLED,
+        help="Enable replace-mask export.",
+    )
+    p.add_argument("--replace_mask_scale", type=float, default=REPLACE_MASK_SCALE)
+    p.add_argument("--replace_mask_min", type=int, default=REPLACE_MASK_MIN_PX)
+    p.add_argument("--replace_mask_max", type=int, default=REPLACE_MASK_MAX_PX)
+    p.add_argument("--replace_mask_gap", type=int, default=REPLACE_MASK_GAP_TOL)
+    p.add_argument(
+        "--replace_mask_edge",
+        type=_parse_bool_arg,
+        default=REPLACE_MASK_DRAW_EDGE,
+        help="Draw extra left edge line on replace-mask.",
+    )
+    p.add_argument("--replace_mask_codec", default=REPLACE_MASK_CODEC, help="Replace-mask codec.")
+    p.add_argument("--ffmpeg_codec", default=FFMPEG_CODEC, help="Force output codec (optional).")
+    p.add_argument("--ffmpeg_crf", type=int, default=FFMPEG_CRF, help="CRF/CQ for splat output.")
+    p.add_argument("--ffmpeg_preset", default=FFMPEG_PRESET, help="Reserved (not used by runner yet).")
+    p.add_argument("--ffmpeg_pix_fmt", default=FFMPEG_PIX_FMT, help="Reserved (not used by runner yet).")
+    p.add_argument("--ffmpeg_extra_args", default=FFMPEG_EXTRA_ARGS, help="Reserved (not used by runner yet).")
+    p.add_argument("--stop_marker", default=STOP_MARKER, help="Graceful stop marker file.")
     p.add_argument(
         "--log-verbose",
         action=argparse.BooleanOptionalAction,
@@ -148,8 +244,7 @@ def _parse_args():
     p.add_argument(
         "--auto_convergence_mode",
         default=AUTO_CONVERGENCE_MODE,
-        choices=["Off", "Manual", "Average", "Peak", "Hybrid", "MinBorders"],
-        help="Auto-convergence mode to pass into processing settings.",
+        help="Auto-convergence mode to pass into processing settings (off/min_borders/... accepted).",
     )
     p.add_argument(
         "--sidecar-policy",
@@ -168,29 +263,6 @@ def _parse_args():
         choices=["fill-missing", "override-all"],
         help="How CSV convergence should interact with sidecar anchors.",
     )
-    p.add_argument(
-        "--pre-crop-top",
-        type=int,
-        default=PRE_CROP_TOP,
-        help="Rows to crop from top before splatting (applies to source+depth readers).",
-    )
-    p.add_argument(
-        "--pre-crop-bottom",
-        type=int,
-        default=PRE_CROP_BOTTOM,
-        help="Rows to crop from bottom before splatting (applies to source+depth readers).",
-    )
-    p.add_argument(
-        "--pre-crop-multiple-of",
-        type=int,
-        default=PRE_CROP_MULTIPLE_OF,
-        help="If >1, enforce cropped height to be divisible by this value by trimming extra rows.",
-    )
-    p.add_argument(
-        "--disable-pre-crop",
-        action="store_true",
-        help="Disable pre-crop even if hard-coded/CLI crop rows are set.",
-    )
     return p.parse_args()
 
 def _import_module_from_path(py_path: Path):
@@ -203,8 +275,28 @@ def _import_module_from_path(py_path: Path):
     return mod
 
 
-def _compute_task_final_out(output_video_path_base: str, target_output_width: int, dual_output: bool) -> str:
-    suffix = "_splatted2" if dual_output else "_splatted4"
+def _normalize_output_layout(value, fallback_dual: bool = False) -> str:
+    raw = str(value or "").strip().lower().replace("-", " ").replace("_", " ")
+    if raw in {"dual", "dual output"}:
+        return "dual"
+    if raw in {"single warp", "single", "warp", "splatted1"}:
+        return "single_warp"
+    if raw in {"quad", "grid", "splatted4"}:
+        return "quad"
+    return "dual" if bool(fallback_dual) else "quad"
+
+
+def _output_layout_suffix(output_layout: str) -> str:
+    layout = _normalize_output_layout(output_layout)
+    if layout == "single_warp":
+        return "_splatted1"
+    if layout == "dual":
+        return "_splatted2"
+    return "_splatted4"
+
+
+def _compute_task_final_out(output_video_path_base: str, target_output_width: int, output_layout: str) -> str:
+    suffix = _output_layout_suffix(output_layout)
     base_no_ext = os.path.splitext(str(output_video_path_base))[0]
     return f"{base_no_ext}_{int(target_output_width)}{suffix}.mp4"
 
@@ -228,98 +320,6 @@ def _safe_remove(path: str | None, tag: str):
             print(f"[CLEAN] removed {tag}: {path}")
     except Exception as ex:
         print(f"[WARN] failed to remove {tag} '{path}': {ex}")
-
-
-class _NumpyBatch:
-    """Minimal wrapper to keep Decord-like .asnumpy() API."""
-
-    def __init__(self, arr: np.ndarray):
-        self._arr = arr
-
-    def asnumpy(self) -> np.ndarray:
-        return self._arr
-
-
-class _VerticalCropReader:
-    """Reader wrapper that crops top/bottom rows on get_batch()."""
-
-    def __init__(self, inner, crop_top: int, crop_bottom: int):
-        self._inner = inner
-        self._crop_top = max(0, int(crop_top))
-        self._crop_bottom = max(0, int(crop_bottom))
-
-    def __len__(self) -> int:
-        return len(self._inner)
-
-    def seek(self, *args, **kwargs):
-        if hasattr(self._inner, "seek"):
-            return self._inner.seek(*args, **kwargs)
-        return None
-
-    def close(self):
-        if hasattr(self._inner, "close"):
-            return self._inner.close()
-        return None
-
-    def get_batch(self, indices):
-        arr = self._inner.get_batch(indices).asnumpy()
-        if arr.ndim < 3:
-            return _NumpyBatch(arr)
-        if self._crop_top <= 0 and self._crop_bottom <= 0:
-            return _NumpyBatch(arr)
-
-        h = int(arr.shape[1])
-        top = min(self._crop_top, max(0, h - 1))
-        max_bottom = max(0, h - top - 1)
-        bottom = min(self._crop_bottom, max_bottom)
-        end = h - bottom
-        if end <= top:
-            raise ValueError(
-                f"Invalid crop window for height={h}: top={top}, bottom={bottom}"
-            )
-        return _NumpyBatch(arr[:, top:end, ...])
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-
-def _compute_vertical_crop(
-    input_height: int,
-    crop_top: int,
-    crop_bottom: int,
-    enforce_multiple_of: int,
-) -> tuple[int, int, int]:
-    """Compute effective top/bottom crop and resulting output height."""
-    h = int(input_height)
-    top = max(0, int(crop_top))
-    bottom = max(0, int(crop_bottom))
-    mul = int(enforce_multiple_of)
-
-    if top + bottom >= h:
-        raise ValueError(
-            f"Pre-crop too aggressive for height={h}: top={top}, bottom={bottom}"
-        )
-
-    out_h = h - top - bottom
-    if mul > 1 and out_h > 0:
-        rem = out_h % mul
-        if rem:
-            # Keep framing centered by splitting extra trim between top/bottom.
-            extra_top = rem // 2
-            extra_bottom = rem - extra_top
-            top += extra_top
-            bottom += extra_bottom
-            out_h = h - top - bottom
-            if out_h <= 0:
-                raise ValueError(
-                    f"Pre-crop+alignment invalid for height={h} (mul={mul})."
-                )
-            if out_h % mul != 0:
-                raise ValueError(
-                    f"Failed to enforce multiple-of-{mul} (result={out_h})."
-                )
-
-    return top, bottom, out_h
 
 
 def _get_call_arg(args_list: list, kwargs: dict, index: int, name: str):
@@ -355,7 +355,7 @@ def _strip_splatted_suffixes(stem: str) -> str:
     # - clip_1920_splatted2_replace_mask
     # - clip_splatted4
     # - clip_replace_mask
-    out = re.sub(r"_(\d+_)?splatted[24](?:_replace_mask)?$", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"_(\d+_)?splatted[124](?:_replace_mask)?$", "", out, flags=re.IGNORECASE)
     out = re.sub(r"_replace_mask$", "", out, flags=re.IGNORECASE)
     return out
 
@@ -511,28 +511,69 @@ def main():
 
     # Override from CLI
     global SPLAT_GUI_PY, INPUT_SOURCE_CLIPS, INPUT_DEPTH_MAPS, OUTPUT_SPLATTED, MASK_OUTPUT, FULL_RES_BATCH_SIZE
-    global PRE_CROP_TOP, PRE_CROP_BOTTOM, PRE_CROP_MULTIPLE_OF
+    global MAX_DISP, PROCESS_LENGTH, ENABLE_FULL_RES, ENABLE_LOW_RES, OUTPUT_LAYOUT, DUAL_OUTPUT
+    global ZERO_DISPARITY_ANCHOR, AUTO_CONVERGENCE_MODE
+    global DEPTH_DILATE_X, DEPTH_DILATE_Y, DEPTH_BLUR_X, DEPTH_BLUR_Y, DEPTH_DILATE_LEFT, DEPTH_GAMMA
+    global SPLAT_STAIR_SMOOTH_ENABLED, SPLAT_BLUR_KERNEL, SPLAT_STAIR_EDGE_X_OFFSET, SPLAT_STAIR_STRIP_PX, SPLAT_STAIR_STRENGTH
+    global REPLACE_MASK_ENABLED, REPLACE_MASK_SCALE, REPLACE_MASK_MIN_PX, REPLACE_MASK_MAX_PX, REPLACE_MASK_GAP_TOL, REPLACE_MASK_DRAW_EDGE, REPLACE_MASK_CODEC
+    global OUTPUT_CRF_FULL, FFMPEG_CODEC, FFMPEG_PRESET, FFMPEG_PIX_FMT, FFMPEG_EXTRA_ARGS, STOP_MARKER
     SPLAT_GUI_PY = args.gui_script
     INPUT_SOURCE_CLIPS = args.input_source_clips
     INPUT_DEPTH_MAPS = args.input_depth_maps
     OUTPUT_SPLATTED = args.output_splatted
     MASK_OUTPUT = args.mask_output
     FULL_RES_BATCH_SIZE = int(args.full_res_batch_size)
-    PRE_CROP_TOP = max(0, int(args.pre_crop_top))
-    PRE_CROP_BOTTOM = max(0, int(args.pre_crop_bottom))
-    PRE_CROP_MULTIPLE_OF = max(0, int(args.pre_crop_multiple_of))
-    if bool(args.disable_pre_crop):
-        PRE_CROP_TOP = 0
-        PRE_CROP_BOTTOM = 0
-    pre_crop_enabled = bool(PRE_CROP_TOP > 0 or PRE_CROP_BOTTOM > 0)
-    if pre_crop_enabled:
-        print(
-            f"[INFO] Pre-crop enabled: top={PRE_CROP_TOP}, bottom={PRE_CROP_BOTTOM}, "
-            f"multiple_of={PRE_CROP_MULTIPLE_OF}"
-        )
-    else:
-        print("[INFO] Pre-crop disabled.")
+    MAX_DISP = float(args.disparity)
+    PROCESS_LENGTH = int(args.process_length)
+    ENABLE_FULL_RES = bool(args.enable_full_res)
+    ENABLE_LOW_RES = bool(args.enable_low_res)
+    OUTPUT_LAYOUT = _normalize_output_layout(args.output_layout, fallback_dual=bool(DUAL_OUTPUT))
+    DUAL_OUTPUT = bool(OUTPUT_LAYOUT == "dual")
+    conv_raw = float(args.convergence)
+    if conv_raw > 1.0:
+        conv_raw = conv_raw / 100.0
+    ZERO_DISPARITY_ANCHOR = max(0.0, min(1.0, conv_raw))
+    AUTO_CONVERGENCE_MODE = _normalize_auto_convergence_mode(args.auto_convergence_mode)
+    DEPTH_DILATE_X = float(args.dilate_x)
+    DEPTH_DILATE_Y = float(args.dilate_y)
+    DEPTH_BLUR_X = float(args.blur_x)
+    DEPTH_BLUR_Y = float(args.blur_y)
+    DEPTH_DILATE_LEFT = float(args.dilate_left)
+    DEPTH_GAMMA = float(args.gamma)
+    SPLAT_STAIR_SMOOTH_ENABLED = bool(args.stair_smooth)
+    SPLAT_BLUR_KERNEL = int(args.stair_smooth_kernel)
+    SPLAT_STAIR_EDGE_X_OFFSET = int(args.stair_smooth_x_off)
+    SPLAT_STAIR_STRIP_PX = int(args.stair_smooth_strip)
+    SPLAT_STAIR_STRENGTH = float(args.stair_smooth_strength)
+    REPLACE_MASK_ENABLED = bool(args.use_replace_mask)
+    REPLACE_MASK_SCALE = float(args.replace_mask_scale)
+    REPLACE_MASK_MIN_PX = int(args.replace_mask_min)
+    REPLACE_MASK_MAX_PX = int(args.replace_mask_max)
+    REPLACE_MASK_GAP_TOL = int(args.replace_mask_gap)
+    REPLACE_MASK_DRAW_EDGE = bool(args.replace_mask_edge)
+    REPLACE_MASK_CODEC = str(args.replace_mask_codec).strip() or "ffv1"
+    FFMPEG_CODEC = str(args.ffmpeg_codec).strip().lower()
+    FFMPEG_PRESET = str(args.ffmpeg_preset).strip()
+    FFMPEG_PIX_FMT = str(args.ffmpeg_pix_fmt).strip()
+    FFMPEG_EXTRA_ARGS = str(args.ffmpeg_extra_args).strip()
+    STOP_MARKER = str(args.stop_marker).strip()
+    OUTPUT_CRF_FULL = int(args.ffmpeg_crf) if int(args.ffmpeg_crf) >= 0 else int(OUTPUT_CRF_FULL)
 
+    if (
+        FFMPEG_CODEC
+        or int(args.ffmpeg_crf) >= 0
+        or FFMPEG_PRESET
+        or FFMPEG_PIX_FMT
+        or FFMPEG_EXTRA_ARGS
+    ):
+        print(
+            "[INFO] ffmpeg output overrides: "
+            f"codec={FFMPEG_CODEC or 'default'} "
+            f"quality={int(args.ffmpeg_crf) if int(args.ffmpeg_crf) >= 0 else 'default'} "
+            f"preset={FFMPEG_PRESET or 'default'} "
+            f"pix_fmt={FFMPEG_PIX_FMT or 'default'} "
+            f"extra={'set' if FFMPEG_EXTRA_ARGS else 'none'}"
+        )
     gui_path = Path(SPLAT_GUI_PY).resolve()
     if not gui_path.exists():
         raise FileNotFoundError(f"Cannot find splatting_gui.py at: {gui_path}")
@@ -592,6 +633,23 @@ def main():
     except Exception:
         pass
 
+    # Optional ffmpeg output-override hook (used by pipeline master overrides).
+    import core.splatting.render_processor as _render_mod
+    _orig_start_ffmpeg = _render_mod.start_ffmpeg_pipe_process
+
+    def _start_ffmpeg_pipe_process_wrapper(*ff_args, **ff_kwargs):
+        if FFMPEG_CODEC and not ff_kwargs.get("force_output_codec"):
+            ff_kwargs["force_output_codec"] = FFMPEG_CODEC
+        if FFMPEG_PIX_FMT and not ff_kwargs.get("force_output_pix_fmt"):
+            ff_kwargs["force_output_pix_fmt"] = FFMPEG_PIX_FMT
+        if FFMPEG_PRESET and not ff_kwargs.get("force_output_preset"):
+            ff_kwargs["force_output_preset"] = FFMPEG_PRESET
+        if FFMPEG_EXTRA_ARGS and not ff_kwargs.get("ffmpeg_extra_output_args"):
+            ff_kwargs["ffmpeg_extra_output_args"] = FFMPEG_EXTRA_ARGS
+        return _orig_start_ffmpeg(*ff_args, **ff_kwargs)
+
+    _render_mod.start_ffmpeg_pipe_process = _start_ffmpeg_pipe_process_wrapper  # type: ignore
+
     # Monkey-patch RenderProcessor.render_video for:
     # - per-task skip-if-output-exists
     # - retry on failure
@@ -599,6 +657,15 @@ def main():
     from core.splatting.render_processor import RenderProcessor
 
     orig_render_video = RenderProcessor.render_video
+    progress_tracker = {"done": 0, "total": 0}
+
+    def _emit_task_progress(delta: int = 1) -> None:
+        progress_tracker["done"] = max(0, int(progress_tracker["done"]) + int(delta))
+        total = max(0, int(progress_tracker.get("total", 0)))
+        if total > 0:
+            print(f"[RUN ] {progress_tracker['done']}/{total}")
+        else:
+            print(f"[RUN ] {progress_tracker['done']}")
 
     def render_video_wrapper(self, *args, **kwargs):
         args_list = list(args)
@@ -607,64 +674,32 @@ def main():
         target_output_width = _get_call_arg(args_list, kwargs, 6, "target_output_width")
         dual_output_raw = _get_call_arg(args_list, kwargs, 9, "dual_output")
         dual_output = bool(DUAL_OUTPUT if dual_output_raw is None else dual_output_raw)
+        output_layout_raw = _get_call_arg(args_list, kwargs, 10, "output_layout")
+        output_layout = _normalize_output_layout(output_layout_raw, fallback_dual=dual_output)
         replace_mask_enabled_raw = _get_call_arg(
-            args_list, kwargs, 37, "replace_mask_enabled"
+            args_list, kwargs, 38, "replace_mask_enabled"
         )
+        if replace_mask_enabled_raw is None:
+            replace_mask_enabled_raw = _get_call_arg(args_list, kwargs, 37, "replace_mask_enabled")
         replace_mask_enabled = bool(
             REPLACE_MASK_ENABLED
             if replace_mask_enabled_raw is None
             else replace_mask_enabled_raw
         )
-        replace_mask_dir_raw = _get_call_arg(args_list, kwargs, 38, "replace_mask_dir")
+        replace_mask_dir_raw = _get_call_arg(args_list, kwargs, 39, "replace_mask_dir")
+        if replace_mask_dir_raw is None:
+            replace_mask_dir_raw = _get_call_arg(args_list, kwargs, 38, "replace_mask_dir")
         replace_mask_dir = str(MASK_OUTPUT if replace_mask_dir_raw is None else replace_mask_dir_raw)
-
-        if pre_crop_enabled:
-            target_output_height = _get_call_arg(args_list, kwargs, 5, "target_output_height")
-            src_reader = _get_call_arg(args_list, kwargs, 0, "input_video_reader")
-            depth_reader = _get_call_arg(args_list, kwargs, 1, "depth_map_reader")
-
-            if target_output_height is not None and src_reader is not None and depth_reader is not None:
-                try:
-                    eff_top, eff_bottom, cropped_h = _compute_vertical_crop(
-                        input_height=int(target_output_height),
-                        crop_top=int(PRE_CROP_TOP),
-                        crop_bottom=int(PRE_CROP_BOTTOM),
-                        enforce_multiple_of=int(PRE_CROP_MULTIPLE_OF),
-                    )
-                    if eff_top > 0 or eff_bottom > 0:
-                        _set_call_arg(
-                            args_list,
-                            kwargs,
-                            0,
-                            "input_video_reader",
-                            _VerticalCropReader(src_reader, eff_top, eff_bottom),
-                        )
-                        _set_call_arg(
-                            args_list,
-                            kwargs,
-                            1,
-                            "depth_map_reader",
-                            _VerticalCropReader(depth_reader, eff_top, eff_bottom),
-                        )
-                        _set_call_arg(args_list, kwargs, 5, "target_output_height", int(cropped_h))
-                        base_label = (
-                            os.path.basename(str(output_video_path_base))
-                            if output_video_path_base is not None
-                            else "unknown"
-                        )
-                        print(
-                            f"[INFO] Pre-crop {base_label}: "
-                            f"H {int(target_output_height)} -> {int(cropped_h)} "
-                            f"(top={eff_top}, bottom={eff_bottom})"
-                        )
-                except Exception as ex:
-                    print(f"[WARN] pre-crop skipped (invalid params): {ex}")
 
         final_out = None
         replace_out = None
         try:
             if output_video_path_base is not None and target_output_width is not None:
-                final_out = _compute_task_final_out(str(output_video_path_base), int(target_output_width), dual_output)
+                final_out = _compute_task_final_out(
+                    str(output_video_path_base),
+                    int(target_output_width),
+                    output_layout,
+                )
                 replace_out = _compute_replace_mask_out(
                     final_out=final_out,
                     replace_mask_enabled=replace_mask_enabled,
@@ -673,6 +708,7 @@ def main():
 
                 if SKIP_IF_OUTPUT_EXISTS and os.path.exists(final_out) and os.path.getsize(final_out) > 0:
                     print(f"[SKIP] task output exists: {final_out}")
+                    _emit_task_progress(1)
                     return True
         except Exception as ex:
             print(f"[WARN] task skip-check failed, continuing: {ex}")
@@ -690,6 +726,7 @@ def main():
                 print(f"[ERR ] render_video raised: {ex}")
 
             if ok:
+                _emit_task_progress(1)
                 return True
 
             if getattr(self, "stop_event", None) is not None and self.stop_event.is_set():
@@ -707,6 +744,7 @@ def main():
             print(f"[ERR ] giving up after {max_attempts} attempt(s). Last exception: {last_exc}")
         else:
             print(f"[ERR ] giving up after {max_attempts} attempt(s).")
+        _emit_task_progress(1)
         return False
 
     RenderProcessor.render_video = render_video_wrapper  # type: ignore
@@ -725,17 +763,32 @@ def main():
                     settings = args[1]
 
                 if video_path is not None and settings is not None and getattr(settings, "enable_full_resolution", False):
+                    if STOP_MARKER and os.path.exists(STOP_MARKER):
+                        app.stop_event.set()
+                        print("[STOP] stop marker detected before next clip. Exiting batch loop.")
+                        return len(app.batch_processor.get_defined_tasks(settings))
                     out_root = Path(getattr(settings, "output_splatted", OUTPUT_SPLATTED)).resolve()
                     base_name = Path(str(video_path)).stem
-                    suffix = "_splatted2" if bool(getattr(settings, "dual_output", DUAL_OUTPUT)) else "_splatted4"
+                    suffix = _output_layout_suffix(
+                        _normalize_output_layout(
+                            getattr(settings, "output_layout", None),
+                            fallback_dual=bool(getattr(settings, "dual_output", DUAL_OUTPUT)),
+                        )
+                    )
                     final_out = out_root / "hires" / f"{base_name}_{int(HIRES_SKIP_WIDTH)}{suffix}.mp4"
                     if final_out.exists() and final_out.stat().st_size > 0:
                         print(f"[SKIP] whole video (hires exists): {final_out}")
-                        return len(app.batch_processor.get_defined_tasks(settings))
+                        skipped = len(app.batch_processor.get_defined_tasks(settings))
+                        _emit_task_progress(skipped)
+                        return skipped
             except Exception as ex:
                 print(f"[WARN] early skip-check failed, continuing: {ex}")
 
-            return orig_orchestration(*args, **kwargs)
+            result = orig_orchestration(*args, **kwargs)
+            if STOP_MARKER and os.path.exists(STOP_MARKER):
+                app.stop_event.set()
+                print("[STOP] stop marker detected after current clip. Stopping before next clip.")
+            return result
 
         app.batch_processor._process_single_video_orchestration = _process_single_video_orchestration_skip_wrapper  # type: ignore
 
@@ -783,6 +836,8 @@ def main():
 
         app.batch_processor._get_video_specific_settings = _get_video_specific_settings_csv_wrapper  # type: ignore
 
+    normalized_output_layout = _normalize_output_layout(OUTPUT_LAYOUT, fallback_dual=bool(DUAL_OUTPUT))
+
     settings = mod.ProcessingSettings(
         input_source_clips=str(Path(INPUT_SOURCE_CLIPS).resolve()),
         input_depth_maps=str(Path(INPUT_DEPTH_MAPS).resolve()),
@@ -795,7 +850,8 @@ def main():
         low_res_width=int(LOW_RES_W),
         low_res_height=int(LOW_RES_H),
         low_res_batch_size=int(LOW_RES_BATCH_SIZE),
-        dual_output=bool(DUAL_OUTPUT),
+        dual_output=bool(normalized_output_layout == "dual"),
+        output_layout=str(normalized_output_layout),
         zero_disparity_anchor=float(ZERO_DISPARITY_ANCHOR),
         enable_global_norm=bool(ENABLE_GLOBAL_NORM),
         match_depth_res=bool(MATCH_DEPTH_RES),
@@ -810,7 +866,8 @@ def main():
         depth_blur_size_y=float(DEPTH_BLUR_Y),
         depth_dilate_left=float(DEPTH_DILATE_LEFT),
         depth_blur_left=float(DEPTH_BLUR_LEFT),
-        auto_convergence_mode=str(args.auto_convergence_mode),
+        depth_blur_left_mix=float(args.blur_balance),
+        auto_convergence_mode=str(AUTO_CONVERGENCE_MODE),
         enable_sidecar_gamma=bool(ENABLE_SIDECAR_GAMMA),
         enable_sidecar_blur_dilate=bool(ENABLE_SIDECAR_BLUR_DILATE),
         sidecar_ext=sidecar_ext,
@@ -826,12 +883,64 @@ def main():
         replace_mask_min_px=int(REPLACE_MASK_MIN_PX),
         replace_mask_max_px=int(REPLACE_MASK_MAX_PX),
         replace_mask_gap_tol=int(REPLACE_MASK_GAP_TOL),
+        replace_mask_codec=str(REPLACE_MASK_CODEC),
         replace_mask_draw_edge=bool(REPLACE_MASK_DRAW_EDGE),
     )
+
+    try:
+        setup_preview = app.batch_processor.setup_batch_processing(settings)
+        task_defs = app.batch_processor.get_defined_tasks(settings)
+        if not setup_preview.error:
+            progress_tracker["total"] = max(0, len(setup_preview.input_videos) * len(task_defs))
+            if progress_tracker["total"] > 0:
+                print(f"[TOTAL] {progress_tracker['total']}")
+    except Exception as ex:
+        print(f"[WARN] failed to precompute task total: {ex}")
 
     print("[INFO] Starting splatting batch with settings:")
     for k in sorted(settings.__dict__.keys()):
         print(f"  - {k} = {getattr(settings, k)}")
+
+    # Lightweight queue monitor to expose runner progress in CLI for pipeline GUI parsing.
+    monitor_stop = threading.Event()
+
+    def _progress_monitor() -> None:
+        while not monitor_stop.is_set():
+            try:
+                msg = app.progress_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if msg == "finished":
+                break
+            if not isinstance(msg, tuple) or not msg:
+                continue
+            kind = msg[0]
+            if kind == "total":
+                try:
+                    total = int(msg[1])
+                    if total > 0:
+                        progress_tracker["total"] = max(progress_tracker["total"], total)
+                except Exception:
+                    pass
+            elif kind == "status":
+                try:
+                    status_line = str(msg[1]).strip()
+                    if status_line:
+                        print(f"[STAT] {status_line}")
+                except Exception:
+                    pass
+            elif kind == "update_info":
+                try:
+                    info = msg[1] if len(msg) > 1 else {}
+                    if isinstance(info, dict):
+                        clip = str(info.get("filename", "")).strip()
+                        if clip:
+                            print(f"[CLIP] {clip}")
+                except Exception:
+                    pass
+
+    monitor_thread = threading.Thread(target=_progress_monitor, daemon=True)
+    monitor_thread.start()
 
     t0 = time.time()
     try:
@@ -841,6 +950,11 @@ def main():
         traceback.print_exc()
         sys.exit(2)
     finally:
+        monitor_stop.set()
+        try:
+            monitor_thread.join(timeout=1.5)
+        except Exception:
+            pass
         dt = time.time() - t0
         print(f"[DONE] elapsed={dt:.1f}s")
         try:

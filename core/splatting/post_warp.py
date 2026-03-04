@@ -127,9 +127,16 @@ def build_replace_mask_edge_hole_run(
         active = _shift_right_bool(active, 1) & hole_s
         replace |= active
 
+    # Always keep a 1px stability boundary on the left side of hole-runs.
+    # This avoids reintroducing internal waviness when the optional visible edge is disabled.
+    boundary_core = _shift_left_bool(seeds_ok, 1) & (~hole_s)
+    replace |= boundary_core
+
+    # Optional visual edge: adds one extra left pixel line only.
+    # This toggle is intentionally cosmetic and does not control stabilization anymore.
     if draw_edge:
-        boundary = _shift_left_bool(seeds_ok, 1) & (~hole_s)
-        replace |= boundary
+        boundary_extra = _shift_left_bool(boundary_core, 1) & (~hole_s)
+        replace |= boundary_extra
 
     return replace
 
@@ -272,4 +279,3 @@ def apply_staircase_smooth_bgside(
     out = img * (1.0 - w3) + blur * w3
 
     return out[0] if single_frame else out
-

@@ -1101,8 +1101,8 @@ class VideoPreviewer(ttk.Frame):
                 # --- MODIFIED: Explicitly check for valid path and skip if None/empty ---
                 if not isinstance(path, str) or not path or not os.path.exists(path):
                     self.source_readers[key] = None
-                    # Log only if the key is expected to have a path (i.e., not a flag like 'is_sbs_input')
-                    if key not in ["is_sbs_input", "is_quad_input"]:
+                    # Log only if the key is expected to have a path (not metadata flags/structs).
+                    if key not in ["is_sbs_input", "is_quad_input", "is_single_input", "input_layout", "sidecar"]:
                         logger.debug(
                             f"Source '{key}' skipped. Path is not a string or file not found: {path}"
                         )
