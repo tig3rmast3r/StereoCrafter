@@ -30,6 +30,7 @@ Tries NVENC first; falls back to libx264 if NVENC fails.
 """
 import gc
 import importlib.util
+import shlex
 import shutil
 import subprocess
 import time
@@ -121,16 +122,41 @@ def _try_nvenc_encode(nvenc_cmd, x264_cmd):
         return False, p2
 
 
+def _set_arg_value(cmd: list[str], key: str, value: str) -> None:
+    try:
+        idx = cmd.index(key)
+        if idx + 1 < len(cmd):
+            cmd[idx + 1] = str(value)
+    except ValueError:
+        pass
+
+
 def _round_up(n: int, m: int) -> int:
     return ((n + m - 1) // m) * m
 
 
-def _preprocess_video(src: Path, dst: Path, content_w: int, content_h: int, pad_w: int, pad_h: int):
+def _preprocess_video(
+    src: Path,
+    dst: Path,
+    content_w: int,
+    content_h: int,
+    pad_w: int,
+    pad_h: int,
+    pad_x: int,
+    pad_y: int,
+    ffmpeg_codec: str = "",
+    ffmpeg_crf: int = -1,
+    ffmpeg_preset: str = "",
+    ffmpeg_pix_fmt: str = "",
+    ffmpeg_extra_args: str = "",
+):
     # Scale always to content_w x content_h, then pad ONLY if needed.
+    # Important: pad placement is explicit (pad_x/pad_y) so caller can anchor content.
+    pix_fmt = (ffmpeg_pix_fmt or "yuv420p").strip()
     vf_parts = [f"scale={content_w}:{content_h}:flags=lanczos"]
     if pad_w != content_w or pad_h != content_h:
-        vf_parts.append(f"pad={pad_w}:{pad_h}:(ow-iw)/2:(oh-ih)/2:black")
-    vf_parts.append("format=yuv420p")
+        vf_parts.append(f"pad={pad_w}:{pad_h}:{int(pad_x)}:{int(pad_y)}:black")
+    vf_parts.append(f"format={pix_fmt}")
     vf = ",".join(vf_parts)
 
     nvenc = [
@@ -143,7 +169,7 @@ def _preprocess_video(src: Path, dst: Path, content_w: int, content_h: int, pad_
         "-rc", "constqp",
         "-qp", "0",                # lossless-ish preprocess
         "-profile:v", "main",
-        "-pix_fmt", "yuv420p",
+        "-pix_fmt", pix_fmt,
         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
         "-color_range", "tv",
         "-movflags", "+write_colr",
@@ -158,12 +184,38 @@ def _preprocess_video(src: Path, dst: Path, content_w: int, content_h: int, pad_
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "0",
-        "-pix_fmt", "yuv420p",
+        "-pix_fmt", pix_fmt,
         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
         "-color_range", "tv",
         "-movflags", "+write_colr",
         str(dst),
     ]
+
+    preset = (ffmpeg_preset or "").strip()
+    if preset:
+        _set_arg_value(nvenc, "-preset", preset)
+        _set_arg_value(x264, "-preset", preset)
+    if int(ffmpeg_crf) >= 0:
+        _set_arg_value(nvenc, "-qp", str(int(ffmpeg_crf)))
+        _set_arg_value(x264, "-crf", str(int(ffmpeg_crf)))
+
+    extra = (ffmpeg_extra_args or "").strip()
+    if extra:
+        extra_tokens = shlex.split(extra)
+        nvenc = nvenc[:-1] + extra_tokens + [nvenc[-1]]
+        x264 = x264[:-1] + extra_tokens + [x264[-1]]
+
+    codec = (ffmpeg_codec or "").strip().lower()
+    if codec:
+        if "nvenc" in codec:
+            _set_arg_value(nvenc, "-c:v", ffmpeg_codec.strip())
+            _run(nvenc, log_prefix="[FFMPEG-NVENC]", check=True)
+            return
+        if codec.startswith("libx"):
+            _set_arg_value(x264, "-c:v", ffmpeg_codec.strip())
+            _run(x264, log_prefix="[FFMPEG-X264]", check=True)
+            return
+        print(f"[WARN] unsupported ffmpeg_codec override for preprocess: {ffmpeg_codec} (using auto fallback)")
 
     _try_nvenc_encode(nvenc, x264)
 
@@ -173,18 +225,26 @@ def _postprocess_depth(
     dst_final: Path,
     crop_w: int,
     crop_h: int,
+    crop_x: int,
+    crop_y: int,
     out_w: int,
     out_h: int,
     final_upscale: bool = True,
     padded: bool = True,
+    ffmpeg_codec: str = "",
+    ffmpeg_crf: int = -1,
+    ffmpeg_preset: str = "",
+    ffmpeg_pix_fmt: str = "",
+    ffmpeg_extra_args: str = "",
 ):
-    # If padded is True, remove pad (center crop) before optional upscale.
+    # If padded is True, remove pad using explicit crop offsets before optional upscale.
+    pix_fmt = (ffmpeg_pix_fmt or "yuv420p").strip()
     vf_parts = []
     if padded:
-        vf_parts.append(f"crop={crop_w}:{crop_h}:(in_w-{crop_w})/2:(in_h-{crop_h})/2")
+        vf_parts.append(f"crop={crop_w}:{crop_h}:{int(crop_x)}:{int(crop_y)}")
     if final_upscale:
         vf_parts.append(f"scale={out_w}:{out_h}:flags=neighbor")
-    vf_parts.append("format=yuv420p")
+    vf_parts.append(f"format={pix_fmt}")
     vf = ",".join(vf_parts)
 
     nvenc = [
@@ -195,9 +255,9 @@ def _postprocess_depth(
         "-c:v", "h264_nvenc",
         "-preset", "medium",
         "-rc", "constqp",
-        "-qp", "1",                # very high quality output (smaller than qp0)
+        "-qp", "0",                # depthmap: preserve max precision
         "-profile:v", "main",
-        "-pix_fmt", "yuv420p",
+        "-pix_fmt", pix_fmt,
         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
         "-color_range", "tv",
         "-movflags", "+write_colr",
@@ -211,13 +271,39 @@ def _postprocess_depth(
         "-vf", vf,
         "-c:v", "libx264",
         "-preset", "veryfast",
-        "-crf", "1",
-        "-pix_fmt", "yuv420p",
+        "-crf", "0",
+        "-pix_fmt", pix_fmt,
         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
         "-color_range", "tv",
         "-movflags", "+write_colr",
         str(dst_final),
     ]
+
+    preset = (ffmpeg_preset or "").strip()
+    if preset:
+        _set_arg_value(nvenc, "-preset", preset)
+        _set_arg_value(x264, "-preset", preset)
+    if int(ffmpeg_crf) >= 0:
+        _set_arg_value(nvenc, "-qp", str(int(ffmpeg_crf)))
+        _set_arg_value(x264, "-crf", str(int(ffmpeg_crf)))
+
+    extra = (ffmpeg_extra_args or "").strip()
+    if extra:
+        extra_tokens = shlex.split(extra)
+        nvenc = nvenc[:-1] + extra_tokens + [nvenc[-1]]
+        x264 = x264[:-1] + extra_tokens + [x264[-1]]
+
+    codec = (ffmpeg_codec or "").strip().lower()
+    if codec:
+        if "nvenc" in codec:
+            _set_arg_value(nvenc, "-c:v", ffmpeg_codec.strip())
+            _run(nvenc, log_prefix="[FFMPEG-NVENC]", check=True)
+            return
+        if codec.startswith("libx"):
+            _set_arg_value(x264, "-c:v", ffmpeg_codec.strip())
+            _run(x264, log_prefix="[FFMPEG-X264]", check=True)
+            return
+        print(f"[WARN] unsupported ffmpeg_codec override for postprocess: {ffmpeg_codec} (using auto fallback)")
 
     _try_nvenc_encode(nvenc, x264)
 
@@ -260,6 +346,15 @@ def run(
     keep_temps: bool = False,
     # NEW: Final upscale policy (default keeps current behavior)
     final_upscale: bool = True,
+    # Pad anchor policy
+    pad_align_bottom: bool = True,
+    # Optional ffmpeg overrides applied to preprocess + worker output + postprocess.
+    # Keep empty / -1 to preserve existing behavior.
+    ffmpeg_codec: str = "",
+    ffmpeg_crf: int = -1,
+    ffmpeg_preset: str = "",
+    ffmpeg_pix_fmt: str = "",
+    ffmpeg_extra_args: str = "",
 ):
     input_dir_p = Path(input_dir).resolve()
     output_dir_p = Path(output_dir).resolve()
@@ -316,6 +411,14 @@ def run(
     print(f"[INFO] Sizes: auto_sizes={auto_sizes} | fixed_pad={pad_w}x{pad_h} fixed_content={content_w}x{content_h}")
     print(f"[INFO] Params: offload={cpu_offload_mode} decode_chunk_size={decode_chunk_size} window={window_size} overlap={overlap} steps={inference_steps} gs={guidance_scale}")
     print(f"[INFO] final_upscale={final_upscale}")
+    print(
+        "[INFO] ffmpeg overrides: "
+        f"codec={ffmpeg_codec or 'default'} "
+        f"crf={ffmpeg_crf if int(ffmpeg_crf) >= 0 else 'default'} "
+        f"preset={ffmpeg_preset or 'default'} "
+        f"pix_fmt={ffmpeg_pix_fmt or 'default'} "
+        f"extra={'set' if str(ffmpeg_extra_args).strip() else 'none'}"
+    )
 
     for i, in_path in enumerate(files, 1):
         processed += 1
@@ -358,8 +461,12 @@ def run(
             cw, ch, pw, ph = int(content_w), int(content_h), int(pad_w), int(pad_h)
 
         padded = (pw != cw) or (ph != ch)
-
-
+        pad_x = max(0, (pw - cw) // 2)
+        if bool(pad_align_bottom):
+            # Keep content aligned to the bottom of padded canvas to avoid synthetic bottom bar artifacts.
+            pad_y = max(0, ph - ch)
+        else:
+            pad_y = max(0, (ph - ch) // 2)
 
         stem = in_path.stem
         tmp_pre = temp_dir / f"{stem}__pre_{pw}x{ph}.mp4"
@@ -372,7 +479,11 @@ def run(
                 except Exception:
                     pass
 
-        print(f"[RUN ] {i}/{total} {in_path.name} -> {out_final.name} (orig {orig_w}x{orig_h} | half {cw}x{ch} | pad {pw}x{ph} | padded={padded})")
+        print(
+            f"[RUN ] {i}/{total} {in_path.name} -> {out_final.name} "
+            f"(orig {orig_w}x{orig_h} | half {cw}x{ch} | pad {pw}x{ph} "
+            f"| pad_xy={pad_x},{pad_y} | padded={padded})"
+        )
         t0 = time.perf_counter()
 
         def attempt(mode: str, dcs: int):
@@ -380,7 +491,21 @@ def run(
             if mode != getattr(runner, "_batch_mode", mode):
                 hard_reset_runner(mode)
 
-            _preprocess_video(in_path, tmp_pre, cw, ch, pw, ph)
+            _preprocess_video(
+                in_path,
+                tmp_pre,
+                cw,
+                ch,
+                pw,
+                ph,
+                pad_x,
+                pad_y,
+                ffmpeg_codec=ffmpeg_codec,
+                ffmpeg_crf=int(ffmpeg_crf),
+                ffmpeg_preset=ffmpeg_preset,
+                ffmpeg_pix_fmt=ffmpeg_pix_fmt,
+                ffmpeg_extra_args=ffmpeg_extra_args,
+            )
 
             runner.infer_to_gray_video(
                 input_video_path=str(tmp_pre),
@@ -397,10 +522,13 @@ def run(
                 target_fps=float(target_fps),
                 max_res=int(max_res),
                 far_black=bool(far_black),
-                crf=int(crf),
-                preset=str(preset),
+                crf=int(ffmpeg_crf) if int(ffmpeg_crf) >= 0 else int(crf),
+                preset=(str(ffmpeg_preset).strip() or str(preset)),
                 debug_mem=bool(debug_mem),
                 decode_chunk_size=int(dcs),
+                codec=(str(ffmpeg_codec).strip() or "h264_nvenc"),
+                pix_fmt=(str(ffmpeg_pix_fmt).strip() or "yuv420p"),
+                ffmpeg_extra_args=str(ffmpeg_extra_args or ""),
             )
 
             _postprocess_depth(
@@ -408,10 +536,17 @@ def run(
                 out_final,
                 cw,
                 ch,
+                pad_x,
+                pad_y,
                 orig_w,
                 orig_h,
                 final_upscale=bool(final_upscale),
                 padded=bool(padded),
+                ffmpeg_codec=ffmpeg_codec,
+                ffmpeg_crf=int(ffmpeg_crf),
+                ffmpeg_preset=ffmpeg_preset,
+                ffmpeg_pix_fmt=ffmpeg_pix_fmt,
+                ffmpeg_extra_args=ffmpeg_extra_args,
             )
 
         try:
@@ -548,6 +683,14 @@ def main():
 
     # NEW: final upscale on/off (default True keeps current behavior)
     ap.add_argument("--final_upscale", type=_bool, default=True)
+    ap.add_argument("--pad_align_bottom", type=_bool, default=True)
+
+    # Optional ffmpeg overrides (empty/-1 keeps legacy behavior).
+    ap.add_argument("--ffmpeg_codec", default="")
+    ap.add_argument("--ffmpeg_crf", type=int, default=-1)
+    ap.add_argument("--ffmpeg_preset", default="")
+    ap.add_argument("--ffmpeg_pix_fmt", default="")
+    ap.add_argument("--ffmpeg_extra_args", default="")
 
     args = ap.parse_args()
     run(**vars(args))
@@ -555,4 +698,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

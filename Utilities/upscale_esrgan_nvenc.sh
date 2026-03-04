@@ -5,12 +5,57 @@ IN_DIR="${1:?uso: $0 IN_DIR OUT_DIR [SCALE] [MODEL] [TILE] [DEST_WxH] [JOBS] [RE
 OUT_DIR="${2:?uso: $0 IN_DIR OUT_DIR [SCALE] [MODEL] [TILE] [DEST_WxH] [JOBS] [RETRIES]}"
 SCALE="${3:-2}"
 MODEL="${4:-realesr-animevideov3-x2}"
-TILE="${5:-256}"
+TILE="${5:-auto}"
 DEST="${6:-}"          # es: 1920x1152
 MAX_JOBS="${7:-4}"     # default 4
 MAX_RETRIES="${8:-3}"  # default 3 retry per file
 
-REALESRGAN_BIN="${REALESRGAN_BIN:-$HOME/tools/realesrgan/realesrgan-ncnn-vulkan}"
+REALESRGAN_BIN="${REALESRGAN_BIN:-realesrgan-ncnn-vulkan}"
+REALESRGAN_MODEL_DIR="${REALESRGAN_MODEL_DIR:-}"
+REALESRGAN_OUT_CODEC="${REALESRGAN_OUT_CODEC:-h264_nvenc}"
+REALESRGAN_OUT_PRESET="${REALESRGAN_OUT_PRESET:-medium}"
+REALESRGAN_OUT_CRF="${REALESRGAN_OUT_CRF:-0}"
+REALESRGAN_OUT_PIX_FMT="${REALESRGAN_OUT_PIX_FMT:-yuv420p}"
+REALESRGAN_OUT_EXTRA_ARGS="${REALESRGAN_OUT_EXTRA_ARGS:-}"
+
+resolve_tile_for_file() {
+  local in_path="$1"
+  local tile_raw tile_lc h
+  tile_raw="${TILE//[[:space:]]/}"
+  tile_lc="${tile_raw,,}"
+
+  if [[ "$tile_lc" =~ ^[0-9]+$ ]] && (( tile_lc > 0 )); then
+    echo "$tile_lc"
+    return 0
+  fi
+
+  if [[ -n "$tile_lc" && "$tile_lc" != "auto" ]]; then
+    echo "[WARN] invalid TILE='$TILE', using auto tile from input height." >&2
+  fi
+
+  h="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$in_path" 2>/dev/null | head -n1 | tr -d '[:space:]')"
+  if [[ "$h" =~ ^[0-9]+$ ]] && (( h > 0 )); then
+    echo "$h"
+    return 0
+  fi
+
+  echo "256"
+}
+
+resolve_realesrgan_bin() {
+  local candidate="$1"
+  if [[ "$candidate" == */* ]]; then
+    [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
+    return 1
+  fi
+  command -v "$candidate" 2>/dev/null || return 1
+}
+
+if ! REALESRGAN_BIN_RESOLVED="$(resolve_realesrgan_bin "$REALESRGAN_BIN")"; then
+  echo "RealESRGAN binary not found: $REALESRGAN_BIN" >&2
+  echo "Set REALESRGAN_BIN (bundled path) or install realesrgan-ncnn-vulkan in PATH." >&2
+  exit 1
+fi
 
 mkdir -p "$OUT_DIR"
 
@@ -29,7 +74,15 @@ if [[ -n "$DEST" ]]; then
 fi
 
 echo "FPS (dal primo file): $FPS"
-echo "Scale: $SCALE  Model: $MODEL  Tile: $TILE"
+if [[ "${TILE//[[:space:]]/}" =~ ^[0-9]+$ ]] && (( ${TILE//[[:space:]]/} > 0 )); then
+  echo "Scale: $SCALE  Model: $MODEL  Tile: ${TILE//[[:space:]]/}"
+else
+  echo "Scale: $SCALE  Model: $MODEL  Tile: auto (per-file input height)"
+fi
+if [[ -n "$REALESRGAN_MODEL_DIR" ]]; then
+  echo "Model dir: $REALESRGAN_MODEL_DIR"
+fi
+echo "Encode: codec=$REALESRGAN_OUT_CODEC preset=$REALESRGAN_OUT_PRESET crf=${REALESRGAN_OUT_CRF:-default} pix_fmt=$REALESRGAN_OUT_PIX_FMT"
 [[ -n "$DEST" ]] && echo "Resize finale: $DEST (stretch libero)"
 echo "Parallel jobs: $MAX_JOBS"
 echo "Retries per file: $MAX_RETRIES"
@@ -65,11 +118,14 @@ tail_err() {
 
 process_one() {
   local IN="$1"
-  local base stem OUT_VIDEO tmp_out TMP attempt ok log_esr log_extract log_encode rc i f n
+  local base stem OUT_VIDEO tmp_out TMP attempt ok log_esr log_extract log_encode rc i f n tile_for_file
+  local codec_l qp crf_v
+  local -a cmd extra_tokens
 
   base="$(basename "$IN")"
   stem="${base%.*}"
   OUT_VIDEO="$OUT_DIR/${stem}.mp4"
+  tile_for_file="$(resolve_tile_for_file "$IN")"
 
   if [[ -s "$OUT_VIDEO" ]]; then
     echo "[SKIP] $base"
@@ -80,7 +136,7 @@ process_one() {
   ok=0
 
   while (( attempt <= MAX_RETRIES )); do
-    echo "[RUN ] $base (try $attempt/$MAX_RETRIES)"
+    echo "[RUN ] $base (try $attempt/$MAX_RETRIES, tile=$tile_for_file)"
 
     TMP="$(mktemp -d)"
     cleanup() { rm -rf "$TMP"; }
@@ -115,7 +171,11 @@ process_one() {
 
     # Upscale
     set +e
-    "$REALESRGAN_BIN" -i "$TMP/in" -o "$TMP/out" -n "$MODEL" -s "$SCALE" -t "$TILE" >"$log_esr" 2>&1
+    if [[ -n "$REALESRGAN_MODEL_DIR" ]]; then
+      "$REALESRGAN_BIN_RESOLVED" -i "$TMP/in" -o "$TMP/out" -n "$MODEL" -m "$REALESRGAN_MODEL_DIR" -s "$SCALE" -t "$tile_for_file" >"$log_esr" 2>&1
+    else
+      "$REALESRGAN_BIN_RESOLVED" -i "$TMP/in" -o "$TMP/out" -n "$MODEL" -s "$SCALE" -t "$tile_for_file" >"$log_esr" 2>&1
+    fi
     rc=$?
     set -e
     if (( rc != 0 )); then
@@ -146,18 +206,42 @@ process_one() {
 
     # Encode
     set +e
+    cmd=(ffmpeg -hide_banner -loglevel error -y -framerate "$FPS" -i "$TMP/outseq/%08d.png")
     if [[ -n "$VF" ]]; then
-      ffmpeg -hide_banner -loglevel error -y \
-        -framerate "$FPS" -i "$TMP/outseq/%08d.png" \
-        -vf "$VF" \
-        -c:v h264_nvenc -preset medium -rc constqp -qp 0 -profile:v main -pix_fmt yuv420p \
-        "$tmp_out" >"$log_encode" 2>&1
-    else
-      ffmpeg -hide_banner -loglevel error -y \
-        -framerate "$FPS" -i "$TMP/outseq/%08d.png" \
-        -c:v h264_nvenc -preset medium -rc constqp -qp 0 -profile:v main -pix_fmt yuv420p \
-        "$tmp_out" >"$log_encode" 2>&1
+      cmd+=(-vf "$VF")
     fi
+
+    codec_l="${REALESRGAN_OUT_CODEC,,}"
+    if [[ "$codec_l" == *"nvenc"* ]]; then
+      qp="0"
+      if [[ "$REALESRGAN_OUT_CRF" =~ ^-?[0-9]+$ ]] && [[ "$REALESRGAN_OUT_CRF" -ge 0 ]]; then
+        qp="$REALESRGAN_OUT_CRF"
+      fi
+      cmd+=(-c:v "$REALESRGAN_OUT_CODEC")
+      if [[ -n "$REALESRGAN_OUT_PRESET" ]]; then
+        cmd+=(-preset "$REALESRGAN_OUT_PRESET")
+      fi
+      cmd+=(-rc constqp -qp "$qp")
+    else
+      crf_v="1"
+      if [[ "$REALESRGAN_OUT_CRF" =~ ^-?[0-9]+$ ]] && [[ "$REALESRGAN_OUT_CRF" -ge 0 ]]; then
+        crf_v="$REALESRGAN_OUT_CRF"
+      fi
+      cmd+=(-c:v "$REALESRGAN_OUT_CODEC")
+      if [[ -n "$REALESRGAN_OUT_PRESET" ]]; then
+        cmd+=(-preset "$REALESRGAN_OUT_PRESET")
+      fi
+      cmd+=(-crf "$crf_v")
+    fi
+
+    cmd+=(-profile:v main -pix_fmt "$REALESRGAN_OUT_PIX_FMT")
+    if [[ -n "${REALESRGAN_OUT_EXTRA_ARGS// }" ]]; then
+      # shellcheck disable=SC2206
+      extra_tokens=($REALESRGAN_OUT_EXTRA_ARGS)
+      cmd+=("${extra_tokens[@]}")
+    fi
+    cmd+=("$tmp_out")
+    "${cmd[@]}" >"$log_encode" 2>&1
     rc=$?
     set -e
     if (( rc != 0 )); then
@@ -229,4 +313,3 @@ if (( fail != 0 )); then
 fi
 
 echo "Fatto. Output in: $OUT_DIR"
-

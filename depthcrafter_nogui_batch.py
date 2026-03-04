@@ -12,6 +12,7 @@ Plus: window_size and overlap (streaming chunking).
 
 import os
 import inspect
+import shlex
 import subprocess
 import numpy as np
 import torch
@@ -97,6 +98,8 @@ def _start_ffmpeg_gray_writer(
     debug_mem: bool = False,
     decode_chunk_size: int = 4,
     pix_out: str = "yuv420p",
+    codec: str = "h264_nvenc",
+    ffmpeg_extra_args: str = "",
     loglevel: str = "error",
     vf: str = None,
 ):
@@ -114,11 +117,29 @@ def _start_ffmpeg_gray_writer(
     ]
     if vf:
         cmd.extend(["-vf", vf])
-    cmd.extend([
-        "-c:v", "h264_nvenc", "-preset", preset, "-qp", str(crf),
-        "-pix_fmt", pix_out,
-        path,
-    ])
+    codec_l = str(codec or "h264_nvenc").strip().lower()
+    if "nvenc" in codec_l:
+        cmd.extend([
+            "-c:v", str(codec).strip() or "h264_nvenc",
+            "-preset", preset,
+            "-qp", str(crf),
+        ])
+    elif codec_l.startswith("libx"):
+        cmd.extend([
+            "-c:v", str(codec).strip(),
+            "-preset", preset,
+            "-crf", str(crf),
+        ])
+    else:
+        cmd.extend([
+            "-c:v", str(codec).strip(),
+            "-crf", str(crf),
+        ])
+
+    cmd.extend(["-pix_fmt", pix_out])
+    if str(ffmpeg_extra_args).strip():
+        cmd.extend(shlex.split(str(ffmpeg_extra_args).strip()))
+    cmd.append(path)
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
 
@@ -249,6 +270,9 @@ cpu_offload_mode: str = "model",  # none|model|sequential
         preset: str = "medium",
         debug_mem: bool = True,
         decode_chunk_size: int = 8,
+        codec: str = "h264_nvenc",
+        pix_fmt: str = "yuv420p",
+        ffmpeg_extra_args: str = "",
     ):
         if window_size <= overlap:
             raise ValueError("window_size must be > overlap")
@@ -326,7 +350,9 @@ cpu_offload_mode: str = "model",  # none|model|sequential
             fps_str=fps_str,
             crf=int(crf),
             preset=str(preset),
-            pix_out="yuv420p",
+            pix_out=str(pix_fmt),
+            codec=str(codec),
+            ffmpeg_extra_args=str(ffmpeg_extra_args),
             vf=f"scale={original_w}:{original_h}:flags=bilinear",
         )
         try:
@@ -367,6 +393,9 @@ def main(
     preset: str = "medium",
     debug_mem: bool = False,
     decode_chunk_size: int = 8,
+    codec: str = "h264_nvenc",
+    pix_fmt: str = "yuv420p",
+    ffmpeg_extra_args: str = "",
 ):
     # Resolve model locations. If None, use local StereoCrafter/weights defaults.
     if unet_path is None:
@@ -398,6 +427,9 @@ def main(
         preset=preset,
         debug_mem=debug_mem,
         decode_chunk_size=decode_chunk_size,
+        codec=codec,
+        pix_fmt=pix_fmt,
+        ffmpeg_extra_args=ffmpeg_extra_args,
     )
 
 
