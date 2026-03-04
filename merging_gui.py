@@ -164,11 +164,29 @@ def _bbox_intersection_area(
     return int((ix2 - ix1 + 1) * (iy2 - iy1 + 1))
 
 
+def _ramp01(value: float, lo: float, hi: float) -> float:
+    v = float(value)
+    a = float(lo)
+    b = float(hi)
+    if b <= a + 1e-6:
+        return 1.0 if v >= b else 0.0
+    return float(max(0.0, min(1.0, (v - a) / (b - a))))
+
+
 def apply_shadow_blur(
     mask: torch.Tensor,
     base_length_px: int,
     curve: float,
     motion_gain: float,
+    motion_deadzone_px: float = 4.0,
+    motion_max_px: float = 40.0,
+    motion_chain_enabled: bool = True,
+    area_min_px: float = 0.0,
+    area_max_px: float = 0.0,
+    area_reset_ratio: float = 1.8,
+    area_reset_abs_px: float = 0.0,
+    component_merge_y_tol_px: int = 0,
+    alpha_down: float = 0.45,
     width_adaptive: bool = True,
     use_gpu: bool = True,
     state: Optional[Dict[str, Any]] = None,
@@ -187,11 +205,17 @@ def apply_shadow_blur(
     width_ref_px = float(max(1.0, width_ref_px))
     width_power = float(max(0.1, width_power))
     border_tol = max(1, int(border_tolerance_px))
-    motion_deadzone_px = 3.0  # Ignore micro-jitter up to this displacement.
-    motion_ref_px = 6.0  # Additional px/frame (beyond deadzone) for full motion gain.
+    motion_chain_enabled = bool(motion_chain_enabled)
+    motion_deadzone_px = float(max(0.0, motion_deadzone_px))
+    motion_max_px = float(max(motion_deadzone_px, motion_max_px))
+    area_min_px = float(max(0.0, area_min_px))
+    area_max_px = float(max(area_min_px, area_max_px))
+    area_reset_ratio = float(max(1.0, area_reset_ratio))
+    area_reset_abs_px = float(max(0.0, area_reset_abs_px))
+    component_merge_y_tol_px = int(max(0, component_merge_y_tol_px))
 
     alpha_up = 0.45
-    alpha_down = 0.20
+    alpha_down = float(max(0.0, min(1.0, alpha_down)))
     max_delta_up = max(1.0, 0.35 * base_len)
     max_delta_down = max(1.0, 0.20 * base_len)
     max_len_cap = int(max(100, 4 * base_len))
@@ -201,7 +225,7 @@ def apply_shadow_blur(
     right_touch_start = width - border_tol
 
     prev_components: List[Dict[str, Any]] = []
-    if state is not None:
+    if motion_chain_enabled and state is not None:
         prev_components = list(state.get("prev_components", []) or [])
 
     # Keep shadow processing fully on NumPy buffers and convert back to torch once.
@@ -213,12 +237,21 @@ def apply_shadow_blur(
         canvas = frame.copy()
 
         if frame_bin.any():
+            frame_cc = frame_bin
+            if component_merge_y_tol_px > 0:
+                # Merge small vertical gaps before CC to avoid noisy split into tiny blobs.
+                k_h = int(2 * component_merge_y_tol_px + 1)
+                k_h = max(1, k_h)
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, k_h))
+                frame_cc = cv2.morphologyEx(frame_bin, cv2.MORPH_CLOSE, kernel, iterations=1)
+
             n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-                frame_bin, connectivity=8
+                frame_cc, connectivity=8
             )
 
             curr_components: List[Dict[str, Any]] = []
             comp_len_by_label: Dict[int, float] = {}
+            curr_candidates: List[Dict[str, Any]] = []
 
             for lab in range(1, int(n_labels)):
                 x = int(stats[lab, cv2.CC_STAT_LEFT])
@@ -231,76 +264,157 @@ def apply_shadow_blur(
                 bbox = (x, y, x + w - 1, y + h - 1)
                 cx = float(centroids[lab][0])
                 cy = float(centroids[lab][1])
-
-                matches: List[Tuple[float, Dict[str, Any]]] = []
-                for prev in prev_components:
-                    inter = _bbox_intersection_area(bbox, prev["bbox"])
-                    if inter > 0:
-                        matches.append((float(inter), prev))
-
-                if not matches and prev_components:
-                    # Fallback nearest match for mild displacements without overlap.
-                    best_prev = None
-                    best_d = 1e9
-                    max_dist = max(8.0, 0.5 * np.sqrt(float(area)))
-                    for prev in prev_components:
-                        dx = float(cx - prev["centroid"][0])
-                        dy = float(cy - prev["centroid"][1])
-                        d = float(np.hypot(dx, dy))
-                        if d < best_d and d <= max_dist:
-                            best_d = d
-                            best_prev = prev
-                    if best_prev is not None:
-                        matches.append((1.0, best_prev))
-
-                if matches:
-                    wsum = float(sum(mw for mw, _ in matches))
-                    prev_len = float(
-                        sum(mw * float(m["len_smooth"]) for mw, m in matches) / max(1e-6, wsum)
-                    )
-                    motion_px = float(
-                        sum(
-                            mw
-                            * float(
-                                np.hypot(
-                                    cx - float(m["centroid"][0]),
-                                    cy - float(m["centroid"][1]),
-                                )
-                            )
-                            for mw, m in matches
-                        )
-                        / max(1e-6, wsum)
-                    )
-                else:
-                    prev_len = float(base_len)
-                    motion_px = 0.0
-
-                motion_eff_px = max(0.0, motion_px - motion_deadzone_px)
-                motion_mult = 1.0 + motion_gain * min(1.0, motion_eff_px / motion_ref_px)
-                target_len = float(base_len) * motion_mult
-                target_len = float(max(0.0, min(float(max_len_cap), target_len)))
-
-                if target_len >= prev_len:
-                    alpha = alpha_up
-                    max_delta = max_delta_up
-                else:
-                    alpha = alpha_down
-                    max_delta = max_delta_down
-                smoothed = prev_len + alpha * (target_len - prev_len)
-                delta = float(smoothed - prev_len)
-                delta = float(max(-max_delta, min(max_delta, delta)))
-                len_smooth = float(max(0.0, min(float(max_len_cap), prev_len + delta)))
-
-                curr_components.append(
+                curr_candidates.append(
                     {
                         "label": int(lab),
                         "bbox": bbox,
                         "centroid": (cx, cy),
-                        "area": area,
-                        "len_smooth": len_smooth,
+                        "area": int(area),
                     }
                 )
-                comp_len_by_label[int(lab)] = len_smooth
+
+            if motion_chain_enabled:
+                n_curr = len(curr_candidates)
+                assigned_prev_idx: List[Optional[int]] = [None] * n_curr
+                assigned_mode: List[str] = ["none"] * n_curr
+                assigned_overlap: List[float] = [0.0] * n_curr
+
+                if prev_components and n_curr > 0:
+                    # Primary match policy: one previous component per current component.
+                    # This avoids multi-match averaging that can inflate motion on split/merge boundaries.
+                    for ci, curr in enumerate(curr_candidates):
+                        best_pi = -1
+                        best_inter = 0
+                        for pi, prev in enumerate(prev_components):
+                            inter = _bbox_intersection_area(curr["bbox"], prev["bbox"])
+                            if inter > best_inter:
+                                best_inter = inter
+                                best_pi = pi
+                        if best_pi >= 0 and best_inter > 0:
+                            assigned_prev_idx[ci] = int(best_pi)
+                            assigned_mode[ci] = "overlap"
+                            assigned_overlap[ci] = float(best_inter)
+
+                    for ci, curr in enumerate(curr_candidates):
+                        if assigned_prev_idx[ci] is not None:
+                            continue
+                        best_pi = -1
+                        best_d = 1e9
+                        max_dist = max(8.0, 0.5 * np.sqrt(float(curr["area"])))
+                        cx = float(curr["centroid"][0])
+                        cy = float(curr["centroid"][1])
+                        for pi, prev in enumerate(prev_components):
+                            dx = float(cx - prev["centroid"][0])
+                            dy = float(cy - prev["centroid"][1])
+                            d = float(np.hypot(dx, dy))
+                            if d < best_d and d <= max_dist:
+                                best_d = d
+                                best_pi = pi
+                        if best_pi >= 0:
+                            assigned_prev_idx[ci] = int(best_pi)
+                            assigned_mode[ci] = "nearest"
+
+                children_by_prev: Dict[int, List[int]] = {}
+                for ci, pi in enumerate(assigned_prev_idx):
+                    if pi is None or assigned_mode[ci] != "overlap":
+                        continue
+                    children_by_prev.setdefault(int(pi), []).append(int(ci))
+
+                split_children: set[int] = set()
+                for _pi, child_idxs in children_by_prev.items():
+                    if len(child_idxs) <= 1:
+                        continue
+                    # Split detected: same previous component contributes to multiple current components.
+                    # Keep inherited len_smooth continuity for all children.
+                    # Reset X-motion only on detached children (non-primary child).
+                    keep_ci = max(
+                        child_idxs,
+                        key=lambda ci: (assigned_overlap[ci], float(curr_candidates[ci]["area"])),
+                    )
+                    for ci in child_idxs:
+                        if ci == keep_ci:
+                            continue
+                        split_children.add(int(ci))
+
+                for ci, curr in enumerate(curr_candidates):
+                    pi = assigned_prev_idx[ci]
+                    if pi is not None:
+                        prev = prev_components[int(pi)]
+                        prev_len = float(prev.get("len_smooth", base_len))
+                        motion_px = float(
+                            abs(float(curr["centroid"][0]) - float(prev["centroid"][0]))
+                        )
+                        prev_area = float(prev.get("area", curr["area"]))
+                    else:
+                        prev_len = float(base_len)
+                        motion_px = 0.0
+                        prev_area = float(curr["area"])
+
+                    motion_norm = _ramp01(
+                        motion_px,
+                        motion_deadzone_px,
+                        motion_max_px,
+                    )
+                    area_norm = _ramp01(float(curr["area"]), area_min_px, area_max_px)
+
+                    # Reset X-motion contribution when area changes sharply (merge/split/noisy holes).
+                    area_changed = False
+                    if pi is not None:
+                        ratio_num = max(float(curr["area"]), prev_area)
+                        ratio_den = max(1.0, min(float(curr["area"]), prev_area))
+                        area_ratio = ratio_num / ratio_den
+                        if area_reset_ratio > 1.0 and area_ratio >= area_reset_ratio:
+                            area_changed = True
+                        if (
+                            area_reset_abs_px > 0.0
+                            and abs(float(curr["area"]) - prev_area) >= area_reset_abs_px
+                        ):
+                            area_changed = True
+                    if area_changed:
+                        motion_norm = 0.0
+
+                    if ci in split_children:
+                        # On split frame, keep continuity from parent but reset X deviation.
+                        motion_norm = 0.0
+
+                    motion_mult = 1.0 + motion_gain * motion_norm * area_norm
+                    target_len = float(base_len) * motion_mult
+                    target_len = float(max(0.0, min(float(max_len_cap), target_len)))
+
+                    if target_len >= prev_len:
+                        alpha = alpha_up
+                        max_delta = max_delta_up
+                    else:
+                        alpha = alpha_down
+                        max_delta = max_delta_down
+                    smoothed = prev_len + alpha * (target_len - prev_len)
+                    delta = float(smoothed - prev_len)
+                    delta = float(max(-max_delta, min(max_delta, delta)))
+                    len_smooth = float(max(0.0, min(float(max_len_cap), prev_len + delta)))
+
+                    curr_components.append(
+                        {
+                            "label": int(curr["label"]),
+                            "bbox": curr["bbox"],
+                            "centroid": curr["centroid"],
+                            "area": int(curr["area"]),
+                            "len_smooth": len_smooth,
+                        }
+                    )
+                    comp_len_by_label[int(curr["label"])] = len_smooth
+            else:
+                for curr in curr_candidates:
+                    len_smooth = float(base_len)
+                    curr_components.append(
+                        {
+                            "label": int(curr["label"]),
+                            "bbox": curr["bbox"],
+                            "centroid": curr["centroid"],
+                            "area": int(curr["area"]),
+                            "len_smooth": len_smooth,
+                        }
+                    )
+                    comp_len_by_label[int(curr["label"])] = len_smooth
 
             # Row/run-aware dynamic shadow length + right-border inversion.
             for y in range(height):
@@ -370,12 +484,13 @@ def apply_shadow_blur(
                         mask_gt = src_vals > dst_slice
                         dst_slice[mask_gt] = src_vals[mask_gt]
 
-            prev_components = curr_components
+            if motion_chain_enabled:
+                prev_components = curr_components
 
         out_np[t, 0] = canvas
 
     if state is not None:
-        state["prev_components"] = prev_components
+        state["prev_components"] = prev_components if motion_chain_enabled else []
 
     return torch.from_numpy(out_np).to(device=mask.device, dtype=mask.dtype)
 
@@ -920,6 +1035,16 @@ def _parse_inpainted_basename(
         return core_with_width, None, is_sbs_input
     core_name = core_with_width[:last_underscore_idx]
     return core_with_width, core_name, is_sbs_input
+
+
+def _infer_splatted_layout_from_path(splatted_path: str) -> str:
+    """Return one of: single (_splatted1), dual (_splatted2), quad (_splatted4/default)."""
+    base = os.path.basename(str(splatted_path or ""))
+    if "_splatted1" in base:
+        return "single"
+    if "_splatted2" in base:
+        return "dual"
+    return "quad"
 
 
 def _normalize_csv_blend_lookup_key(value: Any) -> str:
@@ -1534,7 +1659,29 @@ def _apply_ct_preset_frame(
 
 
 class MergingGUI(ThemedTk):
-    PREVIEW_SHADOW_WARMUP_FRAMES = 20
+    MOTION_DEFAULTS_CONFIG_PATH = "config_merging_gui_motion_defaults.json"
+    PREVIEW_SHADOW_WARMUP_MAX_FRAMES = 20
+    PREVIEW_SHADOW_WARMUP_RESIDUAL = 0.05
+    OUTPUT_FORMAT_CHOICES = [
+        "Full SBS (Left-Right)",
+        "Double SBS",
+        "Half SBS (Left-Right)",
+        "Full SBS Cross-eye (Right-Left)",
+        "Anaglyph (Red/Cyan)",
+        "Anaglyph Half-Color",
+    ]
+    MOTION_DEFAULTS_FALLBACK = {
+        "shadow_motion_gain": 1.0,
+        "shadow_motion_enabled": True,
+        "shadow_motion_deadzone_px": 20.0,
+        "shadow_motion_max_px": 40.0,
+        "shadow_area_min_px": 1000.0,
+        "shadow_area_max_px": 2000.0,
+        "shadow_area_reset_ratio": 1.65,
+        "shadow_area_reset_abs_px": 0.0,
+        "shadow_component_merge_y_tol_px": 4,
+        "shadow_alpha_down": 0.45,
+    }
 
     # --- Centralized Default Settings ---
     APP_DEFAULTS = {
@@ -1542,15 +1689,26 @@ class MergingGUI(ThemedTk):
         "original_folder": "./input_source_clips",
         "mask_folder": "./output_splatted/hires",
         "replace_mask_folder": "",  # optional; if empty uses splatted folder
+        "mask_formerge_folder": "./work/mask_for_merge",
         "output_folder": "./final_videos",
         "use_replace_mask": True,
+        "use_mask_formerge": False,
         "mask_binarize_threshold": -0.01,
         "mask_dilate_kernel_size": 2,
         "mask_blur_kernel_size": 4,
         "shadow_length_px": 30,
         "shadow_width_adaptive": True,
         "shadow_curve": 0.0,
-        "shadow_motion_gain": 0.0,
+        "shadow_motion_gain": 1.0,  # hidden in GUI, managed via motion defaults
+        "shadow_motion_enabled": True,
+        "shadow_motion_deadzone_px": 20.0,
+        "shadow_motion_max_px": 40.0,
+        "shadow_area_min_px": 1000.0,
+        "shadow_area_max_px": 2000.0,
+        "shadow_area_reset_ratio": 1.65,
+        "shadow_area_reset_abs_px": 0.0,
+        "shadow_component_merge_y_tol_px": 4,
+        "shadow_alpha_down": 0.45,
         "preview_shadow_temporal": False,
         "use_gpu": True,
         "output_format": "Full SBS (Left-Right)",
@@ -1583,6 +1741,7 @@ class MergingGUI(ThemedTk):
         super().__init__(theme="clam")
         self.title(f"Stereocrafter Merging GUI {GUI_VERSION}")
         self.app_config = self._load_config()
+        self.motion_defaults = self._load_motion_defaults()
         self.help_data = self._load_help_texts()
 
         # --- Sidecar Config Manager ---
@@ -1635,6 +1794,15 @@ class MergingGUI(ThemedTk):
             )
         )
         self.replace_mask_folder_var.trace_add("write", self._on_folder_changed)
+        self.mask_formerge_folder_var = tk.StringVar(
+            value=str(
+                self.app_config.get(
+                    "mask_formerge_folder",
+                    self.APP_DEFAULTS.get("mask_formerge_folder", ""),
+                )
+            )
+        )
+        self.mask_formerge_folder_var.trace_add("write", self._on_folder_changed)
 
 
         # --- Optional: Use external replace-mask video instead of embedded splat mask ---
@@ -1642,6 +1810,14 @@ class MergingGUI(ThemedTk):
             value=bool(
                 self.app_config.get(
                     "use_replace_mask", self.APP_DEFAULTS.get("use_replace_mask", False)
+                )
+            )
+        )
+        self.use_mask_formerge_var = tk.BooleanVar(
+            value=bool(
+                self.app_config.get(
+                    "use_mask_formerge",
+                    self.APP_DEFAULTS.get("use_mask_formerge", False),
                 )
             )
         )
@@ -1707,11 +1883,143 @@ class MergingGUI(ThemedTk):
                 )
             )
         )
+        motion_gain_default = float(
+            self.motion_defaults.get(
+                "shadow_motion_gain",
+                self.APP_DEFAULTS.get("shadow_motion_gain", 1.0),
+            )
+        )
         self.shadow_motion_gain_var = tk.DoubleVar(
             value=float(
                 self.app_config.get(
                     "shadow_motion_gain",
-                    self.APP_DEFAULTS["shadow_motion_gain"],
+                    motion_gain_default,
+                )
+            )
+        )
+        motion_enabled_default = bool(
+            self.motion_defaults.get(
+                "shadow_motion_enabled",
+                self.APP_DEFAULTS.get("shadow_motion_enabled", True),
+            )
+        )
+        self.shadow_motion_enabled_var = tk.BooleanVar(
+            value=bool(
+                self.app_config.get(
+                    "shadow_motion_enabled",
+                    motion_enabled_default,
+                )
+            )
+        )
+        motion_deadzone_default = float(
+            self.motion_defaults.get(
+                "shadow_motion_deadzone_px",
+                self.APP_DEFAULTS.get("shadow_motion_deadzone_px", 20.0),
+            )
+        )
+        self.shadow_motion_deadzone_px_var = tk.DoubleVar(
+            value=float(
+                self.app_config.get(
+                    "shadow_motion_deadzone_px",
+                    motion_deadzone_default,
+                )
+            )
+        )
+        motion_max_default = float(
+            self.motion_defaults.get(
+                "shadow_motion_max_px",
+                self.APP_DEFAULTS.get("shadow_motion_max_px", 40.0),
+            )
+        )
+        self.shadow_motion_max_px_var = tk.DoubleVar(
+            value=float(
+                self.app_config.get(
+                    "shadow_motion_max_px",
+                    motion_max_default,
+                )
+            )
+        )
+        area_min_default = float(
+            self.motion_defaults.get(
+                "shadow_area_min_px",
+                self.APP_DEFAULTS.get("shadow_area_min_px", 1000.0),
+            )
+        )
+        self.shadow_area_min_px_var = tk.DoubleVar(
+            value=float(
+                self.app_config.get(
+                    "shadow_area_min_px",
+                    area_min_default,
+                )
+            )
+        )
+        area_max_default = float(
+            self.motion_defaults.get(
+                "shadow_area_max_px",
+                self.APP_DEFAULTS.get("shadow_area_max_px", 2000.0),
+            )
+        )
+        self.shadow_area_max_px_var = tk.DoubleVar(
+            value=float(
+                self.app_config.get(
+                    "shadow_area_max_px",
+                    area_max_default,
+                )
+            )
+        )
+        area_reset_ratio_default = float(
+            self.motion_defaults.get(
+                "shadow_area_reset_ratio",
+                self.APP_DEFAULTS.get("shadow_area_reset_ratio", 1.65),
+            )
+        )
+        self.shadow_area_reset_ratio_var = tk.DoubleVar(
+            value=float(
+                self.app_config.get(
+                    "shadow_area_reset_ratio",
+                    area_reset_ratio_default,
+                )
+            )
+        )
+        area_reset_abs_default = float(
+            self.motion_defaults.get(
+                "shadow_area_reset_abs_px",
+                self.APP_DEFAULTS.get("shadow_area_reset_abs_px", 0.0),
+            )
+        )
+        self.shadow_area_reset_abs_px_var = tk.DoubleVar(
+            value=float(
+                self.app_config.get(
+                    "shadow_area_reset_abs_px",
+                    area_reset_abs_default,
+                )
+            )
+        )
+        component_y_tol_default = int(
+            self.motion_defaults.get(
+                "shadow_component_merge_y_tol_px",
+                self.APP_DEFAULTS.get("shadow_component_merge_y_tol_px", 4),
+            )
+        )
+        self.shadow_component_merge_y_tol_px_var = tk.IntVar(
+            value=int(
+                self.app_config.get(
+                    "shadow_component_merge_y_tol_px",
+                    component_y_tol_default,
+                )
+            )
+        )
+        alpha_down_default = float(
+            self.motion_defaults.get(
+                "shadow_alpha_down",
+                self.APP_DEFAULTS.get("shadow_alpha_down", 0.45),
+            )
+        )
+        self.shadow_alpha_down_var = tk.DoubleVar(
+            value=float(
+                self.app_config.get(
+                    "shadow_alpha_down",
+                    alpha_down_default,
                 )
             )
         )
@@ -1732,6 +2040,8 @@ class MergingGUI(ThemedTk):
                 "output_format", self.APP_DEFAULTS["output_format"]
             )
         )
+        if self.output_format_var.get() not in self.OUTPUT_FORMAT_CHOICES:
+            self.output_format_var.set(self.APP_DEFAULTS["output_format"])
         self.pad_to_16_9_var = tk.BooleanVar(
             value=self.app_config.get("pad_to_16_9", self.APP_DEFAULTS["pad_to_16_9"])
         )
@@ -1864,6 +2174,8 @@ class MergingGUI(ThemedTk):
         # --- END FIX ---
         self.progress_var = tk.DoubleVar(value=0)
         self.widgets_to_disable = []
+        self._is_refreshing_mode_constraints = False
+        self._last_mode_constraints_video_index = -999999
 
         self.create_widgets()
 
@@ -1882,6 +2194,7 @@ class MergingGUI(ThemedTk):
         # Call all the label updaters to set the initial text from the loaded config
         for updater in self.slider_label_updaters:
             updater()
+        self._refresh_mode_constraints(trigger_preview=False)
         self.update_status_label("Ready.")
 
         # --- FIX: Initialize the previewer AFTER the main GUI is fully built ---
@@ -2146,6 +2459,8 @@ class MergingGUI(ThemedTk):
         # After setting all variables, manually update the slider labels to match.
         for updater in self.slider_label_updaters:
             updater()
+        self._last_mode_constraints_video_index = -999999
+        self._refresh_mode_constraints(trigger_preview=False)
         logger.info("Applied settings to GUI and updated labels.")
 
     def _toggle_ct_advanced_controls(self) -> None:
@@ -2243,6 +2558,248 @@ class MergingGUI(ThemedTk):
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
 
+    @staticmethod
+    def _coerce_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _coerce_int(value: Any, default: int) -> int:
+        try:
+            return int(round(float(value)))
+        except Exception:
+            return int(default)
+
+    @classmethod
+    def _compute_preview_shadow_warmup_frames(cls, alpha_down: float) -> int:
+        """Estimate temporal warmup frames from IIR decay (residual-based)."""
+        a = float(alpha_down)
+        if not np.isfinite(a):
+            return 1
+        a = max(0.0, min(0.999, a))
+        if a <= 1e-6:
+            return 1
+        if a >= 0.999:
+            return int(cls.PREVIEW_SHADOW_WARMUP_MAX_FRAMES)
+        residual = float(max(1e-4, min(0.5, cls.PREVIEW_SHADOW_WARMUP_RESIDUAL)))
+        try:
+            frames = int(np.ceil(np.log(residual) / np.log(a)))
+        except Exception:
+            frames = 1
+        return int(max(1, min(int(cls.PREVIEW_SHADOW_WARMUP_MAX_FRAMES), frames)))
+
+    def _load_motion_defaults(self) -> Dict[str, Any]:
+        defaults = dict(self.MOTION_DEFAULTS_FALLBACK)
+        path = self.MOTION_DEFAULTS_CONFIG_PATH
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return defaults
+
+            parsed = dict(defaults)
+            # Backward compatibility for percent-based payloads.
+            if (
+                "shadow_area_reset_ratio" not in payload
+                and "shadow_area_reset_pct" in payload
+            ):
+                try:
+                    pct = float(payload.get("shadow_area_reset_pct", 0.0))
+                    payload["shadow_area_reset_ratio"] = 1.0 + (pct / 100.0)
+                except Exception:
+                    pass
+
+            parsed["shadow_motion_gain"] = self._coerce_float(
+                payload.get("shadow_motion_gain", parsed["shadow_motion_gain"]),
+                parsed["shadow_motion_gain"],
+            )
+            parsed["shadow_motion_enabled"] = bool(
+                payload.get("shadow_motion_enabled", parsed["shadow_motion_enabled"])
+            )
+            parsed["shadow_motion_deadzone_px"] = self._coerce_float(
+                payload.get(
+                    "shadow_motion_deadzone_px", parsed["shadow_motion_deadzone_px"]
+                ),
+                parsed["shadow_motion_deadzone_px"],
+            )
+            parsed["shadow_motion_max_px"] = self._coerce_float(
+                payload.get("shadow_motion_max_px", parsed["shadow_motion_max_px"]),
+                parsed["shadow_motion_max_px"],
+            )
+            parsed["shadow_area_min_px"] = self._coerce_float(
+                payload.get("shadow_area_min_px", parsed["shadow_area_min_px"]),
+                parsed["shadow_area_min_px"],
+            )
+            parsed["shadow_area_max_px"] = self._coerce_float(
+                payload.get("shadow_area_max_px", parsed["shadow_area_max_px"]),
+                parsed["shadow_area_max_px"],
+            )
+            parsed["shadow_area_reset_ratio"] = self._coerce_float(
+                payload.get(
+                    "shadow_area_reset_ratio", parsed["shadow_area_reset_ratio"]
+                ),
+                parsed["shadow_area_reset_ratio"],
+            )
+            parsed["shadow_area_reset_abs_px"] = self._coerce_float(
+                payload.get(
+                    "shadow_area_reset_abs_px", parsed["shadow_area_reset_abs_px"]
+                ),
+                parsed["shadow_area_reset_abs_px"],
+            )
+            parsed["shadow_component_merge_y_tol_px"] = self._coerce_int(
+                payload.get(
+                    "shadow_component_merge_y_tol_px",
+                    parsed["shadow_component_merge_y_tol_px"],
+                ),
+                parsed["shadow_component_merge_y_tol_px"],
+            )
+            parsed["shadow_alpha_down"] = self._coerce_float(
+                payload.get("shadow_alpha_down", parsed["shadow_alpha_down"]),
+                parsed["shadow_alpha_down"],
+            )
+            logger.info(f"Loaded motion defaults from {path}")
+            return parsed
+        except FileNotFoundError:
+            return defaults
+        except Exception as e:
+            logger.warning(f"Failed loading motion defaults from '{path}': {e}")
+            return defaults
+
+    @staticmethod
+    def _path_exists(path: Any) -> bool:
+        return isinstance(path, str) and bool(path) and os.path.exists(path)
+
+    def _get_current_source_metadata(self) -> Optional[Dict[str, Any]]:
+        previewer = getattr(self, "previewer", None)
+        if previewer is None:
+            return None
+        video_list = getattr(previewer, "video_list", []) or []
+        idx = int(getattr(previewer, "current_video_index", -1))
+        if 0 <= idx < len(video_list):
+            meta = video_list[idx]
+            if isinstance(meta, dict):
+                return meta
+        return None
+
+    def _set_widget_enabled(self, widget: Any, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        try:
+            if isinstance(widget, ttk.Combobox):
+                widget.configure(state="readonly" if enabled else "disabled")
+            else:
+                widget.configure(state=state)
+        except Exception:
+            pass
+
+    def _set_children_enabled(
+        self,
+        parent: Any,
+        enabled: bool,
+        skip_widgets: Optional[List[Any]] = None,
+    ) -> None:
+        if parent is None:
+            return
+        skip = set(skip_widgets or [])
+        for child in parent.winfo_children():
+            if child in skip:
+                continue
+            self._set_widget_enabled(child, enabled)
+            self._set_children_enabled(child, enabled, skip_widgets=skip_widgets)
+
+    def _set_mask_slider_row_enabled(self, row: int, enabled: bool) -> None:
+        frame = getattr(self, "_mask_sliders_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            try:
+                grid_row = int(child.grid_info().get("row", -1))
+            except Exception:
+                grid_row = -1
+            if grid_row != int(row):
+                continue
+            self._set_widget_enabled(child, enabled)
+
+    def _refresh_mode_constraints(self, trigger_preview: bool = False) -> None:
+        if self._is_refreshing_mode_constraints:
+            return
+        if not hasattr(self, "_mask_sliders_frame") or not hasattr(self, "_replace_mask_check"):
+            return
+        self._is_refreshing_mode_constraints = True
+        try:
+            meta = self._get_current_source_metadata()
+            previewer = getattr(self, "previewer", None)
+            video_list = getattr(previewer, "video_list", []) if previewer is not None else []
+            source_readers = (
+                getattr(previewer, "source_readers", {}) if previewer is not None else {}
+            )
+            if meta is None and video_list:
+                first = video_list[0]
+                meta = first if isinstance(first, dict) else None
+
+            has_single = bool(meta and (meta.get("input_layout") == "single" or meta.get("is_single_input", False)))
+            has_replace_mask = bool(meta and self._path_exists(meta.get("replace_mask")))
+            has_mask_formerge = bool(meta and self._path_exists(meta.get("mask_formerge")))
+            if isinstance(source_readers, dict):
+                has_replace_mask = bool(
+                    has_replace_mask or (source_readers.get("replace_mask") is not None)
+                )
+                has_mask_formerge = bool(
+                    has_mask_formerge or (source_readers.get("mask_formerge") is not None)
+                )
+
+            use_replace_mask_effective = bool(self.use_replace_mask_var.get()) or has_single
+            use_mask_formerge_effective = bool(self.use_mask_formerge_var.get()) and has_mask_formerge
+
+            # Single-warp always requires replace-mask and keeps checkbox locked.
+            if has_single and not bool(self.use_replace_mask_var.get()):
+                self.use_replace_mask_var.set(True)
+                use_replace_mask_effective = True
+            self._set_widget_enabled(self._replace_mask_check, not has_single)
+
+            # If mask-for-merge is active for current clip, skip all mask-preprocess controls.
+            self._set_children_enabled(
+                self._mask_sliders_frame,
+                not use_mask_formerge_effective,
+            )
+            self._set_widget_enabled(
+                self._temporal_shadow_preview_check,
+                not use_mask_formerge_effective,
+            )
+            self._set_widget_enabled(
+                self._shadow_width_adaptive_check,
+                not use_mask_formerge_effective,
+            )
+            self._set_widget_enabled(
+                self._motion_chain_check,
+                not use_mask_formerge_effective,
+            )
+
+            # With replace-mask ON, initial binarization is bypassed (fixed binary mask).
+            if not use_mask_formerge_effective:
+                self._set_mask_slider_row_enabled(
+                    row=0,
+                    enabled=not (use_replace_mask_effective and has_replace_mask),
+                )
+
+            # CT availability depends on replace-mask presence.
+            ct_available = bool(has_replace_mask)
+            if not ct_available and bool(self.enable_color_transfer_var.get()):
+                self.enable_color_transfer_var.set(False)
+            self._set_widget_enabled(self._color_transfer_check, ct_available)
+            self._set_children_enabled(self._ct_frame, ct_available)
+
+            if bool(meta and meta.get("input_layout") == "single") and not has_replace_mask:
+                logger.error(
+                    "Single-warp clip selected but replace-mask is missing."
+                )
+
+            if trigger_preview and previewer is not None and getattr(previewer, "video_list", []):
+                previewer.update_preview()
+        finally:
+            self._is_refreshing_mode_constraints = False
+
     def create_widgets(self):
         self.create_menubar()
         # The main window will now be a simple vertical layout.
@@ -2293,7 +2850,7 @@ class MergingGUI(ThemedTk):
         self.widgets_to_disable.append(entry_mask)
         self.widgets_to_disable.append(btn_mask)
 
-        # --- Right column (3 paths) ---
+        # --- Right column (4 paths) ---
         # Replace Mask Folder (optional)
         ttk.Label(right_paths, text="Replace Mask Folder (optional):").grid(row=0, column=0, sticky="e", padx=5, pady=2)
         entry_rmask = ttk.Entry(right_paths, textvariable=self.replace_mask_folder_var)
@@ -2303,22 +2860,35 @@ class MergingGUI(ThemedTk):
         self.widgets_to_disable.append(entry_rmask)
         self.widgets_to_disable.append(btn_rmask)
 
+        # Mask-for-merge Folder (optional preprocessed mask for final blend)
+        ttk.Label(right_paths, text="Mask-for-merge Folder (optional):").grid(
+            row=1, column=0, sticky="e", padx=5, pady=2
+        )
+        entry_mform = ttk.Entry(right_paths, textvariable=self.mask_formerge_folder_var)
+        entry_mform.grid(row=1, column=1, padx=5, sticky="ew")
+        btn_mform = ttk.Button(
+            right_paths, text="Browse", command=lambda: self._browse_folder(self.mask_formerge_folder_var)
+        )
+        btn_mform.grid(row=1, column=2, padx=5)
+        self.widgets_to_disable.append(entry_mform)
+        self.widgets_to_disable.append(btn_mform)
+
         # Output Folder
-        ttk.Label(right_paths, text="Output Folder:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        ttk.Label(right_paths, text="Output Folder:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
         entry_out = ttk.Entry(right_paths, textvariable=self.output_folder_var)
-        entry_out.grid(row=1, column=1, padx=5, sticky="ew")
+        entry_out.grid(row=2, column=1, padx=5, sticky="ew")
         self._create_hover_tooltip(entry_out, "output_folder")
         btn_out = ttk.Button(right_paths, text="Browse", command=lambda: self._browse_folder(self.output_folder_var))
-        btn_out.grid(row=1, column=2, padx=5)
+        btn_out.grid(row=2, column=2, padx=5)
         self.widgets_to_disable.append(entry_out)
         self.widgets_to_disable.append(btn_out)
 
         # CT CSV Blend Path (per-frame best preset map)
-        ttk.Label(right_paths, text="CT CSV Blend Path:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        ttk.Label(right_paths, text="CT CSV Blend Path:").grid(row=3, column=0, sticky="e", padx=5, pady=2)
         entry_ctcsv = ttk.Entry(right_paths, textvariable=self.ct_csv_blend_path_var)
-        entry_ctcsv.grid(row=2, column=1, padx=5, sticky="ew")
+        entry_ctcsv.grid(row=3, column=1, padx=5, sticky="ew")
         btn_ctcsv = ttk.Button(right_paths, text="Browse", command=self._browse_ct_csv_blend_map)
-        btn_ctcsv.grid(row=2, column=2, padx=5)
+        btn_ctcsv.grid(row=3, column=2, padx=5)
         self.widgets_to_disable.append(entry_ctcsv)
         self.widgets_to_disable.append(btn_ctcsv)
 
@@ -2357,10 +2927,12 @@ class MergingGUI(ThemedTk):
         )
         param_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         param_frame.grid_columnconfigure(1, weight=1)
+        self._mask_param_frame = param_frame
         # Keep sliders and checkboxes in separate sub-frames for stable vertical layout.
         mask_sliders_frame = ttk.Frame(param_frame)
         mask_sliders_frame.grid(row=0, column=0, columnspan=3, sticky="ew")
         mask_sliders_frame.grid_columnconfigure(1, weight=1)
+        self._mask_sliders_frame = mask_sliders_frame
         # Vertical spacer that pushes checkbox row to the bottom of the panel.
         param_frame.grid_rowconfigure(1, weight=1)
 
@@ -2450,23 +3022,13 @@ class MergingGUI(ThemedTk):
             decimals=2,
             step_size=0.01,
         )
-        create_single_slider_with_label_updater(
-            self,
-            mask_sliders_frame,
-            "Shadow Motion Gain:",
-            self.shadow_motion_gain_var,
-            0.0,
-            3.0,
-            5,
-            decimals=2,
-            step_size=0.01,
-        )
 
         mask_checks_row = ttk.Frame(param_frame)
         mask_checks_row.grid(row=2, column=0, columnspan=3, sticky="ew", padx=5, pady=(8, 2))
+        self._mask_checks_row = mask_checks_row
         temporal_shadow_preview_check = ttk.Checkbutton(
             mask_checks_row,
-            text=f"Temporal Shadow Preview ({self.PREVIEW_SHADOW_WARMUP_FRAMES}f)",
+            text="Temporal Shadow Preview (dynamic warmup)",
             variable=self.preview_shadow_temporal_var,
             command=lambda: self.on_slider_release(None),
         )
@@ -2482,16 +3044,38 @@ class MergingGUI(ThemedTk):
             variable=self.use_replace_mask_var,
             command=self._on_use_replace_mask_changed,
         )
+        mask_formerge_check = ttk.Checkbutton(
+            mask_checks_row,
+            text="Use Mask-for-merge (preprocessed)",
+            variable=self.use_mask_formerge_var,
+            command=self._on_use_mask_formerge_changed,
+        )
+        motion_chain_check = ttk.Checkbutton(
+            mask_checks_row,
+            text="Motion Chain Enabled",
+            variable=self.shadow_motion_enabled_var,
+            command=lambda: self.on_slider_release(None),
+        )
         temporal_shadow_preview_check.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=2)
         shadow_width_adaptive_check.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=2)
-        replace_mask_check.grid(row=0, column=2, sticky="w", pady=2)
+        replace_mask_check.grid(row=0, column=2, sticky="w", padx=(0, 12), pady=2)
+        mask_formerge_check.grid(row=1, column=0, sticky="w", padx=(0, 12), pady=2)
+        motion_chain_check.grid(row=1, column=1, sticky="w", padx=(0, 12), pady=2)
         self.widgets_to_disable.append(temporal_shadow_preview_check)
         self.widgets_to_disable.append(shadow_width_adaptive_check)
         self.widgets_to_disable.append(replace_mask_check)
+        self.widgets_to_disable.append(mask_formerge_check)
+        self.widgets_to_disable.append(motion_chain_check)
+        self._temporal_shadow_preview_check = temporal_shadow_preview_check
+        self._shadow_width_adaptive_check = shadow_width_adaptive_check
+        self._replace_mask_check = replace_mask_check
+        self._mask_formerge_check = mask_formerge_check
+        self._motion_chain_check = motion_chain_check
 
         # --- COLOR TRANSFER (PRESET-ONLY) PARAMETERS ---
         ct_frame = ttk.LabelFrame(params_ct_row, text="Color Transfer (Safe)", padding=10)
         ct_frame.grid(row=0, column=1, sticky="nsew")
+        self._ct_frame = ct_frame
         for _c in range(4):
             ct_frame.grid_columnconfigure(_c, weight=1 if _c in (1, 3) else 0)
 
@@ -2684,19 +3268,10 @@ class MergingGUI(ThemedTk):
 
         # Output format dropdown
         ttk.Label(options_frame, text="Output:").pack(side="left", padx=(10, 5))
-        output_formats = [
-            "Full SBS (Left-Right)",
-            "Double SBS",
-            "Half SBS (Left-Right)",
-            "Full SBS Cross-eye (Right-Left)",
-            "Anaglyph (Red/Cyan)",
-            "Anaglyph Half-Color",
-            "Right-Eye Only",
-        ]
         output_format_combo = ttk.Combobox(
             options_frame,
             textvariable=self.output_format_var,
-            values=output_formats,
+            values=self.OUTPUT_FORMAT_CHOICES,
             state="readonly",
             width=22,
         )
@@ -2712,6 +3287,7 @@ class MergingGUI(ThemedTk):
         color_check.pack(side="left", padx=5)
         self._create_hover_tooltip(color_check, "enable_color_transfer")
         self.widgets_to_disable.append(color_check)
+        self._color_transfer_check = color_check
 
         pad_check = ttk.Checkbutton(
             options_frame, text="Pad 16:9", variable=self.pad_to_16_9_var
@@ -2845,6 +3421,23 @@ class MergingGUI(ThemedTk):
         except Exception:
             return None
 
+    def _find_mask_formerge_for_splatted(
+        self, splatted_path: str, mask_formerge_folder: str = ""
+    ) -> Optional[str]:
+        """Return preprocessed mask-for-merge path for the given splatted clip."""
+        try:
+            base = os.path.splitext(os.path.basename(splatted_path))[0]
+            folder = (mask_formerge_folder or "").strip()
+            if not folder:
+                return None
+            for ext in [".mkv", ".mp4"]:
+                candidate = os.path.join(folder, f"{base}_replace_mask{ext}")
+                if os.path.exists(candidate):
+                    return candidate
+            return None
+        except Exception:
+            return None
+
     def _find_sidecar_file(self, base_path: str) -> Optional[str]:
         """Looks for a sidecar JSON file next to the video file."""
         return find_sidecar_file(base_path)
@@ -2949,14 +3542,19 @@ class MergingGUI(ThemedTk):
             self.previewer.update_preview()
 
     def _on_use_replace_mask_changed(self, *args):
-        """Called when the replace-mask checkbox is toggled. Updates the preview."""
-        if hasattr(self, "previewer") and self.previewer.video_list:
-            self.previewer.update_preview()
+        """Called when replace-mask mode changes."""
+        self._refresh_mode_constraints(trigger_preview=True)
+
+    def _on_use_mask_formerge_changed(self, *args):
+        """Called when preprocessed mask-for-merge mode changes."""
+        self._refresh_mode_constraints(trigger_preview=True)
 
     def _on_folder_changed(self, *args):
         """Called when a folder path changes. Resets the video list scan flag."""
         if hasattr(self, "previewer"):
             self.previewer.reset_video_list_scan()
+        self._last_mode_constraints_video_index = -999999
+        self._refresh_mode_constraints(trigger_preview=False)
 
     def _on_resume_changed(self, *args):
         """Called when the Resume checkbox is changed. Clears preview to apply new setting."""
@@ -2984,6 +3582,8 @@ class MergingGUI(ThemedTk):
             except tk.TclError:
                 # Widget might have been destroyed, ignore
                 pass
+        if not is_processing:
+            self._refresh_mode_constraints(trigger_preview=False)
 
     def update_status_label(self, message):
         self.status_label_var.set(message)
@@ -3215,11 +3815,14 @@ class MergingGUI(ThemedTk):
         try:
             selected_preset_label = _resolve_ct_preset_label(self.ct_preset_var.get())
             selected_auto_mode = _resolve_ct_auto_mode_label(self.ct_auto_mode_var.get())
+            alpha_down = float(self.shadow_alpha_down_var.get())
+            dynamic_warmup = self._compute_preview_shadow_warmup_frames(alpha_down)
             settings = {
                 "inpainted_folder": self.inpainted_folder_var.get(),
                 "original_folder": self.original_folder_var.get(),
                 "mask_folder": self.mask_folder_var.get(),
                 "replace_mask_folder": self.replace_mask_folder_var.get(),
+                "mask_formerge_folder": self.mask_formerge_folder_var.get(),
                 "output_folder": self.output_folder_var.get(),
                 "use_gpu": self.use_gpu_var.get(),
                 "pad_to_16_9": self.pad_to_16_9_var.get(),
@@ -3248,7 +3851,8 @@ class MergingGUI(ThemedTk):
 
                 "preview_size": self.preview_size_var.get(),
                 "preview_source": self.preview_source_var.get(),
-                "use_replace_mask": self.use_replace_mask_var.get(),
+                "use_replace_mask": bool(self.use_replace_mask_var.get()),
+                "use_mask_formerge": bool(self.use_mask_formerge_var.get()),
                 # Mask params
                 "mask_binarize_threshold": float(
                     self.mask_binarize_threshold_var.get()
@@ -3259,10 +3863,19 @@ class MergingGUI(ThemedTk):
                 "shadow_width_adaptive": bool(self.shadow_width_adaptive_var.get()),
                 "shadow_curve": float(self.shadow_curve_var.get()),
                 "shadow_motion_gain": float(self.shadow_motion_gain_var.get()),
-                "preview_shadow_temporal": bool(self.preview_shadow_temporal_var.get()),
-                "preview_shadow_warmup_frames": int(
-                    self.PREVIEW_SHADOW_WARMUP_FRAMES
+                "shadow_motion_enabled": bool(self.shadow_motion_enabled_var.get()),
+                "shadow_motion_deadzone_px": float(self.shadow_motion_deadzone_px_var.get()),
+                "shadow_motion_max_px": float(self.shadow_motion_max_px_var.get()),
+                "shadow_area_min_px": float(self.shadow_area_min_px_var.get()),
+                "shadow_area_max_px": float(self.shadow_area_max_px_var.get()),
+                "shadow_area_reset_ratio": float(self.shadow_area_reset_ratio_var.get()),
+                "shadow_area_reset_abs_px": float(self.shadow_area_reset_abs_px_var.get()),
+                "shadow_component_merge_y_tol_px": int(
+                    self.shadow_component_merge_y_tol_px_var.get()
                 ),
+                "shadow_alpha_down": alpha_down,
+                "preview_shadow_temporal": bool(self.preview_shadow_temporal_var.get()),
+                "preview_shadow_warmup_frames": int(dynamic_warmup),
             }
             return settings
         except (ValueError, TypeError) as e:
@@ -3301,6 +3914,7 @@ class MergingGUI(ThemedTk):
         inpainted_reader = None
         splatted_reader = None
         replace_mask_reader = None
+        mask_formerge_reader = None
         original_reader = None
         ffmpeg_process = None
         if settings is None:
@@ -3416,7 +4030,7 @@ class MergingGUI(ThemedTk):
             )
 
             # Initialize readers to None for robust cleanup
-            inpainted_reader, splatted_reader, replace_mask_reader, original_reader = None, None, None, None
+            inpainted_reader, splatted_reader, replace_mask_reader, mask_formerge_reader, original_reader = None, None, None, None, None
             original_video_path_to_move = None  # To track which original file to move
             try:
                 # --- 1. Find corresponding files (same logic as preview) ---
@@ -3445,28 +4059,42 @@ class MergingGUI(ThemedTk):
                 # --- END NEW ---
 
                 mask_folder = settings["mask_folder"]
+                splatted1_pattern = os.path.join(
+                    mask_folder, f"{core_name}_*_splatted1.mp4"
+                )
                 splatted4_pattern = os.path.join(
                     mask_folder, f"{core_name}_*_splatted4.mp4"
                 )
                 splatted2_pattern = os.path.join(
                     mask_folder, f"{core_name}_*_splatted2.mp4"
                 )
+                splatted1_matches = glob.glob(splatted1_pattern)
                 splatted4_matches = glob.glob(splatted4_pattern)
                 splatted2_matches = glob.glob(splatted2_pattern)
 
                 splatted_file_path = None
-                if splatted4_matches:
+                input_layout = "quad"
+                if splatted1_matches:
+                    splatted_file_path = splatted1_matches[0]
+                    input_layout = "single"
+                    is_dual_input = False
+                elif splatted4_matches:
                     splatted_file_path = splatted4_matches[0]
+                    input_layout = "quad"
                     is_dual_input = False
                 elif splatted2_matches:
                     splatted_file_path = splatted2_matches[0]
+                    input_layout = "dual"
                     is_dual_input = True
+                is_quad_input = input_layout == "quad"
+                is_single_input = input_layout == "single"
 
                 # 2. Open readers, don't load all frames
                 # --- FIX: Validate all file paths before attempting to open them ---
                 if not splatted_file_path or not os.path.exists(splatted_file_path):
                     logger.error(
-                        f"Missing required splatted file for '{core_name}'. Searched for '{splatted4_pattern}' and '{splatted2_pattern}'. Skipping video."
+                        f"Missing required splatted file for '{core_name}'. "
+                        f"Searched for '{splatted1_pattern}', '{splatted4_pattern}' and '{splatted2_pattern}'. Skipping video."
                     )
                     self.after(0, self.progress_var.set, i + 1)
                     continue
@@ -3477,29 +4105,83 @@ class MergingGUI(ThemedTk):
                 # Optional external replace-mask video (binary mkv/mp4)
                 replace_mask_reader = None
                 replace_mask_path = None
-                if settings.get("use_replace_mask", False):
-                    replace_mask_path = self._find_replace_mask_for_splatted(
-                        splatted_file_path, settings.get("replace_mask_folder", "")
+                mask_formerge_reader = None
+                mask_formerge_path = None
+                use_replace_mask_setting = bool(settings.get("use_replace_mask", False))
+                use_mask_formerge_setting = bool(settings.get("use_mask_formerge", False))
+                use_replace_mask = bool(use_replace_mask_setting)
+                if is_single_input and not use_replace_mask:
+                    logger.warning(
+                        f"{base_name} uses single-warp input: forcing replace-mask ON."
                     )
-                    if replace_mask_path and os.path.exists(replace_mask_path):
-                        try:
-                            replace_mask_reader = VideoReader(
-                                replace_mask_path, ctx=cpu(0)
-                            )
+                    use_replace_mask = True
+                replace_mask_path = self._find_replace_mask_for_splatted(
+                    splatted_file_path, settings.get("replace_mask_folder", "")
+                )
+                has_replace_mask = bool(replace_mask_path and os.path.exists(replace_mask_path))
+                if has_replace_mask:
+                    try:
+                        replace_mask_reader = VideoReader(
+                            replace_mask_path, ctx=cpu(0)
+                        )
+                        if use_replace_mask:
                             logger.info(
                                 f"Using external replace mask: {os.path.basename(replace_mask_path)}"
                             )
-                        except Exception as e_rm:
-                            logger.warning(
-                                f"Failed to open replace mask '{replace_mask_path}': {e_rm}"
+                        else:
+                            logger.info(
+                                f"Replace mask available for CT reference: {os.path.basename(replace_mask_path)}"
                             )
-                            replace_mask_reader = None
-                            replace_mask_path = None
+                    except Exception as e_rm:
+                        logger.warning(
+                            f"Failed to open replace mask '{replace_mask_path}': {e_rm}"
+                        )
+                        replace_mask_reader = None
+                        has_replace_mask = False
+                elif use_replace_mask and not has_replace_mask and not is_single_input:
+                    logger.warning(
+                        f"Replace-mask toggle ON but no replace-mask found for '{base_name}'. Falling back to legacy mask for blend."
+                    )
+                if is_single_input and not has_replace_mask:
+                    raise RuntimeError(
+                        f"Single-warp input requires replace mask, but none was found/opened for '{base_name}'."
+                    )
 
+                # Optional preprocessed mask-for-merge (final blend mask source).
+                if use_mask_formerge_setting:
+                    mask_formerge_path = self._find_mask_formerge_for_splatted(
+                        splatted_file_path, settings.get("mask_formerge_folder", "")
+                    )
+                    if mask_formerge_path and os.path.exists(mask_formerge_path):
+                        try:
+                            mask_formerge_reader = VideoReader(mask_formerge_path, ctx=cpu(0))
+                            logger.info(
+                                f"Using preprocessed mask-for-merge: {os.path.basename(mask_formerge_path)}"
+                            )
+                        except Exception as e_mf:
+                            logger.warning(
+                                f"Failed to open mask-for-merge '{mask_formerge_path}': {e_mf}"
+                            )
+                            mask_formerge_reader = None
+                    else:
+                        logger.warning(
+                            f"Mask-for-merge toggle ON but no preprocessed mask found for '{base_name}'. Falling back to in-GUI mask chain."
+                        )
+
+                # Keep explicit flags for later per-chunk behavior.
+                has_replace_mask = bool(replace_mask_reader is not None)
+                use_replace_mask_effective = bool(has_replace_mask and use_replace_mask)
+                use_mask_formerge_effective = bool(mask_formerge_reader is not None)
+                ct_available = bool(has_replace_mask)
+                ct_enabled_effective = bool(settings.get("enable_color_transfer", False) and ct_available)
+                if bool(settings.get("enable_color_transfer", False)) and not ct_available:
+                    logger.warning(
+                        f"Color Transfer disabled for '{base_name}': replace-mask not available."
+                    )
 
                 # --- FIX: Determine original_reader based on input type ---
                 original_reader = None  # Assume None initially
-                if is_dual_input:  # splatted2
+                if is_dual_input or is_single_input:  # splatted2 / splatted1
                     # --- MODIFIED: Use helper to find original video with any extension ---
                     original_video_path = self._find_video_by_core_name(
                         settings["original_folder"], core_name
@@ -3510,15 +4192,16 @@ class MergingGUI(ThemedTk):
 
                     if original_video_path and os.path.exists(original_video_path):
                         logger.info(
-                            f"Found matching original video for dual-input: {os.path.basename(original_video_path)}"
+                            f"Found matching original video for {input_layout}-input: {os.path.basename(original_video_path)}"
                         )
                         original_reader = VideoReader(original_video_path, ctx=cpu(0))
                     else:
                         logger.warning(
-                            f"Original video not found for dual-input mode: '{core_name}.*'."
+                            f"Original video not found for {input_layout}-input mode: '{core_name}.*'."
                         )
-                        logger.warning(
-                            "Will proceed, but only 'Right-Eye Only' output will be possible for this video."
+                        raise RuntimeError(
+                            f"Missing original video for {input_layout}-input mode: '{core_name}.*'. "
+                            "Output requires original left-eye content."
                         )
                 else:  # splatted4 (quad)
                     # For quad-splatted files, the splatted file itself is the source for the left eye.
@@ -3534,22 +4217,27 @@ class MergingGUI(ThemedTk):
                 # Determine output dimensions from a sample frame
                 sample_splatted_np = splatted_reader.get_batch([0]).asnumpy()
                 _, H_splat, W_splat, _ = sample_splatted_np.shape
-                if is_dual_input:
+                if is_single_input:
+                    hires_H, hires_W = H_splat, W_splat
+                elif is_dual_input:
                     hires_H, hires_W = H_splat, W_splat // 2
                 else:
                     hires_H, hires_W = H_splat // 2, W_splat // 2
 
-                # --- NEW: Check if SBS/3D output is possible ---
                 output_format = settings["output_format"]
-                if original_reader is None and output_format != "Right-Eye Only":
-                    logger.warning(
-                        f"Original video is missing for '{base_name}'. Forcing output format to 'Right-Eye Only'."
+                if output_format not in self.OUTPUT_FORMAT_CHOICES:
+                    raise RuntimeError(
+                        f"Unsupported output format '{output_format}'. "
+                        f"Supported formats: {', '.join(self.OUTPUT_FORMAT_CHOICES)}"
                     )
-                    output_format = "Right-Eye Only"
-                # --- END NEW ---
+                if original_reader is None:
+                    raise RuntimeError(
+                        f"Original video is missing for '{base_name}'. Cannot render output format '{output_format}'."
+                    )
 
                 # --- NEW: Determine output dimensions, perceived width for filename, and suffix ---
                 perceived_width_for_filename = hires_W  # Default to single-eye width
+                output_height = hires_H
 
                 if output_format == "Full SBS Cross-eye (Right-Left)":
                     output_width = hires_W * 2
@@ -3574,15 +4262,8 @@ class MergingGUI(ThemedTk):
                     output_width = hires_W
                     output_suffix = "_merged_anaglyph.mp4"
                     # Perceived width is the full output width
-                else:  # Right-Eye Only
-                    output_width = hires_W
-                    output_suffix = "_merged_right_eye.mp4"
-                    # Perceived width is the full output width
-
-                if (
-                    "output_height" not in locals()
-                ):  # Set default height if not already set by a special format
-                    output_height = hires_H
+                else:
+                    raise RuntimeError(f"Unsupported output format: {output_format}")
 
                 # Construct the final filename using the core name and the new perceived width
                 output_filename = (
@@ -3679,9 +4360,7 @@ class MergingGUI(ThemedTk):
                     splatted_np = splatted_reader.get_batch(frame_indices).asnumpy()
 
                     replace_mask_np = None
-                    _rmr = locals().get('replace_mask_reader', None)
-                    if _rmr is not None:
-                        replace_mask_reader = _rmr
+                    if replace_mask_reader is not None:
                         try:
                             replace_mask_np = (
                                 replace_mask_reader.get_batch(frame_indices).asnumpy()
@@ -3691,6 +4370,21 @@ class MergingGUI(ThemedTk):
                                 f"Replace mask read failed for {base_name} frames {frame_start}-{frame_end}: {e_rmread}"
                             )
                             replace_mask_np = None
+                    mask_formerge_np = None
+                    if mask_formerge_reader is not None:
+                        try:
+                            mask_formerge_np = (
+                                mask_formerge_reader.get_batch(frame_indices).asnumpy()
+                            )
+                        except Exception as e_mfread:
+                            logger.warning(
+                                f"Mask-for-merge read failed for {base_name} frames {frame_start}-{frame_end}: {e_mfread}"
+                            )
+                            mask_formerge_np = None
+                    if is_single_input and replace_mask_np is None:
+                        raise RuntimeError(
+                            f"Single-warp input requires replace mask on every chunk; read failed at frames {frame_start}-{frame_end}."
+                        )
 
 
                     # Convert to tensors and extract parts (same logic as preview)
@@ -3712,7 +4406,22 @@ class MergingGUI(ThemedTk):
                     )
                     _, _, H, W = splatted_tensor.shape
 
-                    if is_dual_input:
+                    if is_single_input:
+                        if original_reader is None:
+                            original_left = torch.zeros_like(inpainted)
+                        else:
+                            original_np = original_reader.get_batch(
+                                frame_indices
+                            ).asnumpy()
+                            original_left = (
+                                torch.from_numpy(original_np)
+                                .permute(0, 3, 1, 2)
+                                .float()
+                                / 255.0
+                            )
+                        mask_raw = torch.zeros_like(splatted_tensor)
+                        warped_original = splatted_tensor
+                    elif is_dual_input:
                         # --- NEW: Handle missing original_reader for dual input ---
                         if original_reader is None:
                             # Create a black tensor as a placeholder for the left eye
@@ -3736,29 +4445,62 @@ class MergingGUI(ThemedTk):
                         original_left = splatted_tensor[:, :, : H // 2, : W // 2]
                         mask_raw = splatted_tensor[:, :, H // 2 :, : W // 2]
                         warped_original = splatted_tensor[:, :, H // 2 :, W // 2 :]
-                    # --- NEW: Prefer external replace-mask if available, else fallback to embedded mask ---
-                    if replace_mask_np is not None:
-                        # replace_mask_np: (T,H,W,C) uint8 or float; convert to 0..1 float mask (T,1,H,W)
-                        if replace_mask_np.ndim == 4 and replace_mask_np.shape[3] >= 1:
-                            rm_gray = replace_mask_np[..., :3].mean(axis=3)  # T,H,W
-                        elif replace_mask_np.ndim == 3:
-                            rm_gray = replace_mask_np  # T,H,W
+
+                    def _gray_mask_batch_from_numpy(arr: np.ndarray) -> torch.Tensor:
+                        if arr.ndim == 4 and arr.shape[3] >= 1:
+                            gray = arr[..., :3].mean(axis=3)
+                        elif arr.ndim == 3:
+                            gray = arr
                         else:
-                            rm_gray = replace_mask_np.squeeze()
-                        rm_gray = rm_gray.astype("float32")
-                        if rm_gray.max() > 1.5:
-                            rm_gray = rm_gray / 255.0
-                        mask = torch.from_numpy(rm_gray).float().unsqueeze(1)
+                            gray = np.squeeze(arr)
+                        gray = gray.astype("float32")
+                        if gray.size > 0 and float(np.nanmax(gray)) > 1.5:
+                            gray = gray / 255.0
+                        gray = np.clip(gray, 0.0, 1.0)
+                        return torch.from_numpy(gray).float().unsqueeze(1)
+
+                    legacy_mask_np = mask_raw.permute(0, 2, 3, 1).cpu().numpy()
+                    legacy_mask = _gray_mask_batch_from_numpy(legacy_mask_np)
+                    replace_mask_batch = (
+                        _gray_mask_batch_from_numpy(replace_mask_np)
+                        if replace_mask_np is not None
+                        else None
+                    )
+                    mask_formerge_batch = (
+                        _gray_mask_batch_from_numpy(mask_formerge_np)
+                        if mask_formerge_np is not None
+                        else None
+                    )
+
+                    use_replace_mask_chunk = bool(
+                        use_replace_mask_effective and replace_mask_batch is not None
+                    ) or bool(is_single_input)
+                    use_mask_formerge_chunk = bool(
+                        use_mask_formerge_effective and mask_formerge_batch is not None
+                    )
+                    if use_mask_formerge_chunk:
+                        mask = mask_formerge_batch
+                    elif use_replace_mask_chunk and replace_mask_batch is not None:
+                        mask = replace_mask_batch
                     else:
-                        mask_np = mask_raw.permute(0, 2, 3, 1).cpu().numpy()
-                        mask_gray_np = np.mean(mask_np, axis=3)
-                        mask = torch.from_numpy(mask_gray_np).float().unsqueeze(1)
+                        mask = legacy_mask
+
+                    # CT always uses replace-mask when available.
+                    ct_mask = (
+                        replace_mask_batch
+                        if replace_mask_batch is not None
+                        else legacy_mask
+                    )
+                    ct_enabled_chunk = bool(
+                        ct_enabled_effective and replace_mask_batch is not None
+                    )
 
                     # Process chunk
                     use_gpu = settings["use_gpu"] and torch.cuda.is_available()
                     device = "cuda" if use_gpu else "cpu"
-                    mask, inpainted, original_left, warped_original = (
+                    mask, ct_mask, inpainted, original_left, warped_original = (
                         mask.to(device),
+                        ct_mask.to(device),
                         inpainted.to(device),
                         original_left.to(device),
                         warped_original.to(device),
@@ -3777,14 +4519,22 @@ class MergingGUI(ThemedTk):
                             mode="bilinear",
                             align_corners=False,
                         )
+                        ct_mask = F.interpolate(
+                            ct_mask,
+                            size=(hires_H, hires_W),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
 
                     # GUI-aligned CT mask: clean binary mask before post-process blend pipeline.
-                    if settings["mask_binarize_threshold"] >= 0.0:
-                        mask_bin = (mask > settings["mask_binarize_threshold"]).float()
+                    if ct_enabled_chunk:
+                        mask_bin = (ct_mask > 0.5).float()
+                    elif settings["mask_binarize_threshold"] >= 0.0:
+                        mask_bin = (ct_mask > settings["mask_binarize_threshold"]).float()
                     else:
-                        mask_bin = (mask > 0.5).float()
+                        mask_bin = (ct_mask > 0.5).float()
 
-                    if settings["enable_color_transfer"]:
+                    if ct_enabled_chunk:
                         adjusted_frames = []
                         eval_candidate_ids: Optional[List[int]] = None
                         if ct_auto_mode == CT_AUTO_MODE_ON:
@@ -3896,36 +4646,65 @@ class MergingGUI(ThemedTk):
                         inpainted = torch.stack(adjusted_frames)
 
                     processed_mask = mask.clone()
-                    # --- NEW: Binarization as the first step ---
-                    if settings["mask_binarize_threshold"] >= 0.0:
-                        processed_mask = (
-                            mask > settings["mask_binarize_threshold"]
-                        ).float()
+                    if not use_mask_formerge_chunk:
+                        # Skip first binarization when blending from replace-mask.
+                        if (
+                            (not use_replace_mask_chunk)
+                            and settings["mask_binarize_threshold"] >= 0.0
+                        ):
+                            processed_mask = (
+                                mask > settings["mask_binarize_threshold"]
+                            ).float()
 
-                    if settings["mask_dilate_kernel_size"] > 0:
-                        processed_mask = apply_mask_dilation(
-                            processed_mask, settings["mask_dilate_kernel_size"], use_gpu
-                        )
-                    if settings["mask_blur_kernel_size"] > 0:
-                        processed_mask = apply_gaussian_blur(
-                            processed_mask, settings["mask_blur_kernel_size"], use_gpu
-                        )
+                        if settings["mask_dilate_kernel_size"] > 0:
+                            processed_mask = apply_mask_dilation(
+                                processed_mask, settings["mask_dilate_kernel_size"], use_gpu
+                            )
+                        if settings["mask_blur_kernel_size"] > 0:
+                            processed_mask = apply_gaussian_blur(
+                                processed_mask, settings["mask_blur_kernel_size"], use_gpu
+                            )
 
-                    if int(settings.get("shadow_length_px", 0)) > 0:
-                        processed_mask = apply_shadow_blur(
-                            processed_mask,
-                            base_length_px=int(settings.get("shadow_length_px", 0)),
-                            curve=float(settings.get("shadow_curve", 0.0)),
-                            motion_gain=float(settings.get("shadow_motion_gain", 0.0)),
-                            width_adaptive=bool(
-                                settings.get("shadow_width_adaptive", True)
-                            ),
-                            use_gpu=use_gpu,
-                            state=shadow_state,
-                            border_tolerance_px=2,
-                            width_ref_px=20.0,
-                            width_power=1.0,
-                        )
+                        if int(settings.get("shadow_length_px", 0)) > 0:
+                            processed_mask = apply_shadow_blur(
+                                processed_mask,
+                                base_length_px=int(settings.get("shadow_length_px", 0)),
+                                curve=float(settings.get("shadow_curve", 0.0)),
+                                motion_gain=float(settings.get("shadow_motion_gain", 0.0)),
+                                motion_deadzone_px=float(
+                                    settings.get("shadow_motion_deadzone_px", 4.0)
+                                ),
+                                motion_max_px=float(
+                                    settings.get("shadow_motion_max_px", 40.0)
+                                ),
+                                motion_chain_enabled=bool(
+                                    settings.get("shadow_motion_enabled", True)
+                                ),
+                                area_min_px=float(
+                                    settings.get("shadow_area_min_px", 0.0)
+                                ),
+                                area_max_px=float(
+                                    settings.get("shadow_area_max_px", 0.0)
+                                ),
+                                area_reset_ratio=float(
+                                    settings.get("shadow_area_reset_ratio", 1.8)
+                                ),
+                                area_reset_abs_px=float(
+                                    settings.get("shadow_area_reset_abs_px", 0.0)
+                                ),
+                                component_merge_y_tol_px=int(
+                                    settings.get("shadow_component_merge_y_tol_px", 0)
+                                ),
+                                alpha_down=float(settings.get("shadow_alpha_down", 0.45)),
+                                width_adaptive=bool(
+                                    settings.get("shadow_width_adaptive", True)
+                                ),
+                                use_gpu=use_gpu,
+                                state=shadow_state,
+                                border_tolerance_px=2,
+                                width_ref_px=20.0,
+                                width_power=1.0,
+                            )
 
                     blended_right_eye = (
                         warped_original * (1 - processed_mask)
@@ -4010,8 +4789,9 @@ class MergingGUI(ThemedTk):
                             dim=1,
                         )
                     else:
-                        # Default to Right-Eye Only
-                        final_chunk = blended_right_eye
+                        raise RuntimeError(
+                            f"Unsupported output format during assembly: {output_format}"
+                        )
                     # --- END NEW ---
 
                     cpu_chunk = final_chunk.cpu()
@@ -4029,7 +4809,7 @@ class MergingGUI(ThemedTk):
                     )
 
                 # 5. Finalize FFmpeg process
-                if settings.get("enable_color_transfer", False):
+                if ct_enabled_effective:
                     total_ct = float(sum(ct_usage_counts.values()))
                     if total_ct > 0:
                         ct_line = " ".join(
@@ -4104,13 +4884,15 @@ class MergingGUI(ThemedTk):
                         inpainted_reader = None
                     if splatted_reader:
                         splatted_reader = None
-                    _rmr = locals().get('replace_mask_reader', None)
-                    if _rmr is not None:
-                        replace_mask_reader = _rmr
+                    if replace_mask_reader:
                         replace_mask_reader = None
+                    if mask_formerge_reader:
+                        mask_formerge_reader = None
                     if original_reader:
                         original_reader = None
-                    inpainted_reader, splatted_reader, original_reader = (
+                    inpainted_reader, splatted_reader, replace_mask_reader, mask_formerge_reader, original_reader = (
+                        None,
+                        None,
                         None,
                         None,
                         None,
@@ -4160,13 +4942,13 @@ class MergingGUI(ThemedTk):
                 # --- FIX: Ensure readers are closed on exception before the finally block ---
                 if splatted_reader:
                     splatted_reader = None
-                _rmr = locals().get('replace_mask_reader', None)
-                if _rmr is not None:
-                    replace_mask_reader = _rmr
+                if replace_mask_reader:
                     replace_mask_reader = None
+                if mask_formerge_reader:
+                    mask_formerge_reader = None
                 if original_reader:
                     original_reader = None
-                inpainted_reader, splatted_reader, replace_mask_reader, original_reader = None, None, None, None
+                inpainted_reader, splatted_reader, replace_mask_reader, mask_formerge_reader, original_reader = None, None, None, None, None
                 # --- END FIX ---
                 logger.error(f"Failed to process {base_name}: {e}", exc_info=True)
                 self.after(
@@ -4186,10 +4968,10 @@ class MergingGUI(ThemedTk):
                     inpainted_reader = None
                 if splatted_reader:
                     splatted_reader = None
-                _rmr = locals().get('replace_mask_reader', None)
-                if _rmr is not None:
-                    replace_mask_reader = _rmr
+                if replace_mask_reader:
                     replace_mask_reader = None
+                if mask_formerge_reader:
+                    mask_formerge_reader = None
                 if original_reader:
                     original_reader = None
                 # --- END: CHUNK-BASED PROCESSING ---
@@ -4288,6 +5070,7 @@ class MergingGUI(ThemedTk):
         ]
 
         video_source_list = []
+        single_missing_replace: List[str] = []
         self._clear_border_info()  # Clear border info before scanning
 
         for inpainted_path in valid_inpainted_videos:
@@ -4325,6 +5108,9 @@ class MergingGUI(ThemedTk):
             # --- END NEW ---
 
             mask_folder = self.mask_folder_var.get()
+            splatted1_pattern = os.path.join(
+                mask_folder, f"{core_name}_*_splatted1.mp4"
+            )
             splatted4_pattern = os.path.join(
                 mask_folder, f"{core_name}_*_splatted4.mp4"
             )
@@ -4332,8 +5118,9 @@ class MergingGUI(ThemedTk):
                 mask_folder, f"{core_name}_*_splatted2.mp4"
             )
             logger.debug(
-                f"  - Searching for splatted file with patterns: '{splatted4_pattern}' and '{splatted2_pattern}'"
+                f"  - Searching for splatted file with patterns: '{splatted1_pattern}', '{splatted4_pattern}' and '{splatted2_pattern}'"
             )
+            splatted1_matches = glob.glob(splatted1_pattern)
             splatted4_matches = glob.glob(splatted4_pattern)
             splatted2_matches = glob.glob(splatted2_pattern)
 
@@ -4342,19 +5129,55 @@ class MergingGUI(ThemedTk):
                 "splatted": None,
                 "original": None,
                 "replace_mask": None,
+                "mask_formerge": None,
                 "is_sbs_input": is_sbs_input,
                 "is_quad_input": False,
+                "is_single_input": False,
+                "input_layout": "quad",
                 "sidecar": clip_sidecar_data,  # Store sidecar data for borders
             }
 
-            if splatted4_matches:
+            if splatted1_matches:
+                splatted_path = splatted1_matches[0]
+                logger.debug(
+                    f"  - Found single-warp match: {os.path.basename(splatted_path)}"
+                )
+                source_dict["splatted"] = splatted_path
+                source_dict["is_single_input"] = True
+                source_dict["input_layout"] = "single"
+                source_dict["replace_mask"] = self._find_replace_mask_for_splatted(
+                    splatted_path, self.replace_mask_folder_var.get()
+                )
+                source_dict["mask_formerge"] = self._find_mask_formerge_for_splatted(
+                    splatted_path, self.mask_formerge_folder_var.get()
+                )
+                original_path = self._find_video_by_core_name(
+                    self.original_folder_var.get(), core_name
+                )
+                if original_path:
+                    source_dict["original"] = original_path
+                else:
+                    logger.warning(
+                        f"  - For single-warp input '{base_name}', the original video '{core_name}.*' was not found."
+                    )
+                if not self._path_exists(source_dict.get("replace_mask")):
+                    single_missing_replace.append(base_name)
+                    logger.error(
+                        f"Single-warp input '{base_name}' missing replace-mask. Skipping preview entry."
+                    )
+                    continue
+            elif splatted4_matches:
                 splatted_path = splatted4_matches[0]
                 logger.debug(
                     f"  - Found quad-splatted match: {os.path.basename(splatted_path)}"
                 )
                 source_dict["splatted"] = splatted_path
                 source_dict["is_quad_input"] = True  # Set flag for quad-splatted input
+                source_dict["input_layout"] = "quad"
                 source_dict["replace_mask"] = self._find_replace_mask_for_splatted(splatted_path, self.replace_mask_folder_var.get())
+                source_dict["mask_formerge"] = self._find_mask_formerge_for_splatted(
+                    splatted_path, self.mask_formerge_folder_var.get()
+                )
                 # 'original' remains None, which is the necessary structural fix for the crash
             elif splatted2_matches:
                 splatted_path = splatted2_matches[0]
@@ -4362,7 +5185,11 @@ class MergingGUI(ThemedTk):
                     f"  - Found dual-splatted match: {os.path.basename(splatted_path)}"
                 )
                 source_dict["splatted"] = splatted_path
+                source_dict["input_layout"] = "dual"
                 source_dict["replace_mask"] = self._find_replace_mask_for_splatted(splatted_path, self.replace_mask_folder_var.get())
+                source_dict["mask_formerge"] = self._find_mask_formerge_for_splatted(
+                    splatted_path, self.mask_formerge_folder_var.get()
+                )
                 original_path = self._find_video_by_core_name(
                     self.original_folder_var.get(), core_name
                 )
@@ -4383,6 +5210,22 @@ class MergingGUI(ThemedTk):
                 continue  # Skip to the next video if no splatted file is found
 
             video_source_list.append(source_dict)
+        if any(bool(v.get("is_single_input", False)) for v in video_source_list):
+            if not self.use_replace_mask_var.get():
+                logger.info(
+                    "Single-warp input detected in preview list: forcing 'Use Replace Mask' ON."
+                )
+                self.use_replace_mask_var.set(True)
+        if single_missing_replace:
+            names = "\n".join(single_missing_replace[:8])
+            extra = "" if len(single_missing_replace) <= 8 else f"\n... (+{len(single_missing_replace)-8} more)"
+            messagebox.showerror(
+                "Missing Replace Mask",
+                "Single-warp clips require replace-mask and were excluded from preview:\n\n"
+                f"{names}{extra}",
+            )
+        self._last_mode_constraints_video_index = -999999
+        self.after_idle(lambda: self._refresh_mode_constraints(trigger_preview=False))
         return video_source_list
 
     def _preview_processing_callback(
@@ -4415,10 +5258,23 @@ class MergingGUI(ThemedTk):
             current_source_metadata = self.previewer.video_list[
                 self.previewer.current_video_index
             ]
+            current_video_index = int(self.previewer.current_video_index)
+            if current_video_index != self._last_mode_constraints_video_index:
+                self._last_mode_constraints_video_index = current_video_index
+                self.after_idle(lambda: self._refresh_mode_constraints(trigger_preview=False))
             is_sbs_input = current_source_metadata.get("is_sbs_input", False)
             is_quad_input = current_source_metadata.get(
                 "is_quad_input", False
             )  # <--- GET NEW FLAG
+            is_single_input = current_source_metadata.get("is_single_input", False)
+            input_layout = current_source_metadata.get("input_layout", "")
+            if input_layout not in {"single", "dual", "quad"}:
+                if is_quad_input:
+                    input_layout = "quad"
+                elif is_single_input:
+                    input_layout = "single"
+                else:
+                    input_layout = "dual"
             # --- END FIX ---
 
             # 2. Determine input types and extract frame parts
@@ -4433,13 +5289,19 @@ class MergingGUI(ThemedTk):
             _, _, H, W = splatted_tensor.shape
 
             # --- FIX: Use is_quad_input for reliable tensor extraction ---
-            if is_quad_input:  # Splatted4 (Original Left and Mask/Warped are all inside the splatted file)
+            if input_layout == "quad":  # Splatted4 (Original Left and Mask/Warped are all inside the splatted file)
                 half_h, half_w = H // 2, W // 2
                 original_left = splatted_tensor[:, :, :half_h, :half_w]
                 depth_map_vis = splatted_tensor[:, :, :half_h, half_w:]
                 mask_raw = splatted_tensor[:, :, half_h:, :half_w]
                 right_eye_original = splatted_tensor[:, :, half_h:, half_w:]
                 is_dual_input = False  # For clarity
+            elif input_layout == "single":  # Splatted1 (only warped frame, mask must come from replace-mask)
+                original_left = original_tensor
+                depth_map_vis = None
+                right_eye_original = splatted_tensor
+                mask_raw = torch.zeros_like(splatted_tensor)
+                is_dual_input = False
             else:  # Splatted2 (Original Left is a separate file provided by original_tensor)
                 half_w = W // 2
                 mask_raw = splatted_tensor[:, :, :, :half_w]
@@ -4447,6 +5309,9 @@ class MergingGUI(ThemedTk):
                 original_left = original_tensor
                 depth_map_vis = None
                 is_dual_input = True  # For clarity
+
+            if original_left is None:
+                original_left = torch.zeros_like(inpainted)
 
             # Configure preview source dropdown based on input type
             preview_options = [
@@ -4460,7 +5325,7 @@ class MergingGUI(ThemedTk):
                 "Optimized Anaglyph",  # <--- ADDED ANAGLYPH
                 "Wigglegram",
             ]
-            if not is_dual_input:  # Depth map is only in quad-splatted files
+            if input_layout == "quad":  # Depth map is only in quad-splatted files
                 preview_options.append("Depth Map")
             self.previewer.set_preview_source_options(preview_options)
 
@@ -4475,9 +5340,11 @@ class MergingGUI(ThemedTk):
             def _mask_from_splatted_tensor(sp_tensor: torch.Tensor) -> torch.Tensor:
                 _h = int(sp_tensor.shape[2])
                 _w = int(sp_tensor.shape[3])
-                if is_quad_input:
+                if input_layout == "quad":
                     _half_h, _half_w = _h // 2, _w // 2
                     _mask_raw = sp_tensor[:, :, _half_h:, :_half_w]
+                elif input_layout == "single":
+                    _mask_raw = torch.zeros_like(sp_tensor[:, :, :, :1]).repeat(1, 1, 1, _w)
                 else:
                     _half_w = _w // 2
                     _mask_raw = sp_tensor[:, :, :, :_half_w]
@@ -4485,7 +5352,10 @@ class MergingGUI(ThemedTk):
 
             def _load_mask_for_preview_frame(frame_idx: int) -> Optional[torch.Tensor]:
                 readers = getattr(self.previewer, "source_readers", {}) or {}
-                if params.get("use_replace_mask", False):
+                effective_use_replace_mask = bool(
+                    params.get("use_replace_mask", False) or input_layout == "single"
+                )
+                if effective_use_replace_mask:
                     rm_reader = readers.get("replace_mask")
                     if rm_reader is not None:
                         try:
@@ -4513,10 +5383,37 @@ class MergingGUI(ThemedTk):
 
             # Convert mask to grayscale (optionally using an external replace-mask video)
             replace_mask_tensor = source_frames.get("replace_mask")
-            if params.get("use_replace_mask", False) and replace_mask_tensor is not None:
+            mask_formerge_tensor = source_frames.get("mask_formerge")
+            has_replace_mask = replace_mask_tensor is not None
+            has_mask_formerge = mask_formerge_tensor is not None
+
+            if input_layout == "single" and not has_replace_mask:
+                raise RuntimeError(
+                    "Single-warp input requires replace-mask, but it is missing for preview."
+                )
+
+            effective_use_replace_mask = bool(
+                (params.get("use_replace_mask", False) and has_replace_mask)
+                or input_layout == "single"
+            )
+            use_mask_formerge_effective = bool(
+                params.get("use_mask_formerge", False) and has_mask_formerge
+            )
+
+            if use_mask_formerge_effective:
+                mask = _gray_mask_from_tensor(mask_formerge_tensor)
+            elif effective_use_replace_mask and has_replace_mask:
                 mask = _gray_mask_from_tensor(replace_mask_tensor)
             else:
                 mask = _gray_mask_from_tensor(mask_raw)
+
+            # CT always consumes replace-mask when available (even if blend uses legacy mask).
+            ct_mask_source = (
+                _gray_mask_from_tensor(replace_mask_tensor)
+                if has_replace_mask
+                else _gray_mask_from_tensor(mask_raw)
+            )
+            ct_available = bool(has_replace_mask)
 
             # 3. Process the frames
             # Define the processing device based on the 'use_gpu' parameter
@@ -4543,10 +5440,26 @@ class MergingGUI(ThemedTk):
                 mask = F.interpolate(
                     mask, size=(hires_H, hires_W), mode="bilinear", align_corners=False
                 )
+            if (
+                ct_mask_source.shape[2] != hires_H
+                or ct_mask_source.shape[3] != hires_W
+            ):
+                ct_mask_source = F.interpolate(
+                    ct_mask_source,
+                    size=(hires_H, hires_W),
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
             def _preprocess_mask_for_shadow(mask_in: torch.Tensor) -> torch.Tensor:
                 proc = mask_in.clone()
-                if params.get("mask_binarize_threshold", -1.0) >= 0.0:
+                if use_mask_formerge_effective:
+                    return proc
+                # Skip the initial binarize step when blending from replace-mask.
+                if (
+                    not effective_use_replace_mask
+                    and params.get("mask_binarize_threshold", -1.0) >= 0.0
+                ):
                     proc = (proc > params["mask_binarize_threshold"]).float()
                 if params.get("mask_dilate_kernel_size", 0) > 0:
                     proc = apply_mask_dilation(
@@ -4566,20 +5479,39 @@ class MergingGUI(ThemedTk):
             )
             warmup_frames = int(params.get("preview_shadow_warmup_frames", 20))
             shadow_motion_gain = float(params.get("shadow_motion_gain", 0.0))
+            shadow_motion_enabled = bool(params.get("shadow_motion_enabled", True))
+            shadow_motion_deadzone_px = float(
+                params.get("shadow_motion_deadzone_px", 4.0)
+            )
 
-            if shadow_len_px > 0:
-                if use_temporal_shadow_preview and shadow_motion_gain > 0.0 and warmup_frames > 0:
+            if shadow_len_px > 0 and not use_mask_formerge_effective:
+                if (
+                    use_temporal_shadow_preview
+                    and shadow_motion_gain > 0.0
+                    and shadow_motion_enabled
+                    and warmup_frames > 0
+                ):
                     preview_frame_idx = int(self.previewer.frame_scrubber_var.get())
                     source_key = str(current_source_metadata.get("inpainted", "") or "")
                     shadow_cache_key = (
                         source_key,
-                        bool(params.get("use_replace_mask", False)),
+                        bool(use_mask_formerge_effective),
+                        bool(effective_use_replace_mask),
                         float(params.get("mask_binarize_threshold", -1.0)),
                         int(params.get("mask_dilate_kernel_size", 0)),
                         int(params.get("mask_blur_kernel_size", 0)),
                         int(shadow_len_px),
                         float(params.get("shadow_curve", 0.0)),
                         float(shadow_motion_gain),
+                        bool(shadow_motion_enabled),
+                        float(shadow_motion_deadzone_px),
+                        float(params.get("shadow_motion_max_px", 40.0)),
+                        float(params.get("shadow_area_min_px", 0.0)),
+                        float(params.get("shadow_area_max_px", 0.0)),
+                        float(params.get("shadow_area_reset_ratio", 1.8)),
+                        float(params.get("shadow_area_reset_abs_px", 0.0)),
+                        int(params.get("shadow_component_merge_y_tol_px", 0)),
+                        float(params.get("shadow_alpha_down", 0.45)),
                         bool(params.get("shadow_width_adaptive", True)),
                         int(warmup_frames),
                         int(hires_H),
@@ -4602,6 +5534,15 @@ class MergingGUI(ThemedTk):
                             base_length_px=shadow_len_px,
                             curve=float(params.get("shadow_curve", 0.0)),
                             motion_gain=shadow_motion_gain,
+                            motion_deadzone_px=shadow_motion_deadzone_px,
+                            motion_max_px=float(params.get("shadow_motion_max_px", 40.0)),
+                            motion_chain_enabled=shadow_motion_enabled,
+                            area_min_px=float(params.get("shadow_area_min_px", 0.0)),
+                            area_max_px=float(params.get("shadow_area_max_px", 0.0)),
+                            area_reset_ratio=float(params.get("shadow_area_reset_ratio", 1.8)),
+                            area_reset_abs_px=float(params.get("shadow_area_reset_abs_px", 0.0)),
+                            component_merge_y_tol_px=int(params.get("shadow_component_merge_y_tol_px", 0)),
+                            alpha_down=float(params.get("shadow_alpha_down", 0.45)),
                             width_adaptive=bool(
                                 params.get("shadow_width_adaptive", True)
                             ),
@@ -4639,6 +5580,15 @@ class MergingGUI(ThemedTk):
                                 base_length_px=shadow_len_px,
                                 curve=float(params.get("shadow_curve", 0.0)),
                                 motion_gain=shadow_motion_gain,
+                                motion_deadzone_px=shadow_motion_deadzone_px,
+                                motion_max_px=float(params.get("shadow_motion_max_px", 40.0)),
+                                motion_chain_enabled=shadow_motion_enabled,
+                                area_min_px=float(params.get("shadow_area_min_px", 0.0)),
+                                area_max_px=float(params.get("shadow_area_max_px", 0.0)),
+                                area_reset_ratio=float(params.get("shadow_area_reset_ratio", 1.8)),
+                                area_reset_abs_px=float(params.get("shadow_area_reset_abs_px", 0.0)),
+                                component_merge_y_tol_px=int(params.get("shadow_component_merge_y_tol_px", 0)),
+                                alpha_down=float(params.get("shadow_alpha_down", 0.45)),
                                 width_adaptive=bool(
                                     params.get("shadow_width_adaptive", True)
                                 ),
@@ -4661,6 +5611,15 @@ class MergingGUI(ThemedTk):
                         base_length_px=shadow_len_px,
                         curve=float(params.get("shadow_curve", 0.0)),
                         motion_gain=shadow_motion_gain,
+                        motion_deadzone_px=shadow_motion_deadzone_px,
+                        motion_max_px=float(params.get("shadow_motion_max_px", 40.0)),
+                        motion_chain_enabled=shadow_motion_enabled,
+                        area_min_px=float(params.get("shadow_area_min_px", 0.0)),
+                        area_max_px=float(params.get("shadow_area_max_px", 0.0)),
+                        area_reset_ratio=float(params.get("shadow_area_reset_ratio", 1.8)),
+                        area_reset_abs_px=float(params.get("shadow_area_reset_abs_px", 0.0)),
+                        component_merge_y_tol_px=int(params.get("shadow_component_merge_y_tol_px", 0)),
+                        alpha_down=float(params.get("shadow_alpha_down", 0.45)),
                         width_adaptive=bool(
                             params.get("shadow_width_adaptive", True)
                         ),
@@ -4674,7 +5633,11 @@ class MergingGUI(ThemedTk):
                 self._preview_shadow_temporal_cache = None
             processed_mask = processed_mask.squeeze(0)  # Remove batch dim
 
-            if params.get("enable_color_transfer", False) and original_left is not None:
+            if (
+                params.get("enable_color_transfer", False)
+                and ct_available
+                and original_left is not None
+            ):
                 selected_label = _resolve_ct_preset_label(
                     params.get("ct_preset", CT_PRESET_DEFAULT_LABEL)
                 )
@@ -4730,10 +5693,15 @@ class MergingGUI(ThemedTk):
                         csv_blend_weights_for_frame = {fallback_selected_id: 1.0}
 
                 # Preview uses the same clean binary CT mask strategy as batch.
-                if params.get("mask_binarize_threshold", -1.0) >= 0.0:
-                    mask_bin = (mask > params["mask_binarize_threshold"]).float()
+                if has_replace_mask:
+                    mask_bin = (ct_mask_source > 0.5).float()
                 else:
-                    mask_bin = (mask > 0.5).float()
+                    if params.get("mask_binarize_threshold", -1.0) >= 0.0:
+                        mask_bin = (
+                            ct_mask_source > params["mask_binarize_threshold"]
+                        ).float()
+                    else:
+                        mask_bin = (ct_mask_source > 0.5).float()
 
                 inpainted_3 = inpainted[0].cpu() if inpainted.dim() == 4 else inpainted.cpu()
                 original_left_3 = (

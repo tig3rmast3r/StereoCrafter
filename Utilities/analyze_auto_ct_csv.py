@@ -19,6 +19,7 @@ import gc
 import multiprocessing as mp
 import os
 import queue as queue_mod
+import subprocess
 import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -123,6 +124,52 @@ def _open_video_reader(path: str, args: argparse.Namespace) -> VideoReader:
     return VideoReader(path, ctx=cpu(0))
 
 
+def _probe_packet_count(path: str) -> Optional[int]:
+    target = str(path or "").strip()
+    if not target:
+        return None
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-count_packets",
+        "-show_entries",
+        "stream=nb_read_packets,nb_read_frames",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+        target,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except Exception:
+        return None
+    if int(proc.returncode or 0) != 0:
+        return None
+    lines = [ln.strip() for ln in str(proc.stdout or "").splitlines() if ln.strip()]
+    for raw in lines:
+        try:
+            val = int(float(raw))
+        except Exception:
+            continue
+        if val >= 0:
+            return int(val)
+    return None
+
+
+def _is_complete_by_packets(done_frames: Set[int], expected_packets: int) -> bool:
+    n = int(max(0, expected_packets))
+    if n <= 0:
+        return False
+    if len(done_frames) != n:
+        return False
+    for fi in range(0, n):
+        if fi not in done_frames:
+            return False
+    return True
+
+
 def _load_existing_frame_keys(csv_path: str) -> Set[Tuple[str, int]]:
     done: Set[Tuple[str, int]] = set()
     if not os.path.exists(csv_path):
@@ -185,6 +232,13 @@ def _process_video_job(
         )
         if candidate and os.path.exists(candidate):
             replace_mask_path = candidate
+        else:
+            print(
+                f"[ERR] missing replace mask for {inpainted_name}; "
+                f"expected '{os.path.splitext(os.path.basename(splatted_path))[0]}_replace_mask.*' in "
+                f"'{args.replace_mask_folder or os.path.dirname(splatted_path)}'"
+            )
+            return None
 
     def _open_all_readers() -> Tuple[VideoReader, VideoReader, VideoReader, Optional[VideoReader]]:
         local_replace_mask_reader: Optional[VideoReader] = None
@@ -192,7 +246,8 @@ def _process_video_job(
             try:
                 local_replace_mask_reader = _open_video_reader(replace_mask_path, args)
             except Exception as e:
-                print(f"[WARN] replace mask open failed for {inpainted_name}: {e}")
+                print(f"[ERR] replace mask open failed for {inpainted_name}: {e}")
+                raise
         inpainted_reader_local = _open_video_reader(inpainted_path, args)
         splatted_reader_local = _open_video_reader(splatted_path, args)
         original_reader_local = _open_video_reader(original_path, args)
@@ -515,6 +570,22 @@ def main() -> int:
     ap.add_argument("--mask-binarize-threshold", type=float, default=-0.01)
     ap.add_argument("--min-mask-pixels", type=int, default=64)
     ap.add_argument(
+        "--resume-validate-packets",
+        dest="resume_validate_packets",
+        action="store_true",
+        default=True,
+        help=(
+            "Use ffprobe packet counts for resume completeness checks; "
+            "videos already fully covered in CSV are skipped without opening readers."
+        ),
+    )
+    ap.add_argument(
+        "--no-resume-validate-packets",
+        dest="resume_validate_packets",
+        action="store_false",
+        help="Disable packet-based resume completeness checks.",
+    )
+    ap.add_argument(
         "--sample-chunk-size",
         type=int,
         default=1,
@@ -599,14 +670,63 @@ def main() -> int:
         print("[ERR] no matching jobs found")
         return 2
 
-    total_jobs = len(jobs)
+    total_jobs_before_resume = len(jobs)
     existing_frame_keys = _load_existing_frame_keys(out_csv)
     existing_frames_by_video = _build_existing_frames_by_video(existing_frame_keys)
     if existing_frame_keys:
         print(
             f"[RESUME] existing frame rows: {len(existing_frame_keys)} | "
-            f"jobs to scan: {total_jobs}"
+            f"jobs to scan: {total_jobs_before_resume}"
         )
+    resume_packet_skipped = 0
+    if bool(args.resume_validate_packets) and existing_frames_by_video:
+        filtered_jobs: List[Tuple[str, str]] = []
+        for inpainted_path, splatted_path in jobs:
+            video_name = os.path.basename(inpainted_path)
+            done_frames = set(existing_frames_by_video.get(video_name, set()))
+            if not done_frames:
+                filtered_jobs.append((inpainted_path, splatted_path))
+                continue
+
+            resume_ref = str(inpainted_path)
+            if bool(args.use_replace_mask):
+                candidate = find_replace_mask_for_splatted(
+                    splatted_path, args.replace_mask_folder or ""
+                )
+                if candidate and os.path.exists(candidate):
+                    resume_ref = str(candidate)
+                else:
+                    filtered_jobs.append((inpainted_path, splatted_path))
+                    continue
+
+            expected_packets = _probe_packet_count(resume_ref)
+            if expected_packets is None:
+                filtered_jobs.append((inpainted_path, splatted_path))
+                continue
+
+            if _is_complete_by_packets(done_frames, expected_packets):
+                resume_packet_skipped += 1
+                print(
+                    f"[RESUME-PACKET-SKIP] {video_name} rows={len(done_frames)} packets={expected_packets}"
+                )
+                continue
+
+            filtered_jobs.append((inpainted_path, splatted_path))
+        jobs = filtered_jobs
+        if resume_packet_skipped > 0:
+            print(
+                f"[RESUME-PACKET] already-complete scenes skipped: {resume_packet_skipped}"
+            )
+
+    if not jobs:
+        print("[OK] all matching jobs are already complete (packet-aware resume).")
+        progress.final_report()
+        print(f"[OK] updated CSV: {out_csv}")
+        print(f"[OK] existing frame rows before run: {len(existing_frame_keys)}")
+        print("[OK] newly written frame rows this run: 0")
+        print("[OK] duplicate frame rows skipped this run: 0")
+        print(f"[OK] total unique frame rows in CSV: {len(existing_frame_keys)}")
+        return 0
 
     csv_exists = os.path.exists(out_csv)
     write_header = (not csv_exists) or (os.path.getsize(out_csv) == 0)

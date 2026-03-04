@@ -1,64 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --------------------------------------------
-# User-editable parameters (PATHS ONLY)
-# --------------------------------------------
-
 PYTHON="${PYTHON:-python3}"
+RUNNER="${RUNNER:-merging_nogui_batch_parallel.py}"
 
-# Headless merging runner (the CT version also includes replace-mask streaming)
-RUNNER="merging_nogui_batch_parallel.py"
+INPAINTED_FOLDER="${INPAINTED_FOLDER:-./work/output/}"
+SPLATTED_FOLDER="${SPLATTED_FOLDER:-./work/splat/hires/}"
+ORIGINAL_FOLDER="${ORIGINAL_FOLDER:-./work/seg/}"
+OUTPUT_FOLDER="${OUTPUT_FOLDER:-./work/sbs/}"
+REPLACE_MASK_FOLDER="${REPLACE_MASK_FOLDER:-./work/mask/}"
 
-# Folder containing the inpainted outputs (e.g. *_inpainted_right_eye.mp4 or *_inpainted_sbs.mp4)
-INPAINTED_FOLDER="./work/output/"
+CT_PRESET="${CT_PRESET:-1}"
+CT_AUTO_MODE="${CT_AUTO_MODE:-CSV Blend}"
+CT_CSV_BLEND_PATH="${CT_CSV_BLEND_PATH:-./autoct.csv}"
+ENABLE_COLOR_TRANSFER="${ENABLE_COLOR_TRANSFER:-1}"
+ADD_BORDERS="${ADD_BORDERS:-0}"
+PAD_TO_16_9="${PAD_TO_16_9:-0}"
+MERGE_DEBUG="${MERGE_DEBUG:-0}"
+PREPROCESSED_MASK_FOLDER="${PREPROCESSED_MASK_FOLDER:-./work/mask_for_merge/}"
+OUTPUT_FORMAT="${OUTPUT_FORMAT:-Full SBS (Left-Right)}"
+CHUNK_SIZE="${CHUNK_SIZE:-20}"
+READER_RELOAD_EVERY_CHUNKS="${READER_RELOAD_EVERY_CHUNKS:-1}"
+USE_GPU="${USE_GPU:-0}"
+CT_STRENGTH="${CT_STRENGTH:-1}"
+CT_BLACK_THRESH="${CT_BLACK_THRESH:-0}"
+CT_MIN_VALID_RATIO="${CT_MIN_VALID_RATIO:-0}"
+CT_MIN_VALID="${CT_MIN_VALID:-0}"
+CT_RING_WIDTH="${CT_RING_WIDTH:-20}"
+CT_CLAMP_L_MIN="${CT_CLAMP_L_MIN:-0.1}"
+CT_CLAMP_L_MAX="${CT_CLAMP_L_MAX:-2}"
+CT_CLAMP_AB_MIN="${CT_CLAMP_AB_MIN:-0.1}"
+CT_CLAMP_AB_MAX="${CT_CLAMP_AB_MAX:-3}"
+CT_EXCLUDE_BLACK_IN_TARGET="${CT_EXCLUDE_BLACK_IN_TARGET:-1}"
+FFMPEG_CODEC="${FFMPEG_CODEC:-}"
+FFMPEG_CRF="${FFMPEG_CRF:-}"
+FFMPEG_PRESET="${FFMPEG_PRESET:-}"
+FFMPEG_PIX_FMT="${FFMPEG_PIX_FMT:-}"
+FFMPEG_EXTRA_ARGS="${FFMPEG_EXTRA_ARGS:-}"
 
-# Folder containing splatted inputs (e.g. *_splatted2.mp4 / *_splatted4.mp4)
-SPLATTED_FOLDER="./work/splat/hires/"
-
-# Folder containing original/source clips (used for the left eye in QUAD or for ref)
-ORIGINAL_FOLDER="./work/seg/"
-
-# Output folder for merged results
-OUTPUT_FOLDER="./work/sbs/"
-
-# Folder containing replace-mask videos (e.g. *_splatted2_replace_mask.mkv)
-# Leave empty to let the runner search next to each splatted file.
-REPLACE_MASK_FOLDER="./work/mask/fixed/"
-
-# Behavior toggles (non-path)
-CT_PRESET="${CT_PRESET:-1}"               # 1..8 or full preset label
-CT_AUTO_MODE="${CT_AUTO_MODE:-On}"        # Off | On | CSV Blend
-CT_CSV_BLEND_PATH="./autoct.csv"
-ENABLE_COLOR_TRANSFER="${ENABLE_COLOR_TRANSFER:-1}"  # 1=on,0=off
-ADD_BORDERS="${ADD_BORDERS:-0}"           # 1=apply sidecar borders, 0=disable
-MERGE_DEBUG="${MERGE_DEBUG:-0}"           # 1=enable Python debug mode/logging
-
-# ---------------------------------
-# Crash/kill retry policy (process)
-# ---------------------------------
-MAX_RETRIES="${MAX_RETRIES:-100}"       # total attempts for the whole run (python process)
+MAX_RETRIES="${MAX_RETRIES:-100}"
 RETRY_SLEEP_SEC="${RETRY_SLEEP_SEC:-2}"
-
-# Exit codes commonly seen when the process dies outside Python:
-# 137 = killed (SIGKILL, often OOM)
-# 139 = segfault
-# 132 = illegal instruction
-# 134 = abort
-RETRY_CODES_DEFAULT="133 135 136 137 139 132 134"
+RETRY_CODES_DEFAULT="132 133 135 136 137 139 132 134"
 RETRY_CODES="${RETRY_CODES:-$RETRY_CODES_DEFAULT}"
 
-# Number of parallel worker processes (each handles a deterministic slice of files)
 WORKERS="${WORKERS:-2}"
 STOP_MARKER="${STOP_MARKER:-$OUTPUT_FOLDER/.stop_after_current}"
 STOP_REQUEST_FILE="${TMPDIR:-/tmp}/merge_stop_request_${$}.flag"
 INTERRUPT_COUNT=0
 STOP_REQUESTED=0
 FORCE_STOP=0
-
-# ------------------------------------------------
-# Build command (keep the rest hardcoded in runner)
-# ------------------------------------------------
+pids=()
+wids=()
 
 CMD=(
   "$PYTHON" "$RUNNER"
@@ -67,14 +59,32 @@ CMD=(
   --original-folder "$ORIGINAL_FOLDER"
   --output-folder "$OUTPUT_FOLDER"
   --stop-marker "$STOP_MARKER"
+  --output-format "$OUTPUT_FORMAT"
+  --chunk-size "$CHUNK_SIZE"
+  --reader-reload-every-chunks "$READER_RELOAD_EVERY_CHUNKS"
   --ct-preset "$CT_PRESET"
   --ct-auto-mode "$CT_AUTO_MODE"
+  --ct-strength "$CT_STRENGTH"
+  --ct-black-thresh "$CT_BLACK_THRESH"
+  --ct-min-valid-ratio "$CT_MIN_VALID_RATIO"
+  --ct-min-valid "$CT_MIN_VALID"
+  --ct-clamp-L-min "$CT_CLAMP_L_MIN"
+  --ct-clamp-L-max "$CT_CLAMP_L_MAX"
+  --ct-clamp-ab-min "$CT_CLAMP_AB_MIN"
+  --ct-clamp-ab-max "$CT_CLAMP_AB_MAX"
+  --ct-ring-width "$CT_RING_WIDTH"
 )
 
-# Replace-mask is optional; enable only if a non-empty folder is provided
-if [ -n "${REPLACE_MASK_FOLDER// }" ]; then
-  CMD+=(--use-replace-mask --replace-mask-folder "$REPLACE_MASK_FOLDER")
+if [ -z "${REPLACE_MASK_FOLDER// }" ] || [ ! -d "$REPLACE_MASK_FOLDER" ]; then
+  echo "[ERR ] replace-mask folder missing: ${REPLACE_MASK_FOLDER:-<empty>}"
+  exit 2
 fi
+if [ -z "${PREPROCESSED_MASK_FOLDER// }" ] || [ ! -d "$PREPROCESSED_MASK_FOLDER" ]; then
+  echo "[ERR ] preprocessed mask_for_merge folder missing: ${PREPROCESSED_MASK_FOLDER:-<empty>}"
+  exit 2
+fi
+CMD+=(--replace-mask-folder "$REPLACE_MASK_FOLDER")
+CMD+=(--preprocessed-mask-folder "$PREPROCESSED_MASK_FOLDER")
 if [ "${CT_AUTO_MODE}" = "CSV Blend" ] && [ -n "${CT_CSV_BLEND_PATH// }" ]; then
   CMD+=(--ct-csv-blend-path "$CT_CSV_BLEND_PATH")
 fi
@@ -86,11 +96,41 @@ if [ "${ADD_BORDERS}" = "1" ]; then
 else
   CMD+=(--no-add-borders)
 fi
+if [ "${PAD_TO_16_9}" = "1" ]; then
+  CMD+=(--pad-to-16-9)
+else
+  CMD+=(--no-pad-to-16-9)
+fi
+if [ "${USE_GPU}" = "1" ]; then
+  CMD+=(--use-gpu)
+else
+  CMD+=(--no-use-gpu)
+fi
+if [ "${CT_EXCLUDE_BLACK_IN_TARGET}" = "1" ]; then
+  CMD+=(--ct-exclude-black-in-target)
+else
+  CMD+=(--no-ct-exclude-black-in-target)
+fi
+if [ -n "${FFMPEG_CODEC// }" ]; then
+  CMD+=(--ffmpeg-codec "$FFMPEG_CODEC")
+fi
+if [ -n "${FFMPEG_CRF// }" ]; then
+  CMD+=(--ffmpeg-crf "$FFMPEG_CRF")
+fi
+if [ -n "${FFMPEG_PRESET// }" ]; then
+  CMD+=(--ffmpeg-preset "$FFMPEG_PRESET")
+fi
+if [ -n "${FFMPEG_PIX_FMT// }" ]; then
+  CMD+=(--ffmpeg-pix-fmt "$FFMPEG_PIX_FMT")
+fi
+if [ -n "${FFMPEG_EXTRA_ARGS// }" ]; then
+  CMD+=(--ffmpeg-extra-args "$FFMPEG_EXTRA_ARGS")
+fi
 
 export MERGE_DEBUG
 
 echo "[BASE CMD] ${CMD[*]}"
-echo "[PAR] WORKERS=$WORKERS  (override with WORKERS=N env var)"
+echo "[PAR] WORKERS=$WORKERS"
 echo "[DBG] MERGE_DEBUG=$MERGE_DEBUG"
 
 cleanup_runtime() {
@@ -149,10 +189,7 @@ run_worker_once() {
     return 0
   fi
   local cmdw=("${CMD[@]}" --num-workers "$WORKERS" --worker-id "$wid")
-
   echo "[CMD w$wid] ${cmdw[*]}"
-
-  # Worker inherits ignored INT/TERM from run_worker_with_retries trap.
   if [ -z "${DISPLAY:-}" ] && command -v xvfb-run >/dev/null 2>&1; then
     xvfb-run -a "${cmdw[@]}"
   else
@@ -173,7 +210,6 @@ should_retry() {
 run_worker_with_retries() {
   local wid="$1"
   local attempt=1
-  # Parent handles Ctrl+C and writes stop marker; workers must not handle TTY INT directly.
   trap '' INT TERM
   while true; do
     if [ -f "$STOP_REQUEST_FILE" ]; then
@@ -191,17 +227,14 @@ run_worker_with_retries() {
       echo "[OK  w$wid] success"
       return 0
     fi
-
     if [ -f "$STOP_REQUEST_FILE" ]; then
       echo "[STOP w$wid] graceful stop completed (last rc=$code)"
       return 0
     fi
-
     if [ "$code" -eq 130 ]; then
       echo "[STOP w$wid] interrupted by user"
       return 130
     fi
-
     if [ "$attempt" -ge "$MAX_RETRIES" ] || ! should_retry "$code"; then
       echo "[FAIL w$wid] exit_code=$code (no more retries)"
       return "$code"
@@ -255,7 +288,6 @@ trap cleanup_runtime EXIT
 
 for ((wid=0; wid<WORKERS; wid++)); do
   wids+=("$wid")
-  # Per-worker logs (optional). Comment out if you don't want them.
   run_worker_with_retries "$wid" > "merge_worker_${wid}.log" 2>&1 &
   pids+=("$!")
   echo "[START] worker $wid pid=${pids[-1]} log=merge_worker_${wid}.log"

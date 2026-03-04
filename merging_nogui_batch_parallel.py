@@ -108,6 +108,7 @@ def _clear_stop_marker(path: str) -> None:
 
 DEFAULTS: Dict[str, object] = {
     # Performance
+    "use_gpu": True,
     "device": "cuda",                 # "cuda" or "cpu" (for the torch ops only)
     "use_gpu_mask_ops": True,         # applies to dilate/blur/shadow (cuda if available)
 
@@ -136,26 +137,24 @@ DEFAULTS: Dict[str, object] = {
     "ct_clamp_ab_max": 3,
     "ct_exclude_black_in_target": True,
     "ct_ring_width": 20,
-    "mask_binarize_threshold": -0.01,   # used for stats-mask and optional binarize step if you add it later
+    "mask_binarize_threshold": -0.01,   # used for CT stats mask
 
     # Replace mask
     "use_replace_mask": True,
-
-    # Mask post-processing
-    "mask_dilate_kernel_size": 2,
-    "mask_blur_kernel_size": 4,
-
-    # Shadow (soft edge) post-processing
-    "shadow_length_px": 30,
-    "shadow_width_adaptive": True,
-    "shadow_curve": 0.0,
-    "shadow_motion_gain": 1.0,
+    "use_preprocessed_mask": True,
+    "preprocessed_mask_folder": "",
 
     # Robustness / workflow
     "retries": 1,
     "move_finished": False,
     "move_failed": False,
     "cleanup_partial_outputs": True,
+    # FFmpeg output overrides (empty = keep auto behavior)
+    "ffmpeg_codec": "",
+    "ffmpeg_crf": None,
+    "ffmpeg_preset": "",
+    "ffmpeg_pix_fmt": "",
+    "ffmpeg_extra_args": "",
 }
 
 OUTPUT_FORMAT_CHOICES = [
@@ -163,7 +162,6 @@ OUTPUT_FORMAT_CHOICES = [
     "Full SBS Cross-eye (Right-Left)",
     "Half SBS (Left-Right)",
     "Double SBS",
-    "Right-Eye Only",
     "Anaglyph (Red/Cyan)",
     "Anaglyph Half-Color",
 ]
@@ -1210,6 +1208,7 @@ def apply_shadow_blur(
     base_length_px: int,
     curve: float,
     motion_gain: float,
+    motion_deadzone_px: float = 4.0,
     width_adaptive: bool = True,
     use_gpu: bool = True,
     state: Optional[Dict[str, Any]] = None,
@@ -1228,7 +1227,7 @@ def apply_shadow_blur(
     width_ref_px = float(max(1.0, width_ref_px))
     width_power = float(max(0.1, width_power))
     border_tol = max(1, int(border_tolerance_px))
-    motion_deadzone_px = 3.0  # Ignore micro-jitter up to this displacement.
+    motion_deadzone_px = float(max(0.0, motion_deadzone_px))  # Ignore micro-jitter up to this displacement.
     motion_ref_px = 6.0  # Additional px/frame (beyond deadzone) for full motion gain.
 
     alpha_up = 0.45
@@ -1304,9 +1303,8 @@ def apply_shadow_blur(
                         sum(
                             mw
                             * float(
-                                np.hypot(
-                                    cx - float(m["centroid"][0]),
-                                    cy - float(m["centroid"][1]),
+                                abs(
+                                    cx - float(m["centroid"][0])
                                 )
                             )
                             for mw, m in matches
@@ -1708,10 +1706,21 @@ def parse_core_and_width(core_with_width: str) -> Tuple[str, Optional[int]]:
     return m.group(1), int(m.group(2))
 
 
+def infer_splatted_layout(splatted_path: str) -> str:
+    """Return one of: single (_splatted1), dual (_splatted2), quad (_splatted4/default)."""
+    base = os.path.basename(splatted_path)
+    if "_splatted1" in base:
+        return "single"
+    if "_splatted2" in base:
+        return "dual"
+    return "quad"
+
+
 def find_replace_mask_for_splatted(splatted_path: str, replace_mask_folder: str) -> Optional[str]:
     """
     Tries to locate a binary replace-mask video matching splatted path.
     Common patterns:
+      - source-Scene-xxxx_1920_splatted1.mp4  -> source-Scene-xxxx_1920_splatted1_replace_mask.mkv/mp4
       - source-Scene-xxxx_1920_splatted2.mp4  -> source-Scene-xxxx_1920_splatted2_replace_mask.mkv/mp4
       - source-Scene-xxxx_1920_splatted4.mp4  -> source-Scene-xxxx_1920_splatted4_replace_mask.mkv/mp4
     """
@@ -1733,6 +1742,17 @@ def find_replace_mask_for_splatted(splatted_path: str, replace_mask_folder: str)
             hits.sort()
             return hits[0]
     return None
+
+
+def find_preprocessed_mask_for_splatted(
+    splatted_path: str, preprocessed_mask_folder: str
+) -> Optional[str]:
+    """
+    Resolve a preprocessed merge-mask file matching the splatted clip.
+    Naming convention follows replace-mask stem:
+      source-Scene-xxxx_1920_splatted2.* -> source-Scene-xxxx_1920_splatted2_replace_mask.*
+    """
+    return find_replace_mask_for_splatted(splatted_path, preprocessed_mask_folder)
 
 
 @dataclass
@@ -1778,9 +1798,8 @@ def build_output_path(
     elif output_format in ["Anaglyph (Red/Cyan)", "Anaglyph Half-Color"]:
         output_width = hires_w
         suffix = "_merged_anaglyph.mp4"
-    else:  # Right-Eye Only
-        output_width = hires_w
-        suffix = "_merged_right_eye.mp4"
+    else:
+        raise ValueError(f"Unsupported output format: {output_format}")
 
     output_filename = f"{core_name}_{perceived_width_for_filename}{suffix}"
     return os.path.join(output_folder, output_filename), output_width, output_height
@@ -1801,7 +1820,7 @@ def output_suffix_and_width_factor(output_format: str) -> Tuple[str, int]:
         return "_merged_half_sbs.mp4", 1
     if output_format in ["Anaglyph (Red/Cyan)", "Anaglyph Half-Color"]:
         return "_merged_anaglyph.mp4", 1
-    return "_merged_right_eye.mp4", 1
+    raise ValueError(f"Unsupported output format: {output_format}")
 
 
 def assemble_output_chunk(
@@ -1835,8 +1854,7 @@ def assemble_output_chunk(
             + original_left[:, 2, :, :] * 0.114
         ).unsqueeze(1)
         return torch.cat([left_gray, blended_right_eye[:, 1:3, :, :]], dim=1)
-    # Right eye only
-    return blended_right_eye
+    raise ValueError(f"Unsupported output format: {output_format}")
 
 
 def write_chunk_to_ffmpeg(ffmpeg_process, chunk: torch.Tensor) -> None:
@@ -1920,11 +1938,13 @@ def collect_jobs(
     for inpainted_path in inpainted_files:
         base = os.path.basename(inpainted_path)
         core_with_width, _is_sbs = parse_inpainted_name(base)
-        # Try to locate splatted in splatted_folder: match by core_with_width prefix
-        # Prefer splatted2, then splatted4
+        # Try to locate splatted in splatted_folder: match by core_with_width prefix.
+        # Prefer single, then dual, then quad.
         candidates = [
+            os.path.join(splatted_folder, f"{core_with_width}_splatted1.mp4"),
             os.path.join(splatted_folder, f"{core_with_width}_splatted2.mp4"),
             os.path.join(splatted_folder, f"{core_with_width}_splatted4.mp4"),
+            os.path.join(splatted_folder, f"{core_with_width}_splatted1.mkv"),
             os.path.join(splatted_folder, f"{core_with_width}_splatted2.mkv"),
             os.path.join(splatted_folder, f"{core_with_width}_splatted4.mkv"),
             os.path.join(splatted_folder, f"{core_with_width}_splatted*.mp4"),
@@ -1962,22 +1982,23 @@ def process_one_job(
     core_name, width_from_name = parse_core_and_width(core_with_width)
 
     # Determine input type from splatted filename and probe original availability early.
-    is_dual_input = "_splatted2" in os.path.basename(splatted_video_path)
+    splatted_layout = infer_splatted_layout(splatted_video_path)
+    is_single_input = splatted_layout == "single"
+    is_dual_input = splatted_layout == "dual"
+    is_quad_input = splatted_layout == "quad"
     original_video_path_to_move: Optional[str] = None
-    original_missing_for_dual = False
-    if is_dual_input:
+    if is_single_input or is_dual_input:
         original_video_path_to_move = find_video_by_core_name(original_folder, core_name)
         if not (original_video_path_to_move and os.path.exists(original_video_path_to_move)):
-            original_missing_for_dual = True
+            raise RuntimeError(
+                f"Missing original video for {inpainted_base_name} (core={core_name}) in {original_folder}."
+            )
 
     # Decide effective output format early (needed for fast skip path).
     output_format = str(settings["output_format"])
     skip_existing = bool(settings.get("skip_existing", True))
     cleanup_partials = bool(settings.get("cleanup_partial_outputs", True))
     strict_existing_validate = bool(settings.get("strict_existing_validate", False))
-    if original_missing_for_dual and output_format != "Right-Eye Only":
-        LOG.warning(f"Original video is missing for '{inpainted_base_name}'. Forcing output format to 'Right-Eye Only'.")
-        output_format = "Right-Eye Only"
 
     # Fast path: if width is encoded in filename, compute output path without opening readers.
     precomputed_output_path: Optional[str] = None
@@ -2023,34 +2044,75 @@ def process_one_job(
     inpainted_reader = VideoReader(inpainted_video_path, ctx=cpu(0))
     splatted_reader = VideoReader(splatted_video_path, ctx=cpu(0))
 
-    # Optional replace-mask
+    # Strict prerequisites: replace-mask + preprocessed merge-mask are mandatory.
     replace_mask_reader = None
     replace_mask_path: Optional[str] = None
-    if bool(settings.get("use_replace_mask", False)):
-        replace_mask_path = find_replace_mask_for_splatted(
-            splatted_video_path, str(settings.get("replace_mask_folder", "") or "")
+    preprocessed_mask_reader = None
+    preprocessed_mask_path: Optional[str] = None
+    use_replace_mask = bool(settings.get("use_replace_mask", False))
+    use_preprocessed_mask = bool(settings.get("use_preprocessed_mask", False))
+    if not use_replace_mask:
+        raise RuntimeError(
+            f"Strict merge mode requires replace mask for {inpainted_base_name}."
         )
-        if replace_mask_path and os.path.exists(replace_mask_path):
-            try:
-                replace_mask_reader = VideoReader(replace_mask_path, ctx=cpu(0))
-                LOG.info(f"Using external replace mask: {os.path.basename(replace_mask_path)}")
-            except Exception as e_rm:
-                LOG.warning(f"Failed to open replace mask '{replace_mask_path}': {e_rm}")
-                replace_mask_reader = None
-                replace_mask_path = None
+    if not use_preprocessed_mask:
+        raise RuntimeError(
+            f"Strict merge mode requires preprocessed mask_for_merge for {inpainted_base_name}."
+        )
+    replace_mask_folder = str(settings.get("replace_mask_folder", "") or "").strip()
+    if not replace_mask_folder:
+        raise RuntimeError(
+            f"Replace-mask folder is required in strict merge mode for {inpainted_base_name}."
+        )
+    replace_mask_path = find_replace_mask_for_splatted(
+        splatted_video_path, replace_mask_folder
+    )
+    if not replace_mask_path or not os.path.exists(replace_mask_path):
+        raise RuntimeError(
+            f"Replace mask not found for {inpainted_base_name} in {replace_mask_folder}."
+        )
+    try:
+        replace_mask_reader = VideoReader(replace_mask_path, ctx=cpu(0))
+        LOG.info(f"Using external replace mask: {os.path.basename(replace_mask_path)}")
+    except Exception as e_rm:
+        raise RuntimeError(
+            f"Failed to open replace mask '{replace_mask_path}' for {inpainted_base_name}: {e_rm}"
+        ) from e_rm
+
+    preprocessed_folder = str(settings.get("preprocessed_mask_folder", "") or "").strip()
+    if not preprocessed_folder:
+        raise RuntimeError(
+            f"Preprocessed mask_for_merge folder is required for {inpainted_base_name}."
+        )
+    preprocessed_mask_path = find_preprocessed_mask_for_splatted(
+        splatted_video_path, preprocessed_folder
+    )
+    if not preprocessed_mask_path or not os.path.exists(preprocessed_mask_path):
+        raise RuntimeError(
+            f"Preprocessed mask_for_merge not found for {inpainted_base_name} in {preprocessed_folder}."
+        )
+    try:
+        preprocessed_mask_reader = VideoReader(preprocessed_mask_path, ctx=cpu(0))
+        LOG.info(
+            f"Using preprocessed merge mask: {os.path.basename(preprocessed_mask_path)}"
+        )
+    except Exception as e_pm:
+        raise RuntimeError(
+            f"Failed to open preprocessed merge mask '{preprocessed_mask_path}' "
+            f"for {inpainted_base_name}: {e_pm}"
+        ) from e_pm
 
     # Original reader:
     original_reader = None
     original_video_path: Optional[str] = original_video_path_to_move
-    if is_dual_input:
+    if is_single_input or is_dual_input:
         if original_video_path and os.path.exists(original_video_path):
-            LOG.info(f"Found matching original video for dual-input: {os.path.basename(original_video_path)}")
+            LOG.info(f"Found matching original video for {splatted_layout}-input: {os.path.basename(original_video_path)}")
             original_reader = VideoReader(original_video_path, ctx=cpu(0))
         else:
-            if not original_missing_for_dual:
-                LOG.warning(f"Original video not found for dual-input mode: '{core_name}.*'.")
-                LOG.warning("Will proceed, but only 'Right-Eye Only' output will be possible for this video.")
-            original_reader = None
+            raise RuntimeError(
+                f"Original video not found for {inpainted_base_name} (core={core_name}) in strict merge mode."
+            )
     else:
         # quad: splatted itself contains left eye
         original_reader = splatted_reader
@@ -2062,15 +2124,12 @@ def process_one_job(
 
     sample_splatted_np = splatted_reader.get_batch([0]).asnumpy()
     _, H_splat, W_splat, _ = sample_splatted_np.shape
-    if is_dual_input:
+    if is_single_input:
+        hires_H, hires_W = H_splat, W_splat
+    elif is_dual_input:
         hires_H, hires_W = H_splat, W_splat // 2
     else:
         hires_H, hires_W = H_splat // 2, W_splat // 2
-
-    # 3) Output format constraints (double-check with actual reader state)
-    if original_reader is None and output_format != "Right-Eye Only":
-        LOG.warning(f"Original video is missing for '{inpainted_base_name}'. Forcing output format to 'Right-Eye Only'.")
-        output_format = "Right-Eye Only"
 
     output_path, output_width, output_height = build_output_path(
         output_folder=output_folder,
@@ -2108,8 +2167,9 @@ def process_one_job(
 
     # 5) Chunk loop + ffmpeg finalize
     chunk_size = int(settings.get("batch_chunk_size", 32))
-    device = torch.device(str(settings.get("device", "cuda")) if torch.cuda.is_available() else "cpu")
-    use_gpu_mask_ops = bool(settings.get("use_gpu_mask_ops", True)) and torch.cuda.is_available()
+    use_gpu = bool(settings.get("use_gpu", True)) and torch.cuda.is_available()
+    device = torch.device("cuda" if use_gpu else "cpu")
+    use_gpu_mask_ops = bool(settings.get("use_gpu_mask_ops", use_gpu)) and use_gpu
     ct_usage_counts = {int(p["id"]): 0.0 for p in CT_PRESETS}
     selected_ct_label = _resolve_ct_preset_label(
         str(settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL))
@@ -2129,6 +2189,16 @@ def process_one_job(
     encode_ok = False
 
     try:
+        ffmpeg_crf_raw = settings.get("ffmpeg_crf", None)
+        ffmpeg_crf: Optional[int]
+        try:
+            ffmpeg_crf = int(ffmpeg_crf_raw) if ffmpeg_crf_raw is not None else None
+        except Exception:
+            ffmpeg_crf = None
+        ffmpeg_codec = str(settings.get("ffmpeg_codec", "") or "").strip() or None
+        ffmpeg_preset = str(settings.get("ffmpeg_preset", "") or "").strip() or None
+        ffmpeg_pix_fmt = str(settings.get("ffmpeg_pix_fmt", "") or "").strip() or None
+        ffmpeg_extra_args = str(settings.get("ffmpeg_extra_args", "") or "").strip() or None
         ffmpeg_process = start_ffmpeg_pipe_process(
             content_width=output_width,
             content_height=output_height,
@@ -2137,6 +2207,11 @@ def process_one_job(
             video_stream_info=video_stream_info,
             pad_to_16_9=bool(settings.get("pad_to_16_9", False)),
             output_format_str=output_format,
+            user_output_crf=ffmpeg_crf,
+            force_output_codec=ffmpeg_codec,
+            force_output_pix_fmt=ffmpeg_pix_fmt,
+            force_output_preset=ffmpeg_preset,
+            ffmpeg_extra_output_args=ffmpeg_extra_args,
         )
         if ffmpeg_process is None:
             raise RuntimeError("Failed to start FFmpeg pipe process.")
@@ -2203,8 +2278,29 @@ def process_one_job(
                 try:
                     replace_mask_np = replace_mask_reader.get_batch(frame_indices).asnumpy()
                 except Exception as e_rmread:
-                    LOG.warning(f"Replace mask read failed for {inpainted_base_name} frames {frame_start}-{frame_end}: {e_rmread}")
-                    replace_mask_np = None
+                    raise RuntimeError(
+                        f"Replace mask read failed for {inpainted_base_name} "
+                        f"frames {frame_start}-{frame_end}: {e_rmread}"
+                    ) from e_rmread
+            if replace_mask_np is None:
+                raise RuntimeError(
+                    f"Replace mask missing on chunk {frame_start}-{frame_end} for {inpainted_base_name}."
+                )
+
+            preprocessed_mask_np = None
+            if preprocessed_mask_reader is not None:
+                try:
+                    preprocessed_mask_np = preprocessed_mask_reader.get_batch(frame_indices).asnumpy()
+                except Exception as e_pmread:
+                    raise RuntimeError(
+                        f"Preprocessed merge mask read failed for {inpainted_base_name} "
+                        f"frames {frame_start}-{frame_end}: {e_pmread}"
+                    ) from e_pmread
+            if preprocessed_mask_np is None:
+                raise RuntimeError(
+                    f"Preprocessed merge mask missing on chunk {frame_start}-{frame_end} "
+                    f"for {inpainted_base_name}."
+                )
 
             # tensors
             inpainted_tensor_full = torch.from_numpy(inpainted_np).permute(0, 3, 1, 2).float() / 255.0
@@ -2218,7 +2314,15 @@ def process_one_job(
 
             _, _, H, W = splatted_tensor.shape
 
-            if is_dual_input:
+            if is_single_input:
+                if original_reader is None:
+                    original_left = torch.zeros_like(inpainted)
+                else:
+                    original_np = original_reader.get_batch(frame_indices).asnumpy()
+                    original_left = torch.from_numpy(original_np).permute(0, 3, 1, 2).float() / 255.0
+                warped_original = splatted_tensor
+                mask_raw = torch.zeros_like(warped_original)
+            elif is_dual_input:
                 if original_reader is None:
                     original_left = torch.zeros_like(inpainted)
                 else:
@@ -2234,7 +2338,7 @@ def process_one_job(
                 warped_original = splatted_tensor[:, :, H // 2 :, W // 2 :]
 
             # Use external replace mask if enabled
-            if replace_mask_np is not None and bool(settings.get("use_replace_mask", False)):
+            if replace_mask_np is not None and use_replace_mask:
                 # GUI-aligned replace-mask conversion: use grayscale from RGB (not channel-0 only).
                 if replace_mask_np.ndim == 4 and replace_mask_np.shape[3] >= 1:
                     rm_gray = replace_mask_np[..., :3].mean(axis=3)  # T,H,W
@@ -2259,27 +2363,22 @@ def process_one_job(
             else:
                 mask_bin_clean = (mask_clean > 0.5).float()
 
-            # Processed mask is used only for final blending.
-            processed_mask = mask_bin_clean.clone()
-            # Post-process mask
-            if int(settings.get("mask_dilate_kernel_size", 0)) > 0:
-                processed_mask = apply_mask_dilation(processed_mask, int(settings["mask_dilate_kernel_size"]), use_gpu_mask_ops)
-            if int(settings.get("mask_blur_kernel_size", 0)) > 0:
-                processed_mask = apply_gaussian_blur(processed_mask, int(settings["mask_blur_kernel_size"]), use_gpu_mask_ops)
-
-            if int(settings.get("shadow_length_px", 0)) > 0:
-                processed_mask = apply_shadow_blur(
-                    processed_mask,
-                    base_length_px=int(settings.get("shadow_length_px", 0)),
-                    curve=float(settings.get("shadow_curve", 0.0)),
-                    motion_gain=float(settings.get("shadow_motion_gain", 0.0)),
-                    width_adaptive=bool(settings.get("shadow_width_adaptive", True)),
-                    use_gpu=use_gpu_mask_ops,
-                    state=shadow_state,
-                    border_tolerance_px=2,
-                    width_ref_px=20.0,
-                    width_power=1.0,
+            # Processed mask for final blending always comes from preprocessed mask_for_merge.
+            if preprocessed_mask_np.ndim == 4 and preprocessed_mask_np.shape[3] >= 1:
+                pm_gray = preprocessed_mask_np[..., :3].mean(axis=3)
+            elif preprocessed_mask_np.ndim == 3:
+                pm_gray = preprocessed_mask_np
+            else:
+                pm_gray = np.squeeze(preprocessed_mask_np)
+            pm_gray = pm_gray.astype(np.float32)
+            if pm_gray.size > 0 and float(np.nanmax(pm_gray)) > 1.5:
+                pm_gray = pm_gray / 255.0
+            processed_mask = torch.from_numpy(pm_gray).float().unsqueeze(1).to(device)
+            if processed_mask.shape[2:] != mask_bin_clean.shape[2:]:
+                processed_mask = F.interpolate(
+                    processed_mask, size=mask_bin_clean.shape[2:], mode="nearest"
                 )
+            processed_mask = torch.clamp(processed_mask, 0.0, 1.0)
 
             warped_original = warped_original.to(device)
             inpainted = inpainted.to(device)
@@ -2291,7 +2390,7 @@ def process_one_job(
                 adjusted_frames: List[torch.Tensor] = []
                 ct_eval_executor = (
                     ThreadPoolExecutor(max_workers=CT_AUTO_EVAL_MAX_WORKERS)
-                    if ct_auto_mode == CT_AUTO_MODE_ON
+                    if ct_auto_mode in (CT_AUTO_MODE_ON, CT_AUTO_MODE_CSV_BLEND)
                     else None
                 )
                 try:
@@ -2324,9 +2423,7 @@ def process_one_job(
                                 if not blend_weights:
                                     fallback_selected_id = int(selected_ct_preset["id"])
                                     blend_weights = {fallback_selected_id: 1.0}
-                                stats_valid_cache: Dict[str, torch.Tensor] = {}
-                                warped_ref_cache: Dict[str, torch.Tensor] = {}
-                                blended_3: Optional[torch.Tensor] = None
+                                active_blend_entries: List[Tuple[int, float]] = []
                                 for pid_i, weight_i in sorted(
                                     blend_weights.items(), key=lambda kv: kv[1], reverse=True
                                 ):
@@ -2334,22 +2431,64 @@ def process_one_job(
                                     w = float(max(0.0, min(1.0, float(weight_i))))
                                     if w <= 0.0:
                                         continue
-                                    preset_i = CT_PRESET_BY_ID.get(pid, selected_ct_preset)
-                                    adjusted_3 = _apply_ct_preset_frame(
-                                        preset=preset_i,
-                                        inpainted_3=inpainted_3,
-                                        original_left_3=original_left_3,
-                                        warped_3=warped_3,
-                                        mask_bin_1hw=mask_bin_1hw,
-                                        settings=settings,
-                                        stats_valid_cache=stats_valid_cache,
-                                        warped_ref_cache=warped_ref_cache,
-                                    )
-                                    if blended_3 is None:
-                                        blended_3 = adjusted_3 * w
-                                    else:
-                                        blended_3 = blended_3 + (adjusted_3 * w)
-                                    ct_usage_counts[pid] += w
+                                    active_blend_entries.append((pid, w))
+
+                                blended_3: Optional[torch.Tensor] = None
+                                if len(active_blend_entries) > 1 and ct_eval_executor is not None:
+                                    def _eval_csv_blend_preset(pid: int) -> Tuple[int, torch.Tensor]:
+                                        preset_i = CT_PRESET_BY_ID.get(pid, selected_ct_preset)
+                                        stats_valid_cache_local: Dict[str, torch.Tensor] = {}
+                                        warped_ref_cache_local: Dict[str, torch.Tensor] = {}
+                                        adjusted_3_local = _apply_ct_preset_frame(
+                                            preset=preset_i,
+                                            inpainted_3=inpainted_3,
+                                            original_left_3=original_left_3,
+                                            warped_3=warped_3,
+                                            mask_bin_1hw=mask_bin_1hw,
+                                            settings=settings,
+                                            stats_valid_cache=stats_valid_cache_local,
+                                            warped_ref_cache=warped_ref_cache_local,
+                                        )
+                                        return int(pid), adjusted_3_local
+
+                                    futures = [
+                                        ct_eval_executor.submit(_eval_csv_blend_preset, pid)
+                                        for pid, _w in active_blend_entries
+                                    ]
+                                    adjusted_by_pid: Dict[int, torch.Tensor] = {}
+                                    for fut in futures:
+                                        pid_done, adjusted_done = fut.result()
+                                        adjusted_by_pid[int(pid_done)] = adjusted_done
+
+                                    for pid, w in active_blend_entries:
+                                        adjusted_3 = adjusted_by_pid.get(pid)
+                                        if adjusted_3 is None:
+                                            continue
+                                        if blended_3 is None:
+                                            blended_3 = adjusted_3 * w
+                                        else:
+                                            blended_3 = blended_3 + (adjusted_3 * w)
+                                        ct_usage_counts[pid] += w
+                                else:
+                                    stats_valid_cache: Dict[str, torch.Tensor] = {}
+                                    warped_ref_cache: Dict[str, torch.Tensor] = {}
+                                    for pid, w in active_blend_entries:
+                                        preset_i = CT_PRESET_BY_ID.get(pid, selected_ct_preset)
+                                        adjusted_3 = _apply_ct_preset_frame(
+                                            preset=preset_i,
+                                            inpainted_3=inpainted_3,
+                                            original_left_3=original_left_3,
+                                            warped_3=warped_3,
+                                            mask_bin_1hw=mask_bin_1hw,
+                                            settings=settings,
+                                            stats_valid_cache=stats_valid_cache,
+                                            warped_ref_cache=warped_ref_cache,
+                                        )
+                                        if blended_3 is None:
+                                            blended_3 = adjusted_3 * w
+                                        else:
+                                            blended_3 = blended_3 + (adjusted_3 * w)
+                                        ct_usage_counts[pid] += w
                                 if blended_3 is None:
                                     fallback_selected_id = int(selected_ct_preset["id"])
                                     fallback_preset = CT_PRESET_BY_ID[fallback_selected_id]
@@ -2410,6 +2549,8 @@ def process_one_job(
             del inpainted_tensor_full, splatted_tensor, inpainted, mask_raw, warped_original, processed_mask, blended_right_eye, final_chunk
             if replace_mask_np is not None:
                 del replace_mask_np
+            if preprocessed_mask_np is not None:
+                del preprocessed_mask_np
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -2483,7 +2624,7 @@ def process_one_job(
 
     # Cleanup reader refs
     try:
-        del inpainted_reader, splatted_reader, original_reader, replace_mask_reader
+        del inpainted_reader, splatted_reader, original_reader, replace_mask_reader, preprocessed_mask_reader
     except Exception:
         pass
     gc.collect()
@@ -2499,8 +2640,8 @@ def main() -> int:
         description="Headless parallel batch runner for merging_gui pipeline (streaming)."
     )
     ap.add_argument("--inpainted-folder", required=True, help="Folder containing *_inpainted_right_eye.mp4 or *_inpainted_sbs.mp4")
-    ap.add_argument("--splatted-folder", required=True, help="Folder containing *_splatted2.mp4 / *_splatted4.mp4")
-    ap.add_argument("--original-folder", required=True, help="Folder containing original left-eye videos (dual-input case)")
+    ap.add_argument("--splatted-folder", required=True, help="Folder containing *_splatted1.mp4 / *_splatted2.mp4 / *_splatted4.mp4")
+    ap.add_argument("--original-folder", required=True, help="Folder containing original left-eye videos (single/dual-input case)")
     ap.add_argument("--output-folder", required=True, help="Output folder for merged files")
     ap.add_argument("--stop-marker", default="", help="Path to a marker file used for graceful stop-after-current-file behavior.")
     ap.add_argument("--only", default=None, help="Process only one file (basename or prefix match)")
@@ -2545,8 +2686,15 @@ def main() -> int:
     ap.add_argument("--no-ct-exclude-black-in-target", action="store_true", default=False)
     ap.add_argument("--ct-ring-width", type=int, default=None)
     ap.add_argument("--mask-binarize-threshold", type=float, default=None, help="Threshold for building binary stats mask; -1 disables")
-    ap.add_argument("--use-replace-mask", action="store_true", default=None)
-    ap.add_argument("--replace-mask-folder", default=None)
+    ap.add_argument("--use-gpu", action="store_true", default=None)
+    ap.add_argument("--no-use-gpu", action="store_true", default=False)
+    ap.add_argument("--ffmpeg-codec", default=None)
+    ap.add_argument("--ffmpeg-crf", type=int, default=None)
+    ap.add_argument("--ffmpeg-preset", default=None)
+    ap.add_argument("--ffmpeg-pix-fmt", default=None)
+    ap.add_argument("--ffmpeg-extra-args", default=None)
+    ap.add_argument("--replace-mask-folder", required=True)
+    ap.add_argument("--preprocessed-mask-folder", required=True)
     ap.add_argument("--move-finished", action="store_true", default=None)
     ap.add_argument("--move-failed", action="store_true", default=None)
     ap.add_argument("--no-cleanup-partials", action="store_true", default=False)
@@ -2617,14 +2765,30 @@ def main() -> int:
         settings["ct_ring_width"] = int(args.ct_ring_width)
     if args.mask_binarize_threshold is not None:
         settings["mask_binarize_threshold"] = float(args.mask_binarize_threshold)
+    if args.use_gpu is True:
+        settings["use_gpu"] = True
+        settings["use_gpu_mask_ops"] = True
+    if args.no_use_gpu is True:
+        settings["use_gpu"] = False
+        settings["use_gpu_mask_ops"] = False
+    if args.ffmpeg_codec is not None:
+        settings["ffmpeg_codec"] = str(args.ffmpeg_codec).strip()
+    if args.ffmpeg_crf is not None:
+        settings["ffmpeg_crf"] = int(args.ffmpeg_crf)
+    if args.ffmpeg_preset is not None:
+        settings["ffmpeg_preset"] = str(args.ffmpeg_preset).strip()
+    if args.ffmpeg_pix_fmt is not None:
+        settings["ffmpeg_pix_fmt"] = str(args.ffmpeg_pix_fmt).strip()
+    if args.ffmpeg_extra_args is not None:
+        settings["ffmpeg_extra_args"] = str(args.ffmpeg_extra_args).strip()
 
     settings["ct_preset"] = _parse_ct_preset_arg(str(settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL)))
     settings["ct_auto_mode"] = _resolve_ct_auto_mode_from_settings(settings)
 
-    if args.use_replace_mask is True:
-        settings["use_replace_mask"] = True
-    if args.replace_mask_folder is not None:
-        settings["replace_mask_folder"] = args.replace_mask_folder
+    settings["use_replace_mask"] = True
+    settings["use_preprocessed_mask"] = True
+    settings["replace_mask_folder"] = str(args.replace_mask_folder).strip()
+    settings["preprocessed_mask_folder"] = str(args.preprocessed_mask_folder).strip()
 
     if args.move_finished is True:
         settings["move_finished"] = True
@@ -2719,7 +2883,9 @@ def main() -> int:
                         inferred_output_path = infer_output_path_from_inpainted(
                             inpainted_video_path=inpainted_path,
                             output_folder=args.output_folder,
-                            output_format=str(settings.get("output_format", "Right-Eye Only")),
+                            output_format=str(
+                                settings.get("output_format", "Full SBS (Left-Right)")
+                            ),
                         )
                         if inferred_output_path:
                             cleanup_partial_output_files(inferred_output_path)
@@ -2734,7 +2900,9 @@ def main() -> int:
                         inferred_output_path = infer_output_path_from_inpainted(
                             inpainted_video_path=inpainted_path,
                             output_folder=args.output_folder,
-                            output_format=str(settings.get("output_format", "Right-Eye Only")),
+                            output_format=str(
+                                settings.get("output_format", "Full SBS (Left-Right)")
+                            ),
                         )
                         if inferred_output_path:
                             # Keep valid complete outputs, remove only stale temp/invalid leftovers.
@@ -2771,7 +2939,9 @@ def main() -> int:
                     inferred_output_path = infer_output_path_from_inpainted(
                         inpainted_video_path=inpainted_path,
                         output_folder=args.output_folder,
-                        output_format=str(settings.get("output_format", "Right-Eye Only")),
+                        output_format=str(
+                            settings.get("output_format", "Full SBS (Left-Right)")
+                        ),
                     )
                     if inferred_output_path:
                         cleanup_partial_output_files(inferred_output_path)
