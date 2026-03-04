@@ -524,8 +524,8 @@ def run_batch(args):
 
             # Determine expected output name like GUI would, to support skip.
             name_wo_ext = os.path.splitext(base)[0]
-            is_dual_input = name_wo_ext.endswith("_splatted2")
-            out_path, _hires = runner._setup_video_info_and_hires(video_path, args.output_dir, is_dual_input)
+            input_layout = runner._infer_input_layout_from_stem(name_wo_ext)
+            out_path, _hires = runner._setup_video_info_and_hires(video_path, args.output_dir, input_layout)
 
             if args.skip_existing and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                 # Fast skip (legacy behavior). Only the resume-boundary file is strictly validated.
@@ -622,6 +622,10 @@ def run_batch(args):
                 update_info_callback=None,
                 original_input_blend_strength=args.original_input_blend_strength,
                 output_crf=args.output_crf,
+                output_codec=args.output_codec,
+                output_preset=args.output_preset,
+                output_pix_fmt=args.output_pix_fmt,
+                output_extra_args=args.output_extra_args,
                 process_length=args.process_length,
             )
 
@@ -722,6 +726,10 @@ def main():
 
     p.add_argument("--offload_type", type=str, default="model", choices=["none", "model", "sequential"],
                    help="Matches GUI offload_type")
+    p.add_argument("--output_codec", type=str, default="", help="Optional ffmpeg output codec override")
+    p.add_argument("--output_preset", type=str, default="", help="Optional ffmpeg preset override")
+    p.add_argument("--output_pix_fmt", type=str, default="", help="Optional ffmpeg pixel format override")
+    p.add_argument("--output_extra_args", type=str, default="", help="Optional extra ffmpeg args")
 
     p.add_argument("--hires_blend_folder", type=str, default="", help="Optional hires folder (same as GUI)")
     p.add_argument("--use_replace_mask", action="store_true",

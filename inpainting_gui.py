@@ -18,6 +18,7 @@ import time
 import subprocess # NEW: For running ffprobe and ffmpeg
 import cv2 # NEW: For saving 16-bit PNGs
 import logging
+import shlex
 
 from dependency.stereocrafter_util import (
     Tooltip, logger, get_video_stream_info, draw_progress_bar,
@@ -33,9 +34,23 @@ from pipelines.stereo_video_inpainting import (
 GUI_VERSION = "26-01-13.0"
 
 # === STREAM ENCODING HELPERS ===
-def _start_ffmpeg_rawvideo_writer(output_path: str, width: int, height: int, fps: float, crf: int, preset: str = "veryfast") -> subprocess.Popen:
+def _start_ffmpeg_rawvideo_writer(
+    output_path: str,
+    width: int,
+    height: int,
+    fps: float,
+    crf: int,
+    codec: str = "libx264",
+    preset: str = "veryfast",
+    pix_fmt: str = "yuv420p",
+    extra_output_args: str = "",
+) -> subprocess.Popen:
     """Start ffmpeg process that reads raw RGB frames from stdin and encodes to H.264 MP4."""
     # Use rgb24 for simplicity; ffmpeg will convert to yuv420p for compatibility.
+    out_codec = (codec or "libx264").strip()
+    out_preset = (preset or "veryfast").strip()
+    out_pix_fmt = (pix_fmt or "yuv420p").strip()
+    quality_flag = "-cq" if "nvenc" in out_codec.lower() else "-crf"
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -43,12 +58,18 @@ def _start_ffmpeg_rawvideo_writer(output_path: str, width: int, height: int, fps
         "-r", f"{fps}",
         "-i", "pipe:0",
         "-an",
-        "-c:v", "libx264",
-        "-preset", preset,
-        "-crf", str(crf),
-        "-pix_fmt", "yuv420p",
-        output_path
+        "-c:v", out_codec,
+        "-preset", out_preset,
+        quality_flag, str(crf),
+        "-pix_fmt", out_pix_fmt,
     ]
+    extra = (extra_output_args or "").strip()
+    if extra:
+        try:
+            cmd.extend(shlex.split(extra))
+        except Exception as ex:
+            logger.warning(f"Invalid streaming ffmpeg extra args ignored: {ex}")
+    cmd.append(output_path)
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
 def _write_rgb_frame(p: subprocess.Popen, frame_rgb_u8: np.ndarray) -> None:
@@ -533,6 +554,25 @@ class InpaintingGUI(ThemedTk):
                 return hits[0]
         return None
 
+    def _infer_input_layout_from_stem(self, stem: str) -> str:
+        """Infer splatted layout from basename stem."""
+        if stem.endswith("_splatted1"):
+            return "single"
+        if stem.endswith("_splatted2"):
+            return "dual"
+        if stem.endswith("_splatted4"):
+            return "quad"
+        return "quad"
+
+    def _normalize_input_layout(self, input_layout: object) -> str:
+        """Back-compat: accept legacy bool (is_dual_input) or new string layout."""
+        if isinstance(input_layout, bool):
+            return "dual" if input_layout else "quad"
+        layout = str(input_layout or "").strip().lower()
+        if layout in {"single", "dual", "quad"}:
+            return layout
+        return "quad"
+
     def _replace_mask_numpy_to_gray(
         self,
         replace_mask_np: np.ndarray,
@@ -619,12 +659,16 @@ class InpaintingGUI(ThemedTk):
         original_left_frames: Optional[torch.Tensor],
         hires_data: dict,
         base_video_name: str,
-        is_dual_input: bool,
+        input_layout: object,
     ) -> Optional[torch.Tensor]:
         """
         Applies Hi-Res upscaling/blending (if enabled), Color Transfer, and final SBS concatenation.
         Returns the final tensor for encoding, or None on error.
         """
+        input_layout = self._normalize_input_layout(input_layout)
+        is_dual_input = input_layout == "dual"
+        is_quad_input = input_layout == "quad"
+
         frames_output_final = inpainted_frames
         frames_mask_processed = mask_frames
         frames_warpped_original_unpadded_normalized = original_warped_frames
@@ -668,11 +712,14 @@ class InpaintingGUI(ThemedTk):
                     half_w_hires = hires_frames_torch.shape[3] // 2
                     hires_warped_chunk = hires_frames_torch[:, :, :, half_w_hires:].float() / 255.0
                     hires_left_chunk = None
-                else: # Quad input
+                elif is_quad_input: # Quad input
                     half_h_hires, half_w_hires = hires_frames_torch.shape[2] // 2, hires_frames_torch.shape[3] // 2
                     hires_left_chunk = hires_frames_torch[:, :, :half_h_hires, :half_w_hires].float() / 255.0
                     hires_warped_chunk = hires_frames_torch[:, :, half_h_hires:, half_w_hires:].float() / 255.0
                     final_hires_left_chunks.append(hires_left_chunk)
+                else:  # Single warp input
+                    hires_warped_chunk = hires_frames_torch.float() / 255.0
+                    hires_left_chunk = None
 
                 # 5. Store processed chunks
                 final_hires_output_chunks.append({
@@ -686,7 +733,7 @@ class InpaintingGUI(ThemedTk):
             frames_mask_processed = torch.cat([d["mask"] for d in final_hires_output_chunks], dim=0)
             frames_warpped_original_unpadded_normalized = torch.cat([d["warped"] for d in final_hires_output_chunks], dim=0)
             
-            if not is_dual_input:
+            if is_quad_input:
                 frames_left_original_cropped = torch.cat(final_hires_left_chunks, dim=0)
             
             # Save a debug image of the first hi-res warped chunk
@@ -706,9 +753,9 @@ class InpaintingGUI(ThemedTk):
             # ... (Replace the large Color Transfer block in your code with its body using the simplified variable names) ...
             reference_frames_for_transfer: Optional[torch.Tensor] = None
 
-            if is_dual_input:
-                # DUAL Input: Create an occlusion-free reference from the warped frames (bottom-right)
-                logger.debug("Dual input detected. Creating occlusion-free reference via directional dilation for color transfer...")
+            if not is_quad_input:
+                # Dual/single input: create an occlusion-free reference from warped frames.
+                logger.debug("Non-quad input detected. Creating occlusion-free reference via directional dilation for color transfer...")
                 
                 warped_frames_base = frames_warpped_original_unpadded_normalized.cpu() 
                 processed_mask = frames_mask_processed.cpu() 
@@ -729,7 +776,7 @@ class InpaintingGUI(ThemedTk):
                         )
                     logger.debug(f"Saved debug color reference frames to {debug_output_dir}")
                 
-            else: 
+            else:
                 reference_frames_for_transfer = frames_left_original_cropped
                 
             # --- Perform the Color Transfer ---
@@ -770,8 +817,8 @@ class InpaintingGUI(ThemedTk):
         # --- Final Concatenation ---
         final_output_frames_for_encoding: Optional[torch.Tensor] = None
 
-        if is_dual_input:
-            # For dual input, the only valid output is the inpainted right eye.
+        if not is_quad_input:
+            # For dual/single input, the only valid output is the inpainted right eye.
             # There is no left-eye data in the source to create an SBS view.
             final_output_frames_for_encoding = frames_output_final
         else:
@@ -821,7 +868,10 @@ class InpaintingGUI(ThemedTk):
         low_res_name_without_ext = os.path.splitext(low_res_filename)[0]
         
         splatted_suffix = None
-        if low_res_name_without_ext.endswith('_splatted2'):
+        if low_res_name_without_ext.endswith('_splatted1'):
+            splatted_suffix = '_splatted1.mp4'
+            splatted_core = '_splatted1'
+        elif low_res_name_without_ext.endswith('_splatted2'):
             splatted_suffix = '_splatted2.mp4'
             splatted_core = '_splatted2'
         elif low_res_name_without_ext.endswith('_splatted4'):
@@ -1012,7 +1062,7 @@ class InpaintingGUI(ThemedTk):
         self,
         input_video_path: str,
         base_video_name: str,
-        is_dual_input: bool,
+        input_layout: object,
         tile_num: int,
         update_info_callback=None,
         overlap: int = 0,
@@ -1020,6 +1070,9 @@ class InpaintingGUI(ThemedTk):
         process_length: int = -1,
     ):
         """Open a decord VideoReader and compute stream meta WITHOUT loading all frames into RAM."""
+        input_layout = self._normalize_input_layout(input_layout)
+        is_dual_input = input_layout == "dual"
+        is_quad_input = input_layout == "quad"
         try:
             vr = VideoReader(input_video_path, ctx=cpu(0))
         except Exception as e:
@@ -1063,11 +1116,14 @@ class InpaintingGUI(ThemedTk):
             half_w = total_w_current // 2
             output_display_h = total_h_current
             output_display_w = half_w
-        else:
+        elif is_quad_input:
             half_h = total_h_current // 2
             half_w = total_w_current // 2
             output_display_h = half_h
             output_display_w = half_w
+        else:
+            output_display_h = total_h_current
+            output_display_w = total_w_current
 
         required_divisor = 8
         if output_display_h % required_divisor != 0 or output_display_w % required_divisor != 0:
@@ -1101,11 +1157,14 @@ class InpaintingGUI(ThemedTk):
         start_idx: int,
         end_idx: int,
         base_video_name: str,
-        is_dual_input: bool,
+        input_layout: object,
         tile_num: int,
         replace_mask_vr: Optional[VideoReader] = None,
     ):
         """Read [start_idx:end_idx) from decord and prepare (warped_padded, mask_padded, warped_unpadded, mask_unpadded, left_unpadded)."""
+        input_layout = self._normalize_input_layout(input_layout)
+        is_dual_input = input_layout == "dual"
+        is_quad_input = input_layout == "quad"
         idxs = list(range(start_idx, end_idx))
         frames_np = vr.get_batch(idxs).asnumpy()  # (T,H,W,3) uint8
         frames = torch.from_numpy(frames_np).permute(0, 3, 1, 2).to(torch.uint8)  # T,C,H,W uint8
@@ -1119,7 +1178,7 @@ class InpaintingGUI(ThemedTk):
             frames_mask_raw = frames[:, :, :, :half_w]
             frames_warped_raw = frames[:, :, :, half_w:]
             expected_mask_h, expected_mask_w = Hfull, half_w
-        else:
+        elif is_quad_input:
             half_h = Hfull // 2
             half_w = Wfull // 2
             # Top-left quadrant is the original left frames
@@ -1127,6 +1186,10 @@ class InpaintingGUI(ThemedTk):
             frames_mask_raw = frames[:, :, half_h:, :half_w]
             frames_warped_raw = frames[:, :, half_h:, half_w:]
             expected_mask_h, expected_mask_w = half_h, half_w
+        else:
+            frames_warped_raw = frames
+            frames_mask_raw = torch.zeros_like(frames_warped_raw)
+            expected_mask_h, expected_mask_w = Hfull, Wfull
 
         # Warped normalized [0,1]
         warped_unpadded = frames_warped_raw.float() / 255.0
@@ -1167,7 +1230,7 @@ class InpaintingGUI(ThemedTk):
         self,
         input_video_path: str,
         base_video_name: str,
-        is_dual_input: bool,
+        input_layout: object,
         frames_chunk: int,
         tile_num: int,
         update_info_callback: Optional[Callable],
@@ -1195,6 +1258,9 @@ class InpaintingGUI(ThemedTk):
                   num_frames_original, padded_H, padded_W, video_stream_info)
                  or None if an error occurs.
         """
+        input_layout = self._normalize_input_layout(input_layout)
+        is_dual_input = input_layout == "dual"
+        is_quad_input = input_layout == "quad"
         frames, fps, video_stream_info = read_video_frames(input_video_path)
 
         # --- Process Length Logic ---
@@ -1284,7 +1350,7 @@ class InpaintingGUI(ThemedTk):
                 return None
             # --- END NEW ---
 
-        else: # Quad input
+        elif is_quad_input: # Quad input
             half_h = total_h_current // 2
             half_w = total_w_current // 2
 
@@ -1312,6 +1378,23 @@ class InpaintingGUI(ThemedTk):
                 self.after(0, lambda: messagebox.showerror("Resolution Error", error_msg))
                 return None
             # --- END NEW ---
+        else:  # Single warp input
+            frames_mask_raw = torch.zeros_like(frames)
+            frames_warpped_raw = frames
+            output_display_h = total_h_current
+            output_display_w = total_w_current
+
+            required_divisor = 8
+            if output_display_h % required_divisor != 0 or output_display_w % required_divisor != 0:
+                error_msg = (f"Video '{base_video_name}' has an invalid resolution for inpainting.\n\n"
+                             f"The target inpainting area has dimensions {output_display_w}x{output_display_h}, "
+                             f"but both width and height must be divisible by {required_divisor}.\n\n"
+                             "Please crop or resize the source video. Skipping this file.")
+                logger.error(error_msg)
+                if update_info_callback:
+                    self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h} (INVALID)", "Skipped", "N/A", "N/A"))
+                self.after(0, lambda: messagebox.showerror("Resolution Error", error_msg))
+                return None
 
 
         # --- Normalization and Grayscale Conversion (Using OpenCV) ---
@@ -1447,16 +1530,20 @@ class InpaintingGUI(ThemedTk):
         self,
         input_video_path: str,
         save_dir: str,
-        is_dual_input: bool,
+        input_layout: object,
     ) -> Tuple[Optional[str], dict]:
         """
         Initializes Hi-Res variables, finds a Hi-Res match, determines the final output path,
         and initializes variables for process flow.
         Returns (output_video_path, hires_data).
         """
+        input_layout = self._normalize_input_layout(input_layout)
+        is_dual_input = input_layout == "dual"
+        is_quad_input = input_layout == "quad"
+
         base_video_name = os.path.basename(input_video_path)
         video_name_without_ext = os.path.splitext(base_video_name)[0]
-        output_suffix = "_inpainted_right_eye" if is_dual_input else "_inpainted_sbs"
+        output_suffix = "_inpainted_sbs" if is_quad_input else "_inpainted_right_eye"
 
         # --- INITIALIZE HI-RES VARIABLES & FIND MATCH (STEP 1) ---
         hires_video_path: Optional[str] = self._find_high_res_match(input_video_path)
@@ -1473,8 +1560,10 @@ class InpaintingGUI(ThemedTk):
 
                 if is_dual_input:
                     hires_H, hires_W = full_h_hires, full_w_hires // 2
-                else:
+                elif is_quad_input:
                     hires_H, hires_W = full_h_hires // 2, full_w_hires // 2
+                else:
+                    hires_H, hires_W = full_h_hires, full_w_hires
                 
                 logger.info(f"Hi-Res blending enabled. Target resolution: {hires_W}x{hires_H}")
             except Exception as e:
@@ -1486,10 +1575,20 @@ class InpaintingGUI(ThemedTk):
         if is_hires_blend_enabled and hires_video_path:
             hires_base_name = os.path.basename(hires_video_path)
             hires_name_without_ext = os.path.splitext(hires_base_name)[0]
-            video_name_for_output = hires_name_without_ext.replace("_splatted4", "").replace("_splatted2", "")
+            video_name_for_output = (
+                hires_name_without_ext
+                .replace("_splatted4", "")
+                .replace("_splatted2", "")
+                .replace("_splatted1", "")
+            )
             logger.debug(f"Output filename base set to Hi-Res: {video_name_for_output}")
         else:
-            video_name_for_output = video_name_without_ext.replace("_splatted4", "").replace("_splatted2", "")
+            video_name_for_output = (
+                video_name_without_ext
+                .replace("_splatted4", "")
+                .replace("_splatted2", "")
+                .replace("_splatted1", "")
+            )
         
         output_video_filename = f"{video_name_for_output}{output_suffix}.mp4"
         output_video_path = os.path.join(save_dir, output_video_filename)
@@ -1796,6 +1895,10 @@ class InpaintingGUI(ThemedTk):
         update_info_callback=None,
         original_input_blend_strength: float = 0.8,
         output_crf: int = 23,
+        output_codec: str = "",
+        output_preset: str = "",
+        output_pix_fmt: str = "",
+        output_extra_args: str = "",
         process_length: int = -1,
     ) -> Tuple[bool, Optional[str]]:
         """
@@ -1807,31 +1910,49 @@ class InpaintingGUI(ThemedTk):
         # Determine splat type early
         base_video_name = os.path.basename(input_video_path)
         video_name_without_ext = os.path.splitext(base_video_name)[0]
-        is_dual_input = video_name_without_ext.endswith("_splatted2")
+        input_layout = self._infer_input_layout_from_stem(video_name_without_ext)
+        is_dual_input = input_layout == "dual"
+        is_quad_input = input_layout == "quad"
         replace_mask_vr = None
+        if input_layout == "single" and not self.use_replace_mask_var.get():
+            logger.error(
+                f"{base_video_name} is single-warp (_splatted1): external replace mask is required."
+            )
+            return False, None
         if self.use_replace_mask_var.get():
             replace_mask_path = self._find_replace_mask_for_splatted(
                 splatted_path=input_video_path,
                 replace_mask_folder=self.replace_mask_folder_var.get(),
             )
             if not replace_mask_path:
-                logger.error(
-                    f"Replace mask enabled but not found for {base_video_name}. "
-                    f"Expected '{video_name_without_ext}_replace_mask.*' in "
-                    f"'{self.replace_mask_folder_var.get() or os.path.dirname(input_video_path)}'."
+                expected_dir = self.replace_mask_folder_var.get() or os.path.dirname(input_video_path)
+                if input_layout == "single":
+                    logger.error(
+                        f"Replace mask enabled but not found for {base_video_name}. "
+                        f"Expected '{video_name_without_ext}_replace_mask.*' in '{expected_dir}'."
+                    )
+                    return False, None
+                logger.warning(
+                    f"Replace mask not found for {base_video_name} in '{expected_dir}'. "
+                    "Falling back to embedded mask from splatted input."
                 )
-                return False, None
-            try:
-                replace_mask_vr = VideoReader(replace_mask_path, ctx=cpu(0))
-                logger.info(f"Using external replace mask: {os.path.basename(replace_mask_path)}")
-            except Exception as e:
-                logger.error(f"Failed to open replace mask '{replace_mask_path}': {e}")
-                return False, None
+            else:
+                try:
+                    replace_mask_vr = VideoReader(replace_mask_path, ctx=cpu(0))
+                    logger.info(f"Using external replace mask: {os.path.basename(replace_mask_path)}")
+                except Exception as e:
+                    if input_layout == "single":
+                        logger.error(f"Failed to open replace mask '{replace_mask_path}': {e}")
+                        return False, None
+                    logger.warning(
+                        f"Failed to open replace mask '{replace_mask_path}' ({e}). "
+                        "Falling back to embedded mask from splatted input."
+                    )
 
         # 1. SETUP & HI-RES DETECTION
         # output_video_path is str (guaranteed), hires_data is dict (guaranteed)
         output_video_path, hires_data = self._setup_video_info_and_hires(
-            input_video_path, save_dir, is_dual_input
+            input_video_path, save_dir, input_layout
         )
         base_video_name = hires_data["base_video_name"]
         video_name_for_output = hires_data["video_name_for_output"]
@@ -1855,7 +1976,7 @@ class InpaintingGUI(ThemedTk):
             stream_prep = self._prepare_video_stream_reader(
                 input_video_path=input_video_path,
                 base_video_name=base_video_name,
-                is_dual_input=is_dual_input,
+                input_layout=input_layout,
                 tile_num=tile_num,
                 update_info_callback=update_info_callback,
                 overlap=overlap,
@@ -1875,7 +1996,7 @@ class InpaintingGUI(ThemedTk):
             prepared_inputs = self._prepare_video_inputs(
                 input_video_path=input_video_path,
                 base_video_name=base_video_name,
-                is_dual_input=is_dual_input,
+                input_layout=input_layout,
                 frames_chunk=frames_chunk,
                 tile_num=tile_num,
                 update_info_callback=update_info_callback,
@@ -1906,7 +2027,7 @@ class InpaintingGUI(ThemedTk):
         results = []  # kept for non-streaming fallback
         mask_unpadded_accum = [] if stream_input_enabled else None
         warped_unpadded_accum = [] if stream_input_enabled else None
-        left_unpadded_accum = [] if (stream_input_enabled and (not is_dual_input)) else None
+        left_unpadded_accum = [] if (stream_input_enabled and is_quad_input) else None
 
         previous_chunk_output_frames: Optional[torch.Tensor] = None
 
@@ -1916,7 +2037,7 @@ class InpaintingGUI(ThemedTk):
             # Determine output frame size (after finalization/concat)
             out_H = padded_H
             out_W = padded_W
-            if not is_dual_input:
+            if is_quad_input:
                 out_W = out_W * 2  # SBS
             # Encode directly to the output MP4 (no audio).
             video_only_path = output_video_path
@@ -1927,7 +2048,10 @@ class InpaintingGUI(ThemedTk):
                     height=out_H,
                     fps=fps,
                     crf=output_crf,
-                    preset="veryfast"
+                    codec=output_codec or "libx264",
+                    preset=output_preset or "veryfast",
+                    pix_fmt=output_pix_fmt or "yuv420p",
+                    extra_output_args=output_extra_args or "",
                 )
             except Exception as e:
                 logger.warning(f"Streaming writer init failed ({e}); falling back to non-streaming encoding.")
@@ -1953,7 +2077,7 @@ class InpaintingGUI(ThemedTk):
                 (original_input_frames_slice, mask_frames_slice,
                  warped_unpadded_slice, mask_unpadded_slice, left_unpadded_slice) = self._read_and_prepare_chunk_from_reader(
                      vr=video_reader, start_idx=i, end_idx=end_idx_for_slicing,
-                     base_video_name=base_video_name, is_dual_input=is_dual_input, tile_num=tile_num,
+                     base_video_name=base_video_name, input_layout=input_layout, tile_num=tile_num,
                      replace_mask_vr=replace_mask_vr,
                  )
             else:
@@ -1962,7 +2086,7 @@ class InpaintingGUI(ThemedTk):
                 warped_unpadded_slice = frames_warpped_original_unpadded_normalized[i:end_idx_for_slicing]
                 mask_unpadded_slice = frames_mask_processed_unpadded_original_length[i:end_idx_for_slicing]
                 left_unpadded_slice = None
-                if not is_dual_input and frames_left_original_cropped is not None:
+                if is_quad_input and frames_left_original_cropped is not None:
                     left_unpadded_slice = frames_left_original_cropped[i:end_idx_for_slicing]
             actual_sliced_length = original_input_frames_slice.shape[0]
             if is_last_chunk:
@@ -2142,8 +2266,8 @@ class InpaintingGUI(ThemedTk):
                 # Color transfer (chunk-wise)
                 if self.enable_color_transfer.get():
                     reference_frames_for_transfer = None
-                    if is_dual_input:
-                        # Dual input: create occlusion-free reference from warped frames via directional dilation
+                    if not is_quad_input:
+                        # Dual/single input: create occlusion-free reference from warped frames via directional dilation
                         reference_frames_for_transfer = self._apply_directional_dilation(
                             frame_chunk=warped_chunk.cpu(),
                             mask_chunk=mask_chunk.cpu()
@@ -2177,7 +2301,7 @@ class InpaintingGUI(ThemedTk):
                     )
 
                 # Final concat (SBS if quad input)
-                if not is_dual_input:
+                if is_quad_input:
                     if left_chunk is None or left_chunk.numel() == 0:
                         raise RuntimeError("Missing left_chunk for SBS output in streaming mode")
                     # Ensure left is on CPU and matches
@@ -2215,7 +2339,7 @@ class InpaintingGUI(ThemedTk):
                     end_off = offset + new_frames.shape[0]
                     warped_unpadded_accum.append(warped_unpadded_slice[offset:end_off].detach().cpu())
                     mask_unpadded_accum.append(mask_unpadded_slice[offset:end_off].detach().cpu())
-                    if (not is_dual_input) and left_unpadded_accum is not None and left_unpadded_slice is not None:
+                    if is_quad_input and left_unpadded_accum is not None and left_unpadded_slice is not None:
                         left_unpadded_accum.append(left_unpadded_slice[offset:end_off].detach().cpu())
 
             # Stop after processing the true last chunk.
@@ -2260,7 +2384,7 @@ class InpaintingGUI(ThemedTk):
                 frames_mask_processed_unpadded_original_length = torch.cat(mask_unpadded_accum, dim=0)[:num_frames_original]
             if warped_unpadded_accum is not None and len(warped_unpadded_accum) > 0:
                 frames_warpped_original_unpadded_normalized = torch.cat(warped_unpadded_accum, dim=0)[:num_frames_original]
-            if (not is_dual_input) and left_unpadded_accum is not None and len(left_unpadded_accum) > 0:
+            if is_quad_input and left_unpadded_accum is not None and len(left_unpadded_accum) > 0:
                 frames_left_original_cropped = torch.cat(left_unpadded_accum, dim=0)[:num_frames_original]
 # 5. FINALIZATION (Hi-Res Upscale, Color Transfer, Blend, Concat)
         final_output_frames_for_encoding = self._finalize_output_frames(
@@ -2270,7 +2394,7 @@ class InpaintingGUI(ThemedTk):
             original_left_frames=frames_left_original_cropped,
             hires_data=hires_data,
             base_video_name=base_video_name,
-            is_dual_input=is_dual_input,
+            input_layout=input_layout,
         )
 
         if final_output_frames_for_encoding is None or final_output_frames_for_encoding.numel() == 0:
@@ -2313,6 +2437,10 @@ class InpaintingGUI(ThemedTk):
                 total_output_frames=total_output_frames, video_stream_info=video_stream_info,
                 stop_event=stop_event_non_optional, sidecar_json_data=None, user_output_crf=output_crf,
                 output_sidecar_ext=".spsidecar",
+                force_output_codec=output_codec or None,
+                force_output_preset=output_preset or None,
+                force_output_pix_fmt=output_pix_fmt or None,
+                ffmpeg_extra_output_args=output_extra_args or None,
             )
             
             if not encoding_success:

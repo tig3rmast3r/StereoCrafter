@@ -2,53 +2,59 @@
 set -euo pipefail
 
 # Edit these paths/values as needed.
-INPUT_DIR="./work/splat/"
-INPUT_VIDEO=""                       # if set (non-empty), overrides INPUT_DIR
-OUTPUT_DIR="./work/output/"
-GLOB="*.mp4"
+PYTHON="${PYTHON:-python3}"
+RUNNER="${RUNNER:-batch_inpainting_runner.py}"
+INPUT_DIR="${INPUT_DIR:-./work/splat/}"
+INPUT_VIDEO="${INPUT_VIDEO:-}"                       # if set (non-empty), overrides INPUT_DIR
+OUTPUT_DIR="${OUTPUT_DIR:-./work/output/}"
+GLOB="${GLOB:-*.mp4}"
 
-HIRES_BLEND_FOLDER=""                # optional
-REPLACE_MASK_FOLDER=""               # optional; folder with <splatted_stem>_replace_mask.*
-USE_REPLACE_MASK=0                   # 1 => use external replace mask (fast-fail if missing/mismatch)
-OFFLOAD_TYPE="model"                 # none | model | sequential
+HIRES_BLEND_FOLDER="${HIRES_BLEND_FOLDER:-}"                # optional
+REPLACE_MASK_FOLDER="${REPLACE_MASK_FOLDER:-}"              # optional; folder with <splatted_stem>_replace_mask.*
+USE_REPLACE_MASK="${USE_REPLACE_MASK:-0}"                   # 1 => use external replace mask (fast-fail if missing/mismatch)
+OFFLOAD_TYPE="${OFFLOAD_TYPE:-model}"                       # none | model | sequential
 
-TILE_NUM=2
-FRAMES_CHUNK=50
-OVERLAP=3
-TAIL_PAD=2
-ORIGINAL_INPUT_BLEND_STRENGTH=0
-OUTPUT_CRF=1
-PROCESS_LENGTH=-1
+TILE_NUM="${TILE_NUM:-2}"
+FRAMES_CHUNK="${FRAMES_CHUNK:-50}"
+OVERLAP="${OVERLAP:-3}"
+TAIL_PAD="${TAIL_PAD:-2}"
+ORIGINAL_INPUT_BLEND_STRENGTH="${ORIGINAL_INPUT_BLEND_STRENGTH:-0}"
+OUTPUT_CRF="${OUTPUT_CRF:-1}"
+OUTPUT_CODEC="${OUTPUT_CODEC:-}"                       # optional override (e.g. libx264, h264_nvenc, hevc_nvenc)
+OUTPUT_PRESET="${OUTPUT_PRESET:-}"                     # optional override (e.g. fast, p7)
+OUTPUT_PIX_FMT="${OUTPUT_PIX_FMT:-}"                   # optional override (e.g. yuv420p, yuv420p10le)
+OUTPUT_EXTRA_ARGS="${OUTPUT_EXTRA_ARGS:-}"             # optional extra ffmpeg args
+PROCESS_LENGTH="${PROCESS_LENGTH:--1}"
 
 # Steps control:
 # - If you want dynamic steps from sharpness.csv, set NO_SHARPNESS_CSV=0 and (optionally) SHARPNESS_BASE.
 # - If you want fixed steps for all files, set NO_SHARPNESS_CSV=1 and FIXED_STEPS.
-NO_SHARPNESS_CSV=0
-SHARPNESS_BASE="./work/"                    # folder containing sharpness.csv; empty => defaults to input folder
-FIXED_STEPS=8
+NO_SHARPNESS_CSV="${NO_SHARPNESS_CSV:-0}"
+SHARPNESS_BASE="${SHARPNESS_BASE:-./work/}"                    # folder containing sharpness.csv; empty => defaults to input folder
+FIXED_STEPS="${FIXED_STEPS:-8}"
 
 # Mask settings
-MASK_INITIAL_THRESHOLD=0.3
-MASK_MORPH_KERNEL_SIZE=0.0
-MASK_DILATE_KERNEL_SIZE=5
-MASK_BLUR_KERNEL_SIZE=10
+MASK_INITIAL_THRESHOLD="${MASK_INITIAL_THRESHOLD:-0.3}"
+MASK_MORPH_KERNEL_SIZE="${MASK_MORPH_KERNEL_SIZE:-0.0}"
+MASK_DILATE_KERNEL_SIZE="${MASK_DILATE_KERNEL_SIZE:-5}"
+MASK_BLUR_KERNEL_SIZE="${MASK_BLUR_KERNEL_SIZE:-10}"
 
-ENABLE_POST_INPAINTING_BLEND=0        # 1 to enable
-DISABLE_COLOR_TRANSFER=1              # 1 to disable
+ENABLE_POST_INPAINTING_BLEND="${ENABLE_POST_INPAINTING_BLEND:-0}"        # 1 to enable
+DISABLE_COLOR_TRANSFER="${DISABLE_COLOR_TRANSFER:-1}"                     # 1 to disable
 
-SKIP_EXISTING=1
-MOVE_FAILED=1
-MOVE_FINISHED=0
-FAILED_SUBDIR="failed"
-FINISHED_SUBDIR="finished"
+SKIP_EXISTING="${SKIP_EXISTING:-1}"
+MOVE_FAILED="${MOVE_FAILED:-1}"
+MOVE_FINISHED="${MOVE_FINISHED:-0}"
+FAILED_SUBDIR="${FAILED_SUBDIR:-failed}"
+FINISHED_SUBDIR="${FINISHED_SUBDIR:-finished}"
 
-DISABLE_DYNAMIC_CHUNK=1
+DISABLE_DYNAMIC_CHUNK="${DISABLE_DYNAMIC_CHUNK:-1}"
 
-DEBUG=0
+DEBUG="${DEBUG:-0}"
 STOP_MARKER="${STOP_MARKER:-$OUTPUT_DIR/.stop_after_current}"
 
 # --- runner command (edit freely) ---
-CMD=(python3 batch_inpainting_runner.py)
+CMD=("$PYTHON" "$RUNNER")
 
 if [[ -n "$INPUT_VIDEO" ]]; then
   CMD+=(--input_video "$INPUT_VIDEO")
@@ -88,6 +94,10 @@ fi
 if [[ "$ENABLE_POST_INPAINTING_BLEND" == "1" ]]; then CMD+=(--enable_post_inpainting_blend); fi
 if [[ "$USE_REPLACE_MASK" == "1" ]]; then CMD+=(--use_replace_mask); fi
 if [[ "$DISABLE_COLOR_TRANSFER" == "1" ]]; then CMD+=(--disable_color_transfer); fi
+if [[ -n "$OUTPUT_CODEC" ]]; then CMD+=(--output_codec "$OUTPUT_CODEC"); fi
+if [[ -n "$OUTPUT_PRESET" ]]; then CMD+=(--output_preset "$OUTPUT_PRESET"); fi
+if [[ -n "$OUTPUT_PIX_FMT" ]]; then CMD+=(--output_pix_fmt "$OUTPUT_PIX_FMT"); fi
+if [[ -n "$OUTPUT_EXTRA_ARGS" ]]; then CMD+=(--output_extra_args "$OUTPUT_EXTRA_ARGS"); fi
 if [[ "$SKIP_EXISTING" == "1" ]]; then CMD+=(--skip_existing); fi
 if [[ "$MOVE_FAILED" == "1" ]]; then CMD+=(--move_failed); fi
 if [[ "$MOVE_FINISHED" == "1" ]]; then CMD+=(--move_finished); fi
