@@ -101,6 +101,7 @@ class RenderProcessor:
         replace_mask_gap_tol: int = 0,
         replace_mask_codec: str = "ffv1",
         replace_mask_draw_edge: bool = True,
+        gpu_microbatch_size: int = 2,
     ) -> bool:
         """Core splatting render loop.
 
@@ -202,6 +203,13 @@ class RenderProcessor:
         
         frame_count = 0
         encoding_successful = True
+        try:
+            gpu_microbatch_size_i = max(1, int(gpu_microbatch_size))
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Invalid gpu_microbatch_size='{gpu_microbatch_size}', using 2."
+            )
+            gpu_microbatch_size_i = 2
 
         try:
             frame_index_iter = (
@@ -319,6 +327,7 @@ class RenderProcessor:
                     replace_mask_max_px=replace_mask_max_px,
                     replace_mask_gap_tol=replace_mask_gap_tol,
                     replace_mask_draw_edge=replace_mask_draw_edge,
+                    gpu_microbatch_size=gpu_microbatch_size_i,
                 )
 
                 if replace_mask_enabled and replace_mask_path:
@@ -506,6 +515,7 @@ class RenderProcessor:
         replace_mask_max_px: int = 32,
         replace_mask_gap_tol: int = 0,
         replace_mask_draw_edge: bool = True,
+        gpu_microbatch_size: int = 2,
     ) -> List[np.ndarray]:
         """Process GPU splatting on normalized depth maps.
         
@@ -543,89 +553,131 @@ class RenderProcessor:
                 )
             batch_depth_numpy_float = resized_depth
         
-        # Move to GPU
-        source_tensor = torch.from_numpy(batch_video_numpy).permute(0, 3, 1, 2).float().cuda() / 255.0
-        depth_tensor = torch.from_numpy(batch_depth_numpy_float).unsqueeze(1).float().cuda()
+        total_frames = int(batch_video_numpy.shape[0])
+        if total_frames <= 0:
+            return []
 
-        # Depth is already normalized to [0, 1], just clip and apply bias
-        depth_tensor = torch.clip(depth_tensor, 0.0, 1.0)
-        
-        if input_bias != 0:
-            depth_tensor = torch.clip(depth_tensor + input_bias, 0.0, 1.0)
+        try:
+            microbatch = max(1, int(gpu_microbatch_size))
+        except (TypeError, ValueError):
+            microbatch = 2
+        microbatch = min(microbatch, total_frames)
 
-        # Disparity calculation
-        disp_map = (depth_tensor - zero_disparity_anchor_val) * 2.0
+        # Keep disparity scaling identical to full-batch path.
         actual_max_disp_pixels = (max_disp / 20.0 / 100.0) * target_width
-        disp_map = disp_map * actual_max_disp_pixels
+        results: List[dict] = []
 
-        # Forward warp
-        with torch.no_grad():
-            right_eye_raw, occlusion_mask = stereo_projector(source_tensor, disp_map)
+        for mb_start in range(0, total_frames, microbatch):
+            mb_end = min(mb_start + microbatch, total_frames)
+            batch_video_mb = batch_video_numpy[mb_start:mb_end]
+            batch_depth_mb = batch_depth_numpy_float[mb_start:mb_end]
 
-            disp_out_winner = None
-            if stair_smooth_enabled or stair_debug_mask or replace_mask_enabled:
-                maxd = float(actual_max_disp_pixels) if float(actual_max_disp_pixels) != 0.0 else 1.0
-                disp_norm_rgb = (disp_map / (2.0 * maxd) + 0.5).clamp(0.0, 1.0).repeat(1, 3, 1, 1)
-                right_disp_norm_rgb, _ = stereo_projector(disp_norm_rgb, disp_map)
-                disp_out_winner = (right_disp_norm_rgb[:, 0:1] - 0.5) * (2.0 * maxd)
+            # Move only a micro-batch to GPU to cap peak VRAM.
+            source_tensor = (
+                torch.from_numpy(batch_video_mb).permute(0, 3, 1, 2).float().cuda() / 255.0
+            )
+            depth_tensor = torch.from_numpy(batch_depth_mb).unsqueeze(1).float().cuda()
 
-            right_eye_processed = right_eye_raw
-            if stair_smooth_enabled or stair_debug_mask:
-                right_eye_processed = apply_staircase_smooth_bgside(
-                    right_eye_processed,
-                    occlusion_mask,
-                    disp_out_winner if disp_out_winner is not None else disp_map,
-                    max_disp=float(actual_max_disp_pixels),
-                    edge_mode="pos",
-                    grad_thr_px=1.0,
-                    strip_px=int(stair_strip_px),
-                    strength=float(stair_strength),
-                    right_margin_extra=0,
-                    debug_mask=bool(stair_debug_mask),
-                    exclude_near_holes=True,
-                    hole_dilate=8,
-                    edge_x_offset=int(stair_edge_x_offset),
-                    blur_kernel=int(stair_blur_kernel),
-                )
+            depth_tensor = torch.clip(depth_tensor, 0.0, 1.0)
+            if input_bias != 0:
+                depth_tensor = torch.clip(depth_tensor + input_bias, 0.0, 1.0)
 
-            replace_mask_u8 = None
-            if replace_mask_enabled and disp_out_winner is not None:
-                hole_bool = occlusion_mask > 0.5
-                rep = build_replace_mask_edge_hole_run(
-                    disp_out_winner,
-                    hole_bool,
-                    grad_thr_px=1.0,
-                    min_px=int(replace_mask_min_px),
-                    max_px=int(replace_mask_max_px),
-                    scale=float(replace_mask_scale),
-                    gap_tol=int(replace_mask_gap_tol),
-                    draw_edge=bool(replace_mask_draw_edge),
-                )
-                try:
-                    eff_max = max(1, int(round(int(replace_mask_max_px) * float(replace_mask_scale))))
-                    left_run = left_black_run_mask_from_rgb(right_eye_processed, tol=0.0, max_px=eff_max)
-                    rep = rep | left_run
-                except Exception:
-                    pass
-                replace_mask_u8 = (rep[:, 0].to(torch.uint8) * 255).contiguous().cpu().numpy()
-        
-        # CPU conversion
-        left_cpu = source_tensor.cpu().numpy()
-        right_cpu = right_eye_processed.cpu().numpy()
-        occl_cpu = occlusion_mask.cpu().numpy()
-        depth_cpu = depth_tensor.cpu().numpy()
+            disp_map = (depth_tensor - zero_disparity_anchor_val) * 2.0
+            disp_map = disp_map * actual_max_disp_pixels
 
-        results = []
-        for j in range(len(batch_video_numpy)):
-            item = {
-                "left": (np.clip(left_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
-                "right": (np.clip(right_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
-                "occlusion": (np.clip(occl_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
-                "depth": (np.clip(depth_cpu[j].transpose(1, 2, 0), 0, 1) * 255).astype(np.uint8),
-            }
-            if replace_mask_u8 is not None:
-                item["replace_mask"] = replace_mask_u8[j]
-            results.append(item)
+            with torch.no_grad():
+                right_eye_raw, occlusion_mask = stereo_projector(source_tensor, disp_map)
+
+                disp_out_winner = None
+                if stair_smooth_enabled or stair_debug_mask or replace_mask_enabled:
+                    maxd = (
+                        float(actual_max_disp_pixels)
+                        if float(actual_max_disp_pixels) != 0.0
+                        else 1.0
+                    )
+                    disp_norm_rgb = (
+                        (disp_map / (2.0 * maxd) + 0.5)
+                        .clamp(0.0, 1.0)
+                        .repeat(1, 3, 1, 1)
+                    )
+                    right_disp_norm_rgb, _ = stereo_projector(disp_norm_rgb, disp_map)
+                    disp_out_winner = (right_disp_norm_rgb[:, 0:1] - 0.5) * (2.0 * maxd)
+
+                right_eye_processed = right_eye_raw
+                if stair_smooth_enabled or stair_debug_mask:
+                    right_eye_processed = apply_staircase_smooth_bgside(
+                        right_eye_processed,
+                        occlusion_mask,
+                        disp_out_winner if disp_out_winner is not None else disp_map,
+                        max_disp=float(actual_max_disp_pixels),
+                        edge_mode="pos",
+                        grad_thr_px=1.0,
+                        strip_px=int(stair_strip_px),
+                        strength=float(stair_strength),
+                        right_margin_extra=0,
+                        debug_mask=bool(stair_debug_mask),
+                        exclude_near_holes=True,
+                        hole_dilate=8,
+                        edge_x_offset=int(stair_edge_x_offset),
+                        blur_kernel=int(stair_blur_kernel),
+                    )
+
+                replace_mask_u8 = None
+                if replace_mask_enabled and disp_out_winner is not None:
+                    hole_bool = occlusion_mask > 0.5
+                    rep = build_replace_mask_edge_hole_run(
+                        disp_out_winner,
+                        hole_bool,
+                        grad_thr_px=1.0,
+                        min_px=int(replace_mask_min_px),
+                        max_px=int(replace_mask_max_px),
+                        scale=float(replace_mask_scale),
+                        gap_tol=int(replace_mask_gap_tol),
+                        draw_edge=bool(replace_mask_draw_edge),
+                    )
+                    try:
+                        eff_max = max(
+                            1,
+                            int(
+                                round(
+                                    int(replace_mask_max_px) * float(replace_mask_scale)
+                                )
+                            ),
+                        )
+                        left_run = left_black_run_mask_from_rgb(
+                            right_eye_processed, tol=0.0, max_px=eff_max
+                        )
+                        rep = rep | left_run
+                    except Exception:
+                        pass
+                    replace_mask_u8 = (
+                        (rep[:, 0].to(torch.uint8) * 255).contiguous().cpu().numpy()
+                    )
+
+            left_cpu = source_tensor.cpu().numpy()
+            right_cpu = right_eye_processed.cpu().numpy()
+            occl_cpu = occlusion_mask.cpu().numpy()
+            depth_cpu = depth_tensor.cpu().numpy()
+
+            for j in range(len(batch_video_mb)):
+                item = {
+                    "left": (
+                        np.clip(left_cpu[j].transpose(1, 2, 0), 0, 1) * 255
+                    ).astype(np.uint8),
+                    "right": (
+                        np.clip(right_cpu[j].transpose(1, 2, 0), 0, 1) * 255
+                    ).astype(np.uint8),
+                    "occlusion": (
+                        np.clip(occl_cpu[j].transpose(1, 2, 0), 0, 1) * 255
+                    ).astype(np.uint8),
+                    "depth": (
+                        np.clip(depth_cpu[j].transpose(1, 2, 0), 0, 1) * 255
+                    ).astype(np.uint8),
+                }
+                if replace_mask_u8 is not None:
+                    item["replace_mask"] = replace_mask_u8[j]
+                results.append(item)
+
         return results
 
 

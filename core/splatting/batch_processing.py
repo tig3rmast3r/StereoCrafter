@@ -569,11 +569,10 @@ class BatchProcessor:
             return float(fallback_anchor)
 
         try:
-            if self._convergence_estimator is None:
-                self._convergence_estimator = ConvergenceEstimatorWrapper()
-            estimator = self._convergence_estimator
-
             if mode == "MinBorders":
+                if self._convergence_estimator is None:
+                    self._convergence_estimator = ConvergenceEstimatorWrapper(load_model=False)
+                estimator = self._convergence_estimator
                 conv_val = estimator.estimate_min_borders_convergence(
                     depth_path=depth_path,
                     process_length=int(settings.process_length),
@@ -587,6 +586,10 @@ class BatchProcessor:
                     f"Auto-Convergence[{mode}] {os.path.basename(video_path)} -> {float(conv_val):.4f}"
                 )
                 return float(conv_val)
+
+            if self._convergence_estimator is None:
+                self._convergence_estimator = ConvergenceEstimatorWrapper()
+            estimator = self._convergence_estimator
 
             avg_val, peak_val, _, _ = estimator.estimate_convergence(
                 rgb_path=video_path,

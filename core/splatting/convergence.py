@@ -35,19 +35,24 @@ class ConvergenceEstimatorWrapper:
     """
 
     def __init__(
-        self, model_path: Optional[str] = None, device: Optional[str] = None
+        self,
+        model_path: Optional[str] = None,
+        device: Optional[str] = None,
+        load_model: bool = True,
     ):
         """Initialize convergence estimation model.
 
         Args:
             model_path: Path to model weights file
             device: Torch device for inference
+            load_model: If False, defer neural model loading until needed
         """
         self.logger = logging.getLogger(__name__)
         self._model_path = model_path
         self._device = device
         self._estimator = None
-        self._load_model()
+        if load_model:
+            self._load_model()
 
     def _load_model(self) -> None:
         """Load the U2NETP model for convergence estimation."""
@@ -75,6 +80,13 @@ class ConvergenceEstimatorWrapper:
             True if model is loaded, False otherwise
         """
         return self._estimator is not None and self._estimator.model is not None
+
+    def ensure_model_loaded(self) -> bool:
+        """Load the neural model on demand when AI convergence modes are used."""
+        if self.is_model_loaded():
+            return True
+        self._load_model()
+        return self.is_model_loaded()
 
     @staticmethod
     def _to_gray_depth(frame_raw: np.ndarray) -> np.ndarray:
@@ -193,8 +205,9 @@ class ConvergenceEstimatorWrapper:
             Tuple of (average_convergence, peak_convergence, max_edge_l, max_edge_r)
         """
         if not self.is_model_loaded():
-            self.logger.warning("Model not loaded, returning fallback values")
-            return fallback_value, fallback_value, None, None
+            if not self.ensure_model_loaded():
+                self.logger.warning("Model not loaded, returning fallback values")
+                return fallback_value, fallback_value, None, None
 
         try:
             # Initialize Readers
