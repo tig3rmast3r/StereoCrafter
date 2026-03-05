@@ -20,7 +20,6 @@ Features:
   - Warm pipeline (keeps model loaded)
   - Skip if final output exists
   - Optional OOM retries (can be disabled)
-  - Move failed inputs to input_dir/failed
   - Temp files cleaned (unless --keep_temps)
   - IMPORTANT: After ANY failed file, we HARD-RESET the pipeline (OOM can poison CUDA state)
                to avoid immediate cascade failures on the next file.
@@ -31,7 +30,6 @@ Tries NVENC first; falls back to libx264 if NVENC fails.
 import gc
 import importlib.util
 import shlex
-import shutil
 import subprocess
 import time
 import traceback
@@ -144,6 +142,8 @@ def _preprocess_video(
     pad_h: int,
     pad_x: int,
     pad_y: int,
+    src_crop_top: int = 0,
+    src_crop_bottom: int = 0,
     ffmpeg_codec: str = "",
     ffmpeg_crf: int = -1,
     ffmpeg_preset: str = "",
@@ -153,7 +153,12 @@ def _preprocess_video(
     # Scale always to content_w x content_h, then pad ONLY if needed.
     # Important: pad placement is explicit (pad_x/pad_y) so caller can anchor content.
     pix_fmt = (ffmpeg_pix_fmt or "yuv420p").strip()
-    vf_parts = [f"scale={content_w}:{content_h}:flags=lanczos"]
+    crop_top = max(0, int(src_crop_top))
+    crop_bottom = max(0, int(src_crop_bottom))
+    vf_parts = []
+    if crop_top > 0 or crop_bottom > 0:
+        vf_parts.append(f"crop=iw:ih-{crop_top + crop_bottom}:0:{crop_top}")
+    vf_parts.append(f"scale={content_w}:{content_h}:flags=lanczos")
     if pad_w != content_w or pad_h != content_h:
         vf_parts.append(f"pad={pad_w}:{pad_h}:{int(pad_x)}:{int(pad_y)}:black")
     vf_parts.append(f"format={pix_fmt}")
@@ -229,6 +234,9 @@ def _postprocess_depth(
     crop_y: int,
     out_w: int,
     out_h: int,
+    recenter_w: int = 0,
+    recenter_h: int = 0,
+    recenter_pad_top: int = 0,
     final_upscale: bool = True,
     padded: bool = True,
     ffmpeg_codec: str = "",
@@ -244,6 +252,9 @@ def _postprocess_depth(
         vf_parts.append(f"crop={crop_w}:{crop_h}:{int(crop_x)}:{int(crop_y)}")
     if final_upscale:
         vf_parts.append(f"scale={out_w}:{out_h}:flags=neighbor")
+    if int(recenter_w) > 0 and int(recenter_h) > 0:
+        pad_top = max(0, int(recenter_pad_top))
+        vf_parts.append(f"pad={int(recenter_w)}:{int(recenter_h)}:0:{pad_top}:black")
     vf_parts.append(f"format={pix_fmt}")
     vf = ",".join(vf_parts)
 
@@ -339,8 +350,6 @@ def run(
     # Policy
     retry_sequential: bool = True,
     retry_decode_chunk_size_1: bool = True,
-    move_failed: bool = True,
-    failed_subdir: str = "failed",
     remove_partial_output: bool = True,
     restart_every: int = 0,
     keep_temps: bool = False,
@@ -348,6 +357,9 @@ def run(
     final_upscale: bool = True,
     # Pad anchor policy
     pad_align_bottom: bool = True,
+    # Strip initial scene pad (top/bottom) before DepthCrafter, then re-center at output.
+    scene_strip_pad_top: int = 0,
+    scene_strip_pad_bottom: int = 0,
     # Optional ffmpeg overrides applied to preprocess + worker output + postprocess.
     # Keep empty / -1 to preserve existing behavior.
     ffmpeg_codec: str = "",
@@ -359,10 +371,6 @@ def run(
     input_dir_p = Path(input_dir).resolve()
     output_dir_p = Path(output_dir).resolve()
     _ensure_dir(output_dir_p)
-
-    failed_dir = input_dir_p / failed_subdir
-    if move_failed:
-        _ensure_dir(failed_dir)
 
     temp_dir = output_dir_p / ".tmp_depthcrafter"
     _ensure_dir(temp_dir)
@@ -412,6 +420,10 @@ def run(
     print(f"[INFO] Params: offload={cpu_offload_mode} decode_chunk_size={decode_chunk_size} window={window_size} overlap={overlap} steps={inference_steps} gs={guidance_scale}")
     print(f"[INFO] final_upscale={final_upscale}")
     print(
+        f"[INFO] scene_strip_pad: top={max(0, int(scene_strip_pad_top))} "
+        f"bottom={max(0, int(scene_strip_pad_bottom))}"
+    )
+    print(
         "[INFO] ffmpeg overrides: "
         f"codec={ffmpeg_codec or 'default'} "
         f"crf={ffmpeg_crf if int(ffmpeg_crf) >= 0 else 'default'} "
@@ -441,20 +453,28 @@ def run(
         except Exception as pe:
             print(f"[ERR ] ffprobe failed for {in_path}: {pe}")
             failed += 1
-            if move_failed:
-                try:
-                    dst = failed_dir / in_path.name
-                    shutil.move(str(in_path), str(dst))
-                except Exception:
-                    pass
             hard_reset_runner(cpu_offload_mode)
             continue
-        # Compute per-file working sizes:
-        #   - content = half of original
-        #   - pad up to multiples of 64 ONLY if needed
+        # Scene pad stripping: remove initial top/bottom pad before DepthCrafter,
+        # then re-center after postprocess to preserve original geometry.
+        strip_top = max(0, int(scene_strip_pad_top))
+        strip_bottom = max(0, int(scene_strip_pad_bottom))
+        max_strip = max(0, int(orig_h) - 2)
+        strip_total = strip_top + strip_bottom
+        if strip_total > max_strip:
+            strip_top, strip_bottom = _split_by_ratio(max_strip, strip_top, strip_bottom)
+            strip_total = strip_top + strip_bottom
+        core_h = int(orig_h) - strip_total
+        if core_h < 2:
+            strip_top = 0
+            strip_bottom = 0
+            strip_total = 0
+            core_h = int(orig_h)
+
+        # Compute per-file working sizes on stripped content.
         if auto_sizes:
             cw = int(orig_w) // 2
-            ch = int(orig_h) // 2
+            ch = max(1, int(core_h) // 2)
             pw = _round_up(cw, 64)
             ph = _round_up(ch, 64)
         else:
@@ -467,6 +487,23 @@ def run(
             pad_y = max(0, ph - ch)
         else:
             pad_y = max(0, (ph - ch) // 2)
+
+        if bool(final_upscale):
+            post_scale_w = int(orig_w)
+            post_scale_h = int(core_h)
+            recenter_w = int(orig_w)
+            recenter_h = int(orig_h)
+        else:
+            post_scale_w = int(cw)
+            post_scale_h = int(ch)
+            recenter_w = max(1, int(orig_w) // 2)
+            recenter_h = max(1, int(orig_h) // 2)
+
+        recenter_pad_total = max(0, int(recenter_h) - int(post_scale_h))
+        recenter_pad_top, _recenter_pad_bottom = _split_by_ratio(
+            recenter_pad_total, strip_top, strip_bottom
+        )
+        recenter_enabled = recenter_pad_total > 0
 
         stem = in_path.stem
         tmp_pre = temp_dir / f"{stem}__pre_{pw}x{ph}.mp4"
@@ -482,7 +519,8 @@ def run(
         print(
             f"[RUN ] {i}/{total} {in_path.name} -> {out_final.name} "
             f"(orig {orig_w}x{orig_h} | half {cw}x{ch} | pad {pw}x{ph} "
-            f"| pad_xy={pad_x},{pad_y} | padded={padded})"
+            f"| strip_tb={strip_top},{strip_bottom} | pad_xy={pad_x},{pad_y} "
+            f"| recenter={'yes' if recenter_enabled else 'no'} | padded={padded})"
         )
         t0 = time.perf_counter()
 
@@ -500,6 +538,8 @@ def run(
                 ph,
                 pad_x,
                 pad_y,
+                src_crop_top=strip_top,
+                src_crop_bottom=strip_bottom,
                 ffmpeg_codec=ffmpeg_codec,
                 ffmpeg_crf=int(ffmpeg_crf),
                 ffmpeg_preset=ffmpeg_preset,
@@ -538,8 +578,11 @@ def run(
                 ch,
                 pad_x,
                 pad_y,
-                orig_w,
-                orig_h,
+                post_scale_w,
+                post_scale_h,
+                recenter_w=(recenter_w if recenter_enabled else 0),
+                recenter_h=(recenter_h if recenter_enabled else 0),
+                recenter_pad_top=(recenter_pad_top if recenter_enabled else 0),
                 final_upscale=bool(final_upscale),
                 padded=bool(padded),
                 ffmpeg_codec=ffmpeg_codec,
@@ -604,16 +647,6 @@ def run(
                 except Exception:
                     pass
 
-            if move_failed:
-                try:
-                    dst = failed_dir / in_path.name
-                    if dst.exists():
-                        dst = failed_dir / f"{in_path.stem}__{int(time.time())}{in_path.suffix}"
-                    shutil.move(str(in_path), str(dst))
-                    print(f"[MOVE] moved failed input -> {dst}")
-                except Exception as me:
-                    print(f"[WARN] could not move failed input: {me}")
-
             traceback.print_exc()
 
             # CRITICAL: hard reset after a failed file to avoid cascade failures
@@ -632,13 +665,26 @@ def run(
     print("-----")
     print(f"[DONE] ok={ok} skipped={skipped} failed={failed} total={total}")
     print(f"[DIR ] output_dir={output_dir_p}")
-    if move_failed:
-        print(f"[DIR ] failed_dir={failed_dir}")
     print(f"[DIR ] temp_dir={temp_dir} (kept={keep_temps})")
 
 
 def _bool(s: str) -> bool:
     return str(s).lower() in ("1", "true", "yes", "y", "on")
+
+
+def _split_by_ratio(total: int, top_ref: int, bottom_ref: int) -> tuple[int, int]:
+    total_i = max(0, int(total))
+    if total_i <= 0:
+        return 0, 0
+    top_i = max(0, int(top_ref))
+    bot_i = max(0, int(bottom_ref))
+    den = top_i + bot_i
+    if den <= 0:
+        top = total_i // 2
+    else:
+        top = int(round((total_i * float(top_i)) / float(den)))
+    top = max(0, min(total_i, top))
+    return top, total_i - top
 
 
 def main():
@@ -675,8 +721,6 @@ def main():
 
     ap.add_argument("--retry_sequential", type=_bool, default=False)
     ap.add_argument("--retry_decode_chunk_size_1", type=_bool, default=False)
-    ap.add_argument("--move_failed", type=_bool, default=True)
-    ap.add_argument("--failed_subdir", default="failed")
     ap.add_argument("--remove_partial_output", type=_bool, default=True)
     ap.add_argument("--restart_every", type=int, default=0)
     ap.add_argument("--keep_temps", type=_bool, default=False)
@@ -684,6 +728,8 @@ def main():
     # NEW: final upscale on/off (default True keeps current behavior)
     ap.add_argument("--final_upscale", type=_bool, default=True)
     ap.add_argument("--pad_align_bottom", type=_bool, default=True)
+    ap.add_argument("--scene_strip_pad_top", type=int, default=0)
+    ap.add_argument("--scene_strip_pad_bottom", type=int, default=0)
 
     # Optional ffmpeg overrides (empty/-1 keeps legacy behavior).
     ap.add_argument("--ffmpeg_codec", default="")

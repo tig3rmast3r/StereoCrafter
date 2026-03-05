@@ -43,9 +43,7 @@ ENABLE_POST_INPAINTING_BLEND="${ENABLE_POST_INPAINTING_BLEND:-0}"        # 1 to 
 DISABLE_COLOR_TRANSFER="${DISABLE_COLOR_TRANSFER:-1}"                     # 1 to disable
 
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
-MOVE_FAILED="${MOVE_FAILED:-1}"
 MOVE_FINISHED="${MOVE_FINISHED:-0}"
-FAILED_SUBDIR="${FAILED_SUBDIR:-failed}"
 FINISHED_SUBDIR="${FINISHED_SUBDIR:-finished}"
 
 DISABLE_DYNAMIC_CHUNK="${DISABLE_DYNAMIC_CHUNK:-1}"
@@ -79,7 +77,6 @@ CMD+=(--output_dir "$OUTPUT_DIR"
      --mask_dilate_kernel_size "$MASK_DILATE_KERNEL_SIZE"
      --mask_blur_kernel_size "$MASK_BLUR_KERNEL_SIZE"
      --fixed_steps "$FIXED_STEPS"
-     --failed_subdir "$FAILED_SUBDIR"
      --finished_subdir "$FINISHED_SUBDIR"
 )
 
@@ -99,7 +96,6 @@ if [[ -n "$OUTPUT_PRESET" ]]; then CMD+=(--output_preset "$OUTPUT_PRESET"); fi
 if [[ -n "$OUTPUT_PIX_FMT" ]]; then CMD+=(--output_pix_fmt "$OUTPUT_PIX_FMT"); fi
 if [[ -n "$OUTPUT_EXTRA_ARGS" ]]; then CMD+=(--output_extra_args "$OUTPUT_EXTRA_ARGS"); fi
 if [[ "$SKIP_EXISTING" == "1" ]]; then CMD+=(--skip_existing); fi
-if [[ "$MOVE_FAILED" == "1" ]]; then CMD+=(--move_failed); fi
 if [[ "$MOVE_FINISHED" == "1" ]]; then CMD+=(--move_finished); fi
 if [[ "$DEBUG" == "1" ]]; then CMD+=(--debug); fi
 if [[ "$DISABLE_DYNAMIC_CHUNK" == "1" ]]; then CMD+=(--no_dynamic_chunk); fi
@@ -164,22 +160,27 @@ _latest_output_token() {
     | head -n1
 }
 
+_pgid_has_members() {
+  local pgid="$1"
+  [[ -n "$pgid" ]] || return 1
+  ps -o pid= -g "$pgid" 2>/dev/null | awk 'NF{found=1; exit} END{exit found?0:1}'
+}
+
 _kill_child_group() {
   local pid="$1"
   local pgid="$2"
 
   if [[ -n "$pgid" ]]; then
     kill -TERM -- "-$pgid" 2>/dev/null || true
-  else
-    kill -TERM "$pid" 2>/dev/null || true
   fi
+  kill -TERM "$pid" 2>/dev/null || true
 
   sleep "$WATCHDOG_TERM_GRACE_SEC"
 
+  if [[ -n "$pgid" ]] && _pgid_has_members "$pgid"; then
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+  fi
   if kill -0 "$pid" 2>/dev/null; then
-    if [[ -n "$pgid" ]]; then
-      kill -KILL -- "-$pgid" 2>/dev/null || true
-    fi
     kill -KILL "$pid" 2>/dev/null || true
   fi
 }
@@ -205,7 +206,7 @@ _request_stop_signal() {
 trap _request_stop_signal INT TERM
 
 _run_once_with_watchdog() {
-  local child_pid child_pgid
+  local child_pid child_pgid self_pgid
   local last_token current_token
   local last_activity_ts now idle_sec
 
@@ -216,6 +217,11 @@ _run_once_with_watchdog() {
   fi
   child_pid=$!
   child_pgid="$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d '[:space:]')"
+  self_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d '[:space:]')"
+  if [[ -n "$child_pgid" && -n "$self_pgid" && "$child_pgid" == "$self_pgid" ]]; then
+    # If setsid is unavailable and child shares our PGID, avoid group-kill on our own shell group.
+    child_pgid=""
+  fi
   CURRENT_CHILD_PID="$child_pid"
   CURRENT_CHILD_PGID="$child_pgid"
 

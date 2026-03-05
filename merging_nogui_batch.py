@@ -6,7 +6,7 @@ Headless batch runner for StereoCrafter merging step (no Tk GUI).
 - Pipes frames to ffmpeg via start_ffmpeg_pipe_process (same as merging_gui).
 - Skip-if-exists (default ON)
 - Retry (default 1 => at most 2 attempts total)
-- Optional move inputs to finished/failed (default OFF)
+- Optional move inputs to finished (default OFF)
 - Cleans up partial outputs on failure
 
 Designed to be driven by an outer .sh that sets directories and adds extra crash-handling.
@@ -143,7 +143,6 @@ DEFAULTS: Dict[str, object] = {
     # Robustness / workflow
     "retries": 1,
     "move_finished": False,
-    "move_failed": False,
     "cleanup_partial_outputs": True,
     # FFmpeg output overrides (empty = keep auto behavior)
     "ffmpeg_codec": "",
@@ -2690,7 +2689,6 @@ def main() -> int:
     ap.add_argument("--replace-mask-folder", required=True)
     ap.add_argument("--preprocessed-mask-folder", required=True)
     ap.add_argument("--move-finished", action="store_true", default=None)
-    ap.add_argument("--move-failed", action="store_true", default=None)
     ap.add_argument("--no-cleanup-partials", action="store_true", default=False)
 
     args = ap.parse_args()
@@ -2786,8 +2784,6 @@ def main() -> int:
 
     if args.move_finished is True:
         settings["move_finished"] = True
-    if args.move_failed is True:
-        settings["move_failed"] = True
 
     if args.no_cleanup_partials is True:
         settings["cleanup_partial_outputs"] = False
@@ -2817,13 +2813,9 @@ def main() -> int:
 
     LOG.info(f"Jobs: {len(pairs)}")
     finished_root = os.path.join(args.inpainted_folder, "finished")
-    failed_root = os.path.join(args.inpainted_folder, "failed")
     splat_finished_root = os.path.join(args.splatted_folder, "finished")
-    splat_failed_root = os.path.join(args.splatted_folder, "failed")
     orig_finished_root = os.path.join(args.original_folder, "finished")
-    orig_failed_root = os.path.join(args.original_folder, "failed")
     rm_finished_root = os.path.join(str(settings.get("replace_mask_folder") or args.splatted_folder), "finished")
-    rm_failed_root = os.path.join(str(settings.get("replace_mask_folder") or args.splatted_folder), "failed")
 
     for (inpainted_path, splatted_path) in pairs:
         if _stop_marker_exists(stop_marker_path):
@@ -2931,12 +2923,6 @@ def main() -> int:
                     )
                     if inferred_output_path:
                         cleanup_partial_output_files(inferred_output_path)
-
-            if bool(settings.get("move_failed", False)):
-                move_file(inpainted_path, failed_root)
-                core_with_width, _ = parse_inpainted_name(base)
-                # Move matching splatted too if present
-                move_file(splatted_path, splat_failed_root)
 
     if _stop_marker_exists(stop_marker_path):
         LOG.info(f"[STOP] marker still present at end of batch: {stop_marker_path}")

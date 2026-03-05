@@ -230,7 +230,7 @@ class SplatterGUI(ThemedTk):
         self.app_config = {}
         self.help_texts = {}
         self.sidecar_manager = SidecarConfigManager()
-        self.convergence_estimator = ConvergenceEstimatorWrapper()
+        self.convergence_estimator = ConvergenceEstimatorWrapper(load_model=False)
         self.border_scanner = BorderScanner(gui_context=self)
         # Cache: estimated per-clip max Total(D+P) keyed by signature
         self._dp_total_est_cache = {}

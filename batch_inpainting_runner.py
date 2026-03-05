@@ -130,26 +130,50 @@ def _run_cmd(cmd):
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
 
 
-def _ffprobe_nb_frames(path: str) -> int:
+def _ffprobe_nb_packets(path: str) -> int:
     """
-    Return an accurate decoded frame count for the first video stream.
-    This is used to detect truncated outputs (files that look valid but are incomplete).
+    Return packet count for the first video stream.
+    We use count_packets (faster than full decode count_frames) to validate skip/restart outputs.
     """
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
-        "-count_frames",
-        "-show_entries", "stream=nb_read_frames",
+        "-count_packets",
+        "-show_entries", "stream=nb_read_packets",
         "-of", "default=nw=1:nk=1",
         path,
     ]
     rc, out, err = _run_cmd(cmd)
     if rc != 0:
         raise RuntimeError(f"ffprobe failed rc={rc}: {err}")
-    try:
-        return int(out.splitlines()[0].strip())
-    except Exception as e:
-        raise RuntimeError(f"ffprobe returned invalid nb_read_frames: {out!r}") from e
+
+    for line in (out or "").splitlines():
+        s = line.strip()
+        if not s or s.upper() == "N/A":
+            continue
+        try:
+            return int(float(s))
+        except Exception:
+            continue
+    raise RuntimeError(f"ffprobe returned invalid nb_read_packets: {out!r}")
+
+
+def _find_replace_mask_for_input(input_path: str, replace_mask_folder: str) -> str:
+    stem = os.path.splitext(os.path.basename(input_path))[0]
+    mask_dir = os.path.abspath(replace_mask_folder) if replace_mask_folder else os.path.dirname(os.path.abspath(input_path))
+    hits = sorted(glob.glob(os.path.join(mask_dir, f"{stem}_replace_mask.*")))
+    return hits[0] if hits else ""
+
+
+def _resolve_validation_reference(input_path: str, replace_mask_folder: str) -> tuple[str, str]:
+    """
+    Prefer replace-mask as reference (fast count_packets); fallback to input video.
+    Returns (reference_path, reference_kind).
+    """
+    mask_path = _find_replace_mask_for_input(input_path, replace_mask_folder)
+    if mask_path and os.path.exists(mask_path):
+        return mask_path, "replace_mask"
+    return input_path, "input"
 
 
 def _cleanup_outputs(out_path: str) -> None:
@@ -235,7 +259,7 @@ def _recover_interrupted_current_job(current_job_path: str):
 
         # Input missing: fallback to basic readability probe.
         try:
-            _ffprobe_nb_frames(output_path)
+            _ffprobe_nb_packets(output_path)
             print(f"[RECOVER] input missing for interrupted job; output decodes, keeping: {output_path}")
         except Exception:
             print(f"[RECOVER] interrupted job output unreadable, deleting: {output_path}")
@@ -267,21 +291,28 @@ def _clear_stop_marker(path: str) -> None:
         pass
 
 
-def _is_output_complete(input_path: str, output_path: str, process_length: int, tol_frames: int = 1) -> bool:
+def _is_output_complete(
+    input_path: str,
+    output_path: str,
+    process_length: int,
+    replace_mask_path: str = "",
+    tol_packets: int = 1,
+) -> bool:
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         return False
     try:
-        in_frames = _ffprobe_nb_frames(input_path)
-        out_frames = _ffprobe_nb_frames(output_path)
-        expected = in_frames
+        ref_path = replace_mask_path if (replace_mask_path and os.path.exists(replace_mask_path)) else input_path
+        ref_packets = _ffprobe_nb_packets(ref_path)
+        out_packets = _ffprobe_nb_packets(output_path)
+        expected = ref_packets
         if process_length is not None:
             try:
                 pl = int(process_length)
             except Exception:
                 pl = -1
             if pl and pl > 0:
-                expected = min(in_frames, pl)
-        return out_frames >= max(0, expected - int(tol_frames))
+                expected = min(ref_packets, pl)
+        return out_packets >= max(0, expected - int(tol_packets))
     except Exception:
         return False
 
@@ -509,6 +540,8 @@ def run_batch(args):
         out_path = ""
         hi_res_input_path = None
         current_job_marked = False
+        validation_ref_path = video_path
+        validation_ref_kind = "input"
 
         try:
             # Ensure GUI vars are consistent for hi-res matching safety checks
@@ -526,20 +559,26 @@ def run_batch(args):
             name_wo_ext = os.path.splitext(base)[0]
             input_layout = runner._infer_input_layout_from_stem(name_wo_ext)
             out_path, _hires = runner._setup_video_info_and_hires(video_path, args.output_dir, input_layout)
+            validation_ref_path, validation_ref_kind = _resolve_validation_reference(
+                video_path,
+                args.replace_mask_folder,
+            )
 
             if args.skip_existing and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                # Fast skip (legacy behavior). Only the resume-boundary file is strictly validated.
-                if fast_resume_start is not None and i == fast_resume_start:
-                    if _is_output_complete(video_path, out_path, args.process_length):
-                        print(f"[SKIP] exists: {out_path}")
+                # Strict skip: validate readability + packet length parity before skipping.
+                if _is_output_complete(
+                    video_path,
+                    out_path,
+                    args.process_length,
+                    replace_mask_path=validation_ref_path if validation_ref_kind == "replace_mask" else "",
+                ):
+                    print(f"[SKIP] exists+valid ({validation_ref_kind}): {out_path}")
+                    if fast_resume_start is not None and i >= fast_resume_start:
                         fast_resume_start = None
                         _clear_resume_state(resume_path)
-                        continue
-                    print(f"[WARN] existing output looks incomplete, deleting: {out_path}")
-                    _cleanup_outputs(out_path)
-                else:
-                    print(f"[SKIP] exists: {out_path}")
                     continue
+                print(f"[WARN] existing output invalid vs {validation_ref_kind}; deleting: {out_path}")
+                _cleanup_outputs(out_path)
 
                         # Determine inference steps:
             # - If sharpness.csv is enabled and has a row for this basename, derive steps from it.
@@ -630,7 +669,12 @@ def run_batch(args):
             )
 
 
-            if completed and _is_output_complete(video_path, out_path, args.process_length):
+            if completed and _is_output_complete(
+                video_path,
+                out_path,
+                args.process_length,
+                replace_mask_path=validation_ref_path if validation_ref_kind == "replace_mask" else "",
+            ):
                 if current_job_marked:
                     _clear_current_job_state(current_job_path)
                     current_job_marked = False
@@ -661,8 +705,6 @@ def run_batch(args):
                 if current_job_marked:
                     _clear_current_job_state(current_job_path)
                     current_job_marked = False
-                if args.move_failed:
-                    _move_to_subfolder(video_path, args.failed_subdir)
 
         except torch.OutOfMemoryError as e:
             print(f"[OOM] {e}")
@@ -670,8 +712,6 @@ def run_batch(args):
             if current_job_marked:
                 _clear_current_job_state(current_job_path)
                 current_job_marked = False
-            if args.move_failed:
-                _move_to_subfolder(video_path, args.failed_subdir)
             _safe_release_cuda()
             continue
         except Exception as e:
@@ -680,11 +720,13 @@ def run_batch(args):
             if current_job_marked:
                 _clear_current_job_state(current_job_path)
                 current_job_marked = False
-            if args.move_failed:
-                _move_to_subfolder(video_path, args.failed_subdir)
             _safe_release_cuda()
             continue
         finally:
+            try:
+                igs._cleanup_ffmpeg_writers()
+            except Exception:
+                pass
             # keep VRAM stable between files
             _safe_release_cuda()
 
@@ -746,9 +788,7 @@ def main():
     p.add_argument("--disable_color_transfer", action="store_true")
 
     p.add_argument("--skip_existing", action="store_true")
-    p.add_argument("--move_failed", action="store_true")
     p.add_argument("--move_finished", action="store_true")
-    p.add_argument("--failed_subdir", type=str, default="failed")
     p.add_argument("--finished_subdir", type=str, default="finished")
 
     p.add_argument("--debug", action="store_true", help="Enable debug image saving (uses GUI code)")

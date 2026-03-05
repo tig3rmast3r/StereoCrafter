@@ -3,6 +3,7 @@ import glob
 import json
 import shutil
 import threading
+import atexit
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, Toplevel, Label
 from ttkthemes import ThemedTk
@@ -32,6 +33,19 @@ from pipelines.stereo_video_inpainting import (
 )
 
 GUI_VERSION = "26-01-13.0"
+
+_ACTIVE_FFMPEG_WRITERS: set[subprocess.Popen] = set()
+_ACTIVE_FFMPEG_LOCK = threading.Lock()
+
+
+def _register_ffmpeg_writer(p: subprocess.Popen) -> None:
+    with _ACTIVE_FFMPEG_LOCK:
+        _ACTIVE_FFMPEG_WRITERS.add(p)
+
+
+def _unregister_ffmpeg_writer(p: subprocess.Popen) -> None:
+    with _ACTIVE_FFMPEG_LOCK:
+        _ACTIVE_FFMPEG_WRITERS.discard(p)
 
 # === STREAM ENCODING HELPERS ===
 def _start_ffmpeg_rawvideo_writer(
@@ -70,7 +84,9 @@ def _start_ffmpeg_rawvideo_writer(
         except Exception as ex:
             logger.warning(f"Invalid streaming ffmpeg extra args ignored: {ex}")
     cmd.append(output_path)
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    _register_ffmpeg_writer(p)
+    return p
 
 def _write_rgb_frame(p: subprocess.Popen, frame_rgb_u8: np.ndarray) -> None:
     """Write a single HxWx3 uint8 RGB frame to ffmpeg stdin."""
@@ -84,7 +100,62 @@ def _close_ffmpeg_writer(p: subprocess.Popen) -> int:
         if p.stdin:
             p.stdin.close()
     finally:
-        return p.wait()
+        rc = p.wait()
+        _unregister_ffmpeg_writer(p)
+        return rc
+
+
+def _force_close_ffmpeg_writer(p: subprocess.Popen, grace_sec: float = 2.0) -> None:
+    """Best-effort cleanup for streaming ffmpeg writer on early return/error."""
+    try:
+        try:
+            if p.stdin:
+                try:
+                    p.stdin.close()
+                except Exception:
+                    pass
+            p.wait(timeout=grace_sec)
+            return
+        except Exception:
+            pass
+
+        try:
+            p.terminate()
+        except Exception:
+            pass
+        try:
+            p.wait(timeout=grace_sec)
+            return
+        except Exception:
+            pass
+
+        try:
+            p.kill()
+        except Exception:
+            pass
+        try:
+            p.wait(timeout=grace_sec)
+        except Exception:
+            pass
+    finally:
+        _unregister_ffmpeg_writer(p)
+
+
+def _cleanup_ffmpeg_writers() -> None:
+    """Close any leaked ffmpeg streaming writers still alive in this process."""
+    with _ACTIVE_FFMPEG_LOCK:
+        procs = list(_ACTIVE_FFMPEG_WRITERS)
+    for p in procs:
+        try:
+            if p.poll() is None:
+                _force_close_ffmpeg_writer(p)
+            else:
+                _unregister_ffmpeg_writer(p)
+        except Exception:
+            _unregister_ffmpeg_writer(p)
+
+
+atexit.register(_cleanup_ffmpeg_writers)
 
 
 # torch.backends.cudnn.benchmark = True

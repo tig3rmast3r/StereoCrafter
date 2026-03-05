@@ -23,6 +23,8 @@ DEBUG_MEM="${DEBUG_MEM:-True}"
 FINAL_UPSCALE="${FINAL_UPSCALE:-False}"
 RESTART_EVERY="${RESTART_EVERY:-100}"
 PAD_ALIGN_BOTTOM="${PAD_ALIGN_BOTTOM:-True}"
+SCENE_STRIP_PAD_TOP="${SCENE_STRIP_PAD_TOP:-0}"
+SCENE_STRIP_PAD_BOTTOM="${SCENE_STRIP_PAD_BOTTOM:-0}"
 
 # Optional ffmpeg overrides (leave empty/default to keep legacy behavior)
 FFMPEG_CODEC="${FFMPEG_CODEC:-}"
@@ -87,6 +89,8 @@ CMD=(
   --final_upscale "$FINAL_UPSCALE"
   --restart_every "$RESTART_EVERY"
   --pad_align_bottom "$PAD_ALIGN_BOTTOM"
+  --scene_strip_pad_top "$SCENE_STRIP_PAD_TOP"
+  --scene_strip_pad_bottom "$SCENE_STRIP_PAD_BOTTOM"
 )
 
 if [[ -n "${FFMPEG_CODEC// }" ]]; then
