@@ -1,158 +1,28 @@
 # Fork Info
 
-- added sh + runners for headless batches (mainly for docker usage and handling errors/skip)
-- Depthcrafter script memory usage optimization (will allow larger files before OOM)
-- Headless rebuild script for Depthcrafter (same options but no gui)
-- Splatting improvement, blur for left borders + pixel perfect binary mask (only 1 extra pixel on left edges)
-- Multithreaded Sharpness Analyzer Script - will analyze splat and predict sharpness inside the masked (inpaint) area (to be used relatively with inpaint steps)
-- Inpaint with optional binary mask and dynamic step selector based on sharpness.csv + Stream behaviour (will allow much longer files)
-- Tail for chunks and at file end during inpaint (extra frames that will be discarted to minimize color jumps between chunks and on the last frame) 
-- New configurable Color Transfer on merging_gui with 8 curated presets
-- New auto Color Transfer evaluation on the fly (best preset for each frame _TESTING_)
-- Merging_gui option to use the new binary mask + single process button
-- Directional shadow mask on merging_gui to fade right borders correctly
-- Headless rebuild scripts for merging with parallel support (same options but no gui)
-- Multithreaded RealESRGAN upscale script
-- Rejoin segments ps1 script (ffmpeg)
-- Added modified Forward-Warp cuda submodule, compatible with latest pytorch (need build)
-- Quick setup scripts (stage1 + stage2 for weights) for vast.ai docker with 5090 for the inpaint step (tested using vastai/pytorch:2.9.1-cuda-12.8.1-py310-24.04, tested only inpaint runner for now)
+This fork is tested only with Linux (ubuntu 22.04 and 24.04 in my case) <br>
+Aim to this Fork is to create a full sbs 1080p 3d content as result with a one-click solution but keeping ways to customize it.<br>
+Supports only 8 bit format (inpainting is 8 bit anyway so it's actually impossible to get 10 bit hdr end to end) with the following pix formats yuv420p, yuv422p and yuv444p (latest 2 can be achieved downscaling from 4k, no chroma upscaling)<br>
+All runner scripts are tuned for intel 265k, 48GB ram and RTX 4090<br>
+Most of the job is done by VIBE CODING using VS code + Codex 5.3/5.4<br>
+All the extra scripts are made multithreading/parallel when possible, helping reducing time (but is still a very very slow process)
 
-THIS FORK IS STILL WIP IT WILL CHANGE A LOT OVERTIME<br>
-Objectives:<br>
-- Single gui panel from start to finish without user action + resume
-- Set up a curated preset for all steps that should work with most contents
-- Optional local run up to splatting + vast.ai inpaint + final local merge
+## Install (linux only)
 
-## Fork workflow example (1080p)
+[Install Linux guide](install_linux_readme.md)
 
-NOTE: always check files after each step
-```bash
-find ./work/***folder*** -maxdepth 1 -type f -name '*.mp4' -print0 | xargs -0 -n1 -P"$(nproc)" sh -c 'ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,avg_frame_rate,nb_frames -show_entries format=duration -of default=nw=1:nk=1 "$1" >/dev/null || echo "BROKEN: $1"' _
-```
-NOTE2: this is a very long task, consider ~1 hour for 1 minute with an RTX 5090
-
-### Step 1- SceneDetect
-
-Pick your source.mkv and divide by scenes using SceneDetect (not included), use same pass to crop bars if needed
-```
-IN="./work/source.mkv"
-OUT_SCENES="./work/seg/"
-```
-for full 1080p (no black bars)
-```
-scenedetect -i "$IN" detect-adaptive -t 2.0 split-video -o "$OUT_SCENES" -a "-map 0:v:0 -an -dn -sn -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p"
-```
-1080p IMAX -> 1024
-```
-scenedetect -i "$IN" detect-adaptive -t 2.0 split-video -o "$OUT_SCENES" -a "-map 0:v:0 -an -dn -sn -vf crop=iw:1024:0:trunc(((ih-1024)/2)/2)*2 -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p"
-```
-1080p standard -> 832
-```
-scenedetect -i "$IN" detect-adaptive -t 2.0 split-video -o "$OUT_SCENES" -a "-map 0:v:0 -an -dn -sn -vf crop=iw:832:0:trunc((ih-832)/4)*2 -c:v libx264 -crf 0 -preset veryfast -pix_fmt yuv420p"
-```
-ADDITIONAL NOTE: best option is to remove completely up/bottom bars, this will ensure higher chances for the right/left borders to be inpainted.<br>
-for the standard 16:9 letterbox option is usually better to sacrifice a couple of top and bottom rows and use 1920x800 instead of 1920x832.<br>
-will update commands when i'm fine with that.
-
-### Step 2 - DepthCrafter
-
-just run
-```bash
-chmod +x run_depthcrafter_runner.sh
-./run_depthcrafter_runner.sh
-```
-If your work folder is ./work you don't need to do anything else.<br>
-It will output depthmap at exactly half size.
-
-### Step 3 - Upscale Depthmaps
-
-i use Real ESRGAN (not included) for upscaling, it will help a lot with precision compared to other upscales.<br>
-5th arg is tile size, i suggest vertical resolution as tile size (faster).<br>
-it will launch 4 batches in parallel (can be changed by args or inside the script).
-```
-./upscale_esrgan.sh "./work/depthmap" "./work/depthmap/upscaled" 2 realesr-animevideov3-x2 416
-```
-
-### Step 4 - Splatting
-
-just run with default values
-```bash
-chmod +x run_splatting_bm_runner.sh
-./run_splatting_bm_runner.sh
-```
-or play with splatting_bm_gui.py to find your own and then change options inside sh and runner accordingly.<br>
-this bm_gui version will have optional blur on left edges and optional extra binary mask to be used with merging_gui and mask analyze, saved in ./work/mask.
-
-### Step 5 - Analyze mask sharpness
-
-```
-python analyze_inpaint_sharpness_newmask.py "./work/splat/hires" "./work/mask" --out_csv "./work/sharpness.csv"
-```
-Will predict masked zone sharpness and save to csv.
-
-### Running inpaint on vast.ai
-
-Get an rtx5090 server with at least 48Gb ram and some disk space (i usually get 100GB but i cleanup overtime)<br>
-in terminal and workspace folder run:
-```
-git clone https://github.com/tig3rmast3r/StereoCrafter --recursive
-cd StereoCrafter
-chmod +x setup_vast_stage1.sh
-./setup_vast_stage1.sh
-```
-for weights (you need HF token with this method)
-
-```
-chmod +x setup_vast_stage2_weights.sh
-./setup_vast_stage2_weights.sh
-```
-insert token and say yes when asks to add to git credentials
-make a work folder inside StereoCrafter and upload your files, sharpness.csv into work/binarymasks into work/mask/ and splatted2 files into work/splat/, inpaint runner is configured already for those paths, just run step 6<br>
-only thing to configure is chunk size (run_inpaint_runner.sh line 16) depending on your vids resolution, usually 80 is fine. May be lower for full res 1920x1080 (no crop)<br>
-Default is 50 that is for RTX4090<br>
-Vids length is not a problem cause i've implemented full stream so it will read only what it needs for that chunk.
-
-### Step 6 - Inpaint
-
-just run and wait (a lot).<br>
-for 24GB VRAM (RTX4090) i suggest tile 2, frame chunk size up to 50.<br>
-for 32GB VRAM (RTX5090) same tile 2 but you can push up to 80 chunk size.<br>
-default option on runner is with Color Transfer disabled (it will be done better during the merging and you do not have to re-inpaint to change it).<br>
-Inpainting runner uses binary ReplaceMask as default.
-```bash
-chmod +x run_inpainting_runner.sh
-./run_inpainting_runner.sh
-```
-
-### Step 7 - Merge inpaint
-
-run or change settings using gui preview and apply on the runner script.<br>
-There is a new Color Transfer panel with 8 curated presetrs to choose from, sliders are usually fine at default.<br>
-You can enable auto CT evaluation, it works quite well but i'm still testing eventual flickerings due to repeated preset changes, it will incrase merging time a lot, you can use the "parallel" nogui script to recover some time, suggested workers are 2 for 48Gb RAM and rtx 4090 or 3 for 64Gb RAM and RTX 5090.<br>
-Runner uses Binary ReplaceMask as default option.<br>
+## Usage
 
 ```bash
-chmod +x run_merging_runner.sh
-./run_merging_runner.sh
+python pipeline_master_gui.py
 ```
+just run scenedetect TAB manually and Verify(quick) then try a test run on the last tab, it will pick the first 10 unfinished clips and do all the steps, if everything went well press the run/resume button and go on vacation, when you are back it should have finished :)<br>
+<br>
+VERY IMPORTANT: most of the crashes/errors i'm getting are because of unstable ffmpeg, in my case h264_nvenc is much more stable, i switch to x264 only for the inpainting job to keep vram usage as low as possible.
 
-### Step 8 - Merge Scenes and Compress
+## More info and fork changelog
 
-I merge in Windows with ffmpeg hevc nvenc.
-
-```
-Rejoin_HEVC_NVENC.ps1
-```
-
-### Step 9 - Remux other Streams (audio,subs,etc..)
-
-use mkvtoolnix to remux (i use gui version in Windows).
-
-#### Dependencies (not included)
--RealESRGAN<br>
--ffmpeg<br>
--Scenedetect<br>
--MKVToolNix
+[Fork changelog](assets/Fork_change_log.md)
 
 # StereoCrafter GUI + DepthCrafter GUI Seg
 
