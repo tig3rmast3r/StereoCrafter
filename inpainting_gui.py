@@ -64,7 +64,7 @@ def _start_ffmpeg_rawvideo_writer(
     out_codec = (codec or "libx264").strip()
     out_preset = (preset or "veryfast").strip()
     out_pix_fmt = (pix_fmt or "yuv420p").strip()
-    quality_flag = "-cq" if "nvenc" in out_codec.lower() else "-crf"
+    quality_flag = "-qp" if "nvenc" in out_codec.lower() else "-crf"
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -1814,7 +1814,7 @@ class InpaintingGUI(ThemedTk):
         current_row += 1
 
         # Row 3: Output CRF (Left) & Process Length (Right)
-        output_crf_label = ttk.Label(param_frame, text="Output CRF:")
+        output_crf_label = ttk.Label(param_frame, text="Output Quality (CRF/QP):")
         output_crf_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(output_crf_label, self.help_data.get("output_crf", ""))
         ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)

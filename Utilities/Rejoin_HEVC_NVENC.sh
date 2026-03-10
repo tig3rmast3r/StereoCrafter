@@ -14,7 +14,7 @@ CQ="${CQ:-16}"
 CRF="${CRF:-16}"
 PIX_FMT="${PIX_FMT:-yuv420p}"
 EXTRA_ARGS="${EXTRA_ARGS:--rc vbr -b:v 0 -multipass fullres -spatial_aq 1 -temporal_aq 1 -aq-strength 12 -rc-lookahead 32 -bf 3}"
-VF="${VF:-pad=iw:1080:0:(1080-ih)/2:black}"
+VF="${VF:-pad=iw:max(ih\,1080):0:(max(ih\,1080)-ih)/2:black,crop=iw:1080:0:(ih-1080)/2}"
 
 if [[ -z "$QUALITY_VALUE" ]]; then
   if [[ "$QUALITY_FLAG" == "cq" ]]; then

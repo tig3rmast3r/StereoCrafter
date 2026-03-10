@@ -63,7 +63,7 @@ DUAL_OUTPUT = True      # legacy fallback if OUTPUT_LAYOUT is invalid
 ENABLE_GLOBAL_NORM = False
 MATCH_DEPTH_RES = True
 
-# Output encode CRF (separate hi/lo)
+# Output encode quality value (CRF for libx, QP for NVENC)
 OUTPUT_CRF_FULL = 1
 OUTPUT_CRF_LOW  = 23
 FFMPEG_CODEC = ""
@@ -230,7 +230,7 @@ def _parse_args():
     )
     p.add_argument("--replace_mask_codec", default=REPLACE_MASK_CODEC, help="Replace-mask codec.")
     p.add_argument("--ffmpeg_codec", default=FFMPEG_CODEC, help="Force output codec (optional).")
-    p.add_argument("--ffmpeg_crf", type=int, default=FFMPEG_CRF, help="CRF/CQ for splat output.")
+    p.add_argument("--ffmpeg_crf", type=int, default=FFMPEG_CRF, help="Quality value for splat output (CRF for libx, QP for NVENC).")
     p.add_argument("--ffmpeg_preset", default=FFMPEG_PRESET, help="Reserved (not used by runner yet).")
     p.add_argument("--ffmpeg_pix_fmt", default=FFMPEG_PIX_FMT, help="Reserved (not used by runner yet).")
     p.add_argument("--ffmpeg_extra_args", default=FFMPEG_EXTRA_ARGS, help="Reserved (not used by runner yet).")

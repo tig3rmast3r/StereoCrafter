@@ -18,21 +18,28 @@ import csv
 import gc
 import multiprocessing as mp
 import os
-import queue as queue_mod
 import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
 from decord import VideoReader, cpu  # type: ignore
 
+# Allow direct execution via `python Utilities/analyze_auto_ct_csv.py`.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from merging_nogui_batch import (
     _select_best_auto_ct_preset_frame,
     collect_jobs,
     find_replace_mask_for_splatted,
     find_video_by_core_name,
+    infer_splatted_layout,
     parse_core_and_width,
     parse_inpainted_name,
 )
@@ -50,12 +57,24 @@ DEFAULT_CT_SETTINGS: Dict[str, object] = {
     "ct_ring_width": 20,
 }
 
-
 def _safe_uint(v: int) -> int:
     try:
         return int(v)
     except Exception:
         return 0
+
+
+def _choose_process_start_method() -> str:
+    # Avoid fork-after-thread/manager deadlocks in long-running AutoCT batches.
+    if sys.platform == "win32":
+        return "spawn"
+    for name in ("forkserver", "spawn"):
+        try:
+            mp.get_context(name)
+            return name
+        except ValueError:
+            continue
+    return "spawn"
 
 
 def _dbg(args: argparse.Namespace, msg: str) -> None:
@@ -282,7 +301,9 @@ def _process_video_job(
         _dbg(args, f"{inpainted_name}: skip, all {n_frames} frames already in CSV")
         return []
 
-    is_dual_input = "_splatted2" in os.path.basename(splatted_path)
+    splatted_layout = infer_splatted_layout(splatted_path)
+    is_single_input = splatted_layout == "single"
+    is_dual_input = splatted_layout == "dual"
 
     rows: List[Dict[str, object]] = []
     total_frames = len(frame_idx_all)
@@ -295,6 +316,7 @@ def _process_video_job(
         (
             f"{inpainted_name}: n_frames={n_frames}, pending={total_frames}, "
             f"chunk={sample_chunk_size}, dual={is_dual_input}, "
+            f"layout={splatted_layout}, "
             f"reload_every_chunks={reload_every_chunks}, "
             f"use_replace_mask={replace_mask_path is not None}, "
             f"already_done={len(done_frames_set)}"
@@ -360,10 +382,14 @@ def _process_video_job(
             inpainted_t = inpainted_t[:, :, :, inpainted_t.shape[3] // 2 :]
 
         _, _, h_splat, w_splat = splatted_t.shape
-        if is_dual_input:
+        if is_single_input:
+            mask_raw = torch.zeros_like(splatted_t)
+            warped_t = splatted_t
+        elif is_dual_input:
             mask_raw = splatted_t[:, :, :, : w_splat // 2]
             warped_t = splatted_t[:, :, :, w_splat // 2 :]
         else:
+            original_left_t = splatted_t[:, :, : h_splat // 2, : w_splat // 2]
             mask_raw = splatted_t[:, :, h_splat // 2 :, : w_splat // 2]
             warped_t = splatted_t[:, :, h_splat // 2 :, w_splat // 2 :]
 
@@ -489,9 +515,9 @@ def _process_video_job(
 
 
 def _process_video_job_mp(
-    payload: Tuple[str, str, Set[int], argparse.Namespace, Optional[Any]]
+    payload: Tuple[str, str, Set[int], argparse.Namespace]
 ) -> Tuple[str, Optional[List[Dict[str, object]]], Optional[str]]:
-    inpainted_path, splatted_path, done_frames, args, progress_queue = payload
+    inpainted_path, splatted_path, done_frames, args = payload
     name = os.path.basename(inpainted_path)
     try:
         rows = _process_video_job(
@@ -499,45 +525,12 @@ def _process_video_job_mp(
             splatted_path=splatted_path,
             done_frames=done_frames,
             progress=None,
-            progress_queue=progress_queue,
+            progress_queue=None,
             args=args,
         )
         return name, rows, None
     except Exception as e:
         return name, None, str(e)
-
-
-def _progress_queue_consumer(
-    progress: ProgressTracker,
-    q: Any,
-    stop_event: threading.Event,
-) -> None:
-    while not stop_event.is_set():
-        try:
-            n = q.get(timeout=0.5)
-        except queue_mod.Empty:
-            continue
-        except Exception:
-            continue
-        try:
-            if isinstance(n, tuple) and len(n) == 2:
-                progress.bump(n_total=int(n[0]), n_complete=int(n[1]))
-            else:
-                progress.bump(n_total=int(n), n_complete=0)
-        except Exception:
-            pass
-    while True:
-        try:
-            n = q.get_nowait()
-        except Exception:
-            break
-        try:
-            if isinstance(n, tuple) and len(n) == 2:
-                progress.bump(n_total=int(n[0]), n_complete=int(n[1]))
-            else:
-                progress.bump(n_total=int(n), n_complete=0)
-        except Exception:
-            pass
 
 
 def main() -> int:
@@ -764,21 +757,10 @@ def main() -> int:
         os.fsync(out_handle.fileno())
 
     workers = max(1, int(args.workers))
-    progress_queue: Optional[Any] = None
-    progress_stop_event: Optional[threading.Event] = None
-    progress_thread: Optional[threading.Thread] = None
-    progress_manager: Optional[Any] = None
+    process_ctx: Optional[Any] = None
 
     if args.process_per_file and workers > 1:
-        progress_stop_event = threading.Event()
-        progress_manager = mp.Manager()
-        progress_queue = progress_manager.Queue(max(2048, workers * 256))
-        progress_thread = threading.Thread(
-            target=_progress_queue_consumer,
-            args=(progress, progress_queue, progress_stop_event),
-            daemon=True,
-        )
-        progress_thread.start()
+        process_ctx = mp.get_context(_choose_process_start_method())
 
     try:
         if workers == 1:
@@ -797,20 +779,22 @@ def main() -> int:
                 if rows is not None:
                     _append_rows(rows)
         elif args.process_per_file:
-            # Hard reset of the worker chain after each file.
-            # maxtasksperchild=1 guarantees a fresh process per scene.
-            ctx = mp.get_context("fork")
+            assert process_ctx is not None
             payloads = [
                 (
                     inpainted_path,
                     splatted_path,
                     set(existing_frames_by_video.get(os.path.basename(inpainted_path), set())),
                     args,
-                    progress_queue,
                 )
                 for (inpainted_path, splatted_path) in jobs
             ]
-            with ctx.Pool(processes=workers, maxtasksperchild=1) as pool:
+            # Hard reset of the worker chain after each file.
+            # maxtasksperchild=1 guarantees a fresh process per scene.
+            with process_ctx.Pool(
+                processes=workers,
+                maxtasksperchild=1,
+            ) as pool:
                 done_count = 0
                 for name, rows, err in pool.imap_unordered(_process_video_job_mp, payloads):
                     done_count += 1
@@ -818,6 +802,14 @@ def main() -> int:
                         print(f"[WARN] worker failed for {name}: {err}")
                     if rows is not None:
                         _append_rows(rows)
+                        progress.bump(
+                            n_total=len(rows),
+                            n_complete=sum(
+                                1
+                                for row in rows
+                                if str(row.get("status", "")).strip() == "ok"
+                            ),
+                        )
                     print(f"[DONE] {done_count}/{len(jobs)} {name}")
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -849,15 +841,6 @@ def main() -> int:
                     print(f"[DONE] {done_count}/{len(jobs)} {name}")
     finally:
         out_handle.close()
-        if progress_stop_event is not None:
-            progress_stop_event.set()
-        if progress_thread is not None:
-            progress_thread.join(timeout=2.0)
-        if progress_manager is not None:
-            try:
-                progress_manager.shutdown()
-            except Exception:
-                pass
         if debug_log_handle is not None:
             debug_log_handle.flush()
             debug_log_handle.close()

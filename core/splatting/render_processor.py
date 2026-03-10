@@ -124,7 +124,7 @@ class RenderProcessor:
             global_depth_min: Global min depth used for normalization
             global_max_depth: Global max depth used for normalization
             depth_stream_info: Metadata for depth map
-            user_output_crf: FFmpeg CRF value
+            user_output_crf: Output quality value (CRF for libx, QP for NVENC)
             is_low_res_task: Whether this is a low-res pass
             depth_gamma: Gamma correction for depth
             depth_dilate_size_x: X dilation for depth

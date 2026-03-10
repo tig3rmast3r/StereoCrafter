@@ -1241,18 +1241,18 @@ def encode_frames_to_mp4(
 
     nvenc_preset = "medium"  # Default NVENC preset (e.g., fast, medium, slow, quality)
     default_nvenc_cq = (
-        "1"  # Constant Quality value for NVENC (lower is better quality)
+        "1"  # Intermediate-stage NVENC quality value (mapped to QP)
     )
 
-    # NEW: Apply user-specified CRF if provided
+    # NEW: Apply user-specified quality value if provided
     if user_output_crf is not None and user_output_crf >= 0:
-        logger.debug(f"Using user-specified output CRF: {user_output_crf}")
+        logger.debug(f"Using user-specified output quality: {user_output_crf}")
         default_cpu_crf = str(user_output_crf)
         default_nvenc_cq = str(
             user_output_crf
-        )  # Assume user CRF applies to NVENC CQ as well for simplicity
+        )  # Shared GUI quality value maps to NVENC QP for intermediates
     else:
-        logger.debug("Using auto-determined output CRF.")
+        logger.debug("Using auto-determined output quality.")
 
     is_hdr_source = False
     original_codec_name = (
@@ -1371,7 +1371,7 @@ def encode_frames_to_mp4(
     ffmpeg_cmd.extend(["-c:v", output_codec])
     if "nvenc" in output_codec:
         ffmpeg_cmd.extend(["-preset", nvenc_preset])
-        ffmpeg_cmd.extend(["-cq", default_nvenc_cq])  # NVENC uses CQ, not CRF
+        ffmpeg_cmd.extend(["-qp", default_nvenc_cq])  # NVENC intermediates use QP, not CRF
     else:
         if cpu_preset:
             ffmpeg_cmd.extend(["-preset", cpu_preset])
@@ -1917,11 +1917,11 @@ def start_ffmpeg_pipe_process(
     default_nvenc_cq = "1"
 
     if user_output_crf is not None and user_output_crf >= 0:
-        logger.debug(f"Using user-specified output CRF/CQ: {user_output_crf}")
+        logger.debug(f"Using user-specified output quality (CRF/QP): {user_output_crf}")
         default_cpu_crf = str(user_output_crf)
         default_nvenc_cq = str(user_output_crf)
     else:
-        logger.debug("Using auto-determined output CRF.")
+        logger.debug("Using auto-determined output quality.")
 
     is_hdr_source = False
     original_codec_name = (
