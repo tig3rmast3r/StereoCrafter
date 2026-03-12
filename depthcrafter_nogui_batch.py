@@ -241,9 +241,9 @@ cpu_offload_mode: str = "model",  # none|model|sequential
         else:
             raise ValueError("cpu_offload_mode must be one of: none, model, sequential")
 
-        # Attention mem savers (best-effort)
+        # noGUI policy: force xFormers OFF to avoid flash-attention runtime instability.
         try:
-            self.pipe.enable_xformers_memory_efficient_attention()
+            self.pipe.disable_xformers_memory_efficient_attention()
         except Exception:
             pass
         self.pipe.enable_attention_slicing()

@@ -35,7 +35,7 @@ if [[ ! -d "$DIR_SBS" ]]; then
 fi
 
 mapfile -d '' -t file_names < <(
-  find "$DIR_SBS" -maxdepth 1 -type f -name "$PATTERN" -printf '%f\0' | sort -z
+  find "$DIR_SBS" -maxdepth 1 \( -type f -o -type l \) -name "$PATTERN" -printf '%f\0' | sort -z
 )
 
 if (( ${#file_names[@]} == 0 )); then
@@ -44,11 +44,22 @@ if (( ${#file_names[@]} == 0 )); then
 fi
 
 concat_list=""
+valid_count=0
 for file_name in "${file_names[@]}"; do
   file_path="${DIR_SBS%/}/$file_name"
+  if [[ ! -f "$file_path" ]]; then
+    echo "[WARN] skipping unreadable input (broken link?): $file_path" >&2
+    continue
+  fi
   escaped_path="$(printf "%s" "$file_path" | sed "s/'/'\\\\''/g")"
   concat_list+="file 'file:$escaped_path'"$'\n'
+  valid_count=$((valid_count + 1))
 done
+
+if (( valid_count == 0 )); then
+  echo "[ERR] no readable files found in '$DIR_SBS' with pattern '$PATTERN'" >&2
+  exit 1
+fi
 
 ff_args=(
   "-hide_banner" "-y"

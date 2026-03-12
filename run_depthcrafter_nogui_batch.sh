@@ -21,6 +21,7 @@ CPU_OFFLOAD_MODE="${CPU_OFFLOAD_MODE:-model}"
 DECODE_CHUNK_SIZE="${DECODE_CHUNK_SIZE:-2}"
 DEBUG_MEM="${DEBUG_MEM:-True}"
 FINAL_UPSCALE="${FINAL_UPSCALE:-False}"
+SCALE_FACTOR="${SCALE_FACTOR:-0.5}"
 RESTART_EVERY="${RESTART_EVERY:-100}"
 PAD_ALIGN_BOTTOM="${PAD_ALIGN_BOTTOM:-True}"
 SCENE_STRIP_PAD_TOP="${SCENE_STRIP_PAD_TOP:-0}"
@@ -87,6 +88,7 @@ CMD=(
   --decode_chunk_size "$DECODE_CHUNK_SIZE"
   --debug_mem "$DEBUG_MEM"
   --final_upscale "$FINAL_UPSCALE"
+  --scale_factor "$SCALE_FACTOR"
   --restart_every "$RESTART_EVERY"
   --pad_align_bottom "$PAD_ALIGN_BOTTOM"
   --scene_strip_pad_top "$SCENE_STRIP_PAD_TOP"
@@ -324,19 +326,19 @@ _run_once_with_watchdog() {
     if (( idle_sec >= WATCHDOG_IDLE_SEC )); then
       echo "[WATCHDOG] no output activity for ${idle_sec}s. Killing runner pid=$child_pid pgid=${child_pgid:-n/a}"
       _kill_child_group "$child_pid" "$child_pgid"
-      set +e
-      wait "$child_pid" 2>/dev/null
-      set -e
+      wait "$child_pid" 2>/dev/null || true
       CURRENT_CHILD_PID=""
       CURRENT_CHILD_PGID=""
       return 124
     fi
   done
 
-  set +e
-  wait "$child_pid"
-  local rc=$?
-  set -e
+  local rc=0
+  if wait "$child_pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
   CURRENT_CHILD_PID=""
   CURRENT_CHILD_PGID=""
   return "$rc"

@@ -501,28 +501,32 @@ def run_batch(args):
 
     stop_event = threading.Event()
 
-    # Optional: load sharpness.csv once (mapping basename -> sharpness_raw).
+    # Optional: load sharpness CSV once (mapping basename -> sharpness_raw).
     sharpness_map = {}
     sharp_csv = ""
     if not args.no_sharpness_csv:
-        sharp_base = args.sharpness_base
-        if not sharp_base:
-            if args.input_dir:
-                sharp_base = args.input_dir
-            elif args.input_video:
-                sharp_base = os.path.dirname(args.input_video)
-            else:
-                sharp_base = os.getcwd()
-        sharp_csv = os.path.join(os.path.abspath(sharp_base), "sharpness.csv")
+        sharp_csv_override = str(args.sharpness_csv_path or "").strip()
+        if sharp_csv_override:
+            sharp_csv = os.path.abspath(sharp_csv_override)
+        else:
+            sharp_base = args.sharpness_base
+            if not sharp_base:
+                if args.input_dir:
+                    sharp_base = args.input_dir
+                elif args.input_video:
+                    sharp_base = os.path.dirname(args.input_video)
+                else:
+                    sharp_base = os.getcwd()
+            sharp_csv = os.path.join(os.path.abspath(sharp_base), "sharpness.csv")
         sharpness_map = _load_sharpness_csv(sharp_csv)
-        print(f"[INFO] sharpness.csv: {sharp_csv} (rows={len(sharpness_map)})")
+        print(f"[INFO] sharpness_csv: {sharp_csv} (rows={len(sharpness_map)})")
         chunk_map = _load_chunk_csv(sharp_csv)
         if chunk_map:
             print(f"[INFO] per-file frames_chunk overrides: {len(chunk_map)}")
         else:
-            print("[INFO] no per-file frames_chunk overrides found in sharpness.csv")
+            print("[INFO] no per-file frames_chunk overrides found in sharpness CSV")
     else:
-        print(f"[INFO] sharpness.csv disabled; using fixed steps={args.fixed_steps}")
+        print(f"[INFO] sharpness CSV disabled; using fixed steps={args.fixed_steps}")
         chunk_map = {}
 
     for idx, video_path in enumerate(videos, 1):
@@ -747,6 +751,8 @@ def main():
     p.add_argument("--output_dir", type=str, required=True, help="Output folder")
     p.add_argument("--glob", type=str, default="*.mp4", help="Glob pattern when using --input_dir")
     p.add_argument("--sharpness_base", type=str, default="", help="Base folder containing sharpness.csv (defaults to input folder)")
+    p.add_argument("--sharpness_csv_path", type=str, default="",
+                   help="Explicit sharpness CSV path (overrides --sharpness_base).")
     p.add_argument("--no_sharpness_csv", action="store_true",
                    help="Ignore sharpness.csv and use --fixed_steps for all files")
     p.add_argument("--fixed_steps", type=int, default=8,

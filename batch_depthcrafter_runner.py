@@ -133,6 +133,17 @@ def _round_up(n: int, m: int) -> int:
     return ((n + m - 1) // m) * m
 
 
+def _ensure_even_min2(n: int) -> int:
+    v = max(2, int(n))
+    if v % 2:
+        v -= 1
+    return max(2, v)
+
+
+def _scaled_even_min2(n: int, factor: float) -> int:
+    return _ensure_even_min2(int(int(n) * float(factor)))
+
+
 def _preprocess_video(
     src: Path,
     dst: Path,
@@ -347,6 +358,7 @@ def run(
     content_h: int = 540,
     pad_w: int = 1024,
     pad_h: int = 576,
+    scale_factor: float = 0.5,
     # Policy
     retry_sequential: bool = True,
     retry_decode_chunk_size_1: bool = True,
@@ -413,10 +425,18 @@ def run(
     total = len(files)
     ok = skipped = failed = 0
     processed = 0
+    try:
+        scale_factor_f = float(scale_factor)
+    except Exception:
+        scale_factor_f = 0.5
+    scale_factor_f = max(0.5, min(0.8, scale_factor_f))
 
     print(f"[INFO] Inputs: {total} | input_dir={input_dir_p} | output_dir={output_dir_p}")
     print(f"[INFO] Worker: {Path(worker_script).resolve()}")
-    print(f"[INFO] Sizes: auto_sizes={auto_sizes} | fixed_pad={pad_w}x{pad_h} fixed_content={content_w}x{content_h}")
+    print(
+        f"[INFO] Sizes: auto_sizes={auto_sizes} scale_factor={scale_factor_f:.2f} "
+        f"| fixed_pad={pad_w}x{pad_h} fixed_content={content_w}x{content_h}"
+    )
     print(f"[INFO] Params: offload={cpu_offload_mode} decode_chunk_size={decode_chunk_size} window={window_size} overlap={overlap} steps={inference_steps} gs={guidance_scale}")
     print(f"[INFO] final_upscale={final_upscale}")
     print(
@@ -473,12 +493,16 @@ def run(
 
         # Compute per-file working sizes on stripped content.
         if auto_sizes:
-            cw = int(orig_w) // 2
-            ch = max(1, int(core_h) // 2)
+            cw = _scaled_even_min2(int(orig_w), scale_factor_f)
+            ch = _scaled_even_min2(int(core_h), scale_factor_f)
             pw = _round_up(cw, 64)
             ph = _round_up(ch, 64)
         else:
             cw, ch, pw, ph = int(content_w), int(content_h), int(pad_w), int(pad_h)
+            cw = _ensure_even_min2(cw)
+            ch = _ensure_even_min2(ch)
+            pw = _round_up(max(cw, pw), 64)
+            ph = _round_up(max(ch, ph), 64)
 
         padded = (pw != cw) or (ph != ch)
         pad_x = max(0, (pw - cw) // 2)
@@ -496,13 +520,12 @@ def run(
         else:
             post_scale_w = int(cw)
             post_scale_h = int(ch)
-            recenter_w = max(1, int(orig_w) // 2)
-            recenter_h = max(1, int(orig_h) // 2)
+            recenter_w = _scaled_even_min2(int(orig_w), scale_factor_f)
+            recenter_h = _scaled_even_min2(int(orig_h), scale_factor_f)
 
         recenter_pad_total = max(0, int(recenter_h) - int(post_scale_h))
-        recenter_pad_top, _recenter_pad_bottom = _split_by_ratio(
-            recenter_pad_total, strip_top, strip_bottom
-        )
+        # Keep output anchored to bottom: never center on re-pad.
+        recenter_pad_top = int(recenter_pad_total)
         recenter_enabled = recenter_pad_total > 0
 
         stem = in_path.stem
@@ -518,7 +541,7 @@ def run(
 
         print(
             f"[RUN ] {i}/{total} {in_path.name} -> {out_final.name} "
-            f"(orig {orig_w}x{orig_h} | half {cw}x{ch} | pad {pw}x{ph} "
+            f"(orig {orig_w}x{orig_h} | scale{scale_factor_f:.2f} {cw}x{ch} | pad {pw}x{ph} "
             f"| strip_tb={strip_top},{strip_bottom} | pad_xy={pad_x},{pad_y} "
             f"| recenter={'yes' if recenter_enabled else 'no'} | padded={padded})"
         )
@@ -718,6 +741,7 @@ def main():
     ap.add_argument("--content_h", type=int, default=540)
     ap.add_argument("--pad_w", type=int, default=1024)
     ap.add_argument("--pad_h", type=int, default=576)
+    ap.add_argument("--scale_factor", type=float, default=0.5)
 
     ap.add_argument("--retry_sequential", type=_bool, default=False)
     ap.add_argument("--retry_decode_chunk_size_1", type=_bool, default=False)

@@ -23,7 +23,7 @@ try:
 except Exception:
     ThemedTk = None
 
-GUI_VERSION = "26-03-01.1"
+GUI_VERSION = "26-03-12.1"
 
 
 class PipelineMasterGUI:
@@ -36,7 +36,12 @@ class PipelineMasterGUI:
         "x265": "libx265",
         "h265": "libx265",
     }
+    DEFAULT_DEPTH_SCALE_FACTOR = 0.5
+    MIN_DEPTH_SCALE_FACTOR = 0.5
+    MAX_DEPTH_SCALE_FACTOR = 0.8
     DEFAULT_DEPTH_REALESRGAN_WORKERS = 4
+    DEFAULT_SPLIT_SCENES_WORKERS = 8
+    DEFAULT_PIPELINE_TEST_RUN_FILES = 5
     VERIFY_QUICK_FFPROBE_TIMEOUT_SEC = 3600.0
     VERIFY_QUICK_FFPROBE_TIMEOUT_RETRIES = 1
     VERIFY_DEEP_FFPROBE_TIMEOUT_SEC = 180.0
@@ -53,13 +58,9 @@ class PipelineMasterGUI:
         "- Mobius: more HDR-like rolloff.\n"
         "- Hable: brighter SDR-style look."
     )
-    STOP_SCENE_NOTICE = (
-        "Running SceneDetect tasks will be stopped now.\n\n"
-        "You will need to restart them from the beginning."
-    )
     DEPTH_AUTO_INFO = (
-        "Auto mode: source scenes are downscaled by 2x, processed with DepthCrafter,\n"
-        "then restored to original size using RealESRGAN.\n"
+        "Auto mode: source scenes are downscaled with a selectable factor (0.50..0.80),\n"
+        "processed with DepthCrafter, then restored with RealESRGAN.\n"
         "RealESRGAN runtime can be selected in Options -> DepthCrafter:\n"
         "Bundled (Utilities/realesrgan) or Local (system/custom).\n"
         "If local runtime has issues, switch to Bundled or rebuild locally."
@@ -151,6 +152,7 @@ class PipelineMasterGUI:
     )
     PIPELINE_STEPS = [
         ("scenedetect", "SceneDetect"),
+        ("split_scenes", "Split Scenes"),
         ("depthcrafter", "DepthCrafter"),
         ("depth_upscale", "Depth Upscale"),
         ("splatting", "Splatting"),
@@ -164,7 +166,7 @@ class PipelineMasterGUI:
         ("remux", "Remux"),
     ]
     PIPELINE_STEPS_WITH_VERIFY = {
-        "scenedetect",
+        "split_scenes",
         "depthcrafter",
         "depth_upscale",
         "splatting",
@@ -222,11 +224,12 @@ class PipelineMasterGUI:
         self._scene_thread: threading.Thread | None = None
         self._scene_process: subprocess.Popen | None = None
         self._scene_stop_requested = False
-        self._scene_clear_output_on_stop = False
+        self._scene_active_step = "scenedetect"
 
         self._verify_thread: threading.Thread | None = None
         self._verify_running = False
         self._verify_mode: str = ""
+        self._scene_verify_result_applied = False
 
         self._analysis_thread: threading.Thread | None = None
         self._analysis_running = False
@@ -263,7 +266,7 @@ class PipelineMasterGUI:
         self._pipeline_check_files_done = False
         self._pipeline_file_scan: dict[str, object] = {}
         self._pipeline_test_active = False
-        self._pipeline_pause_after_scenedetect = False
+        self._pipeline_pause_after_split_scenes = False
         self._pipeline_test_manifest: list[str] = []
         self._pipeline_test_scene_stems: list[str] = []
         self._pipeline_test_source_dir: str = ""
@@ -287,6 +290,8 @@ class PipelineMasterGUI:
         self._source_capabilities: dict = {}
         self._recommended_crop_filters: dict = {}
         self._crop_recommendation_profile: dict = {}
+        self._depth_input_resolution_cache_key: tuple[str, str, int] | None = None
+        self._depth_input_resolution_cache_value: tuple[int | None, int | None] = (None, None)
         self._scene_crop_target_syncing = False
         self._crop_notice_shown = False
         self._hdr_notice_shown = False
@@ -368,6 +373,14 @@ class PipelineMasterGUI:
         self.scene_extra_ffmpeg_args_var = tk.StringVar(
             value=self._config.get("scene_extra_ffmpeg_args", "")
         )
+        self.scene_split_threads_var = tk.StringVar(
+            value=str(
+                self._config.get(
+                    "scene_split_threads",
+                    str(self.DEFAULT_SPLIT_SCENES_WORKERS),
+                )
+            )
+        )
 
         self.scene_cmd_preview_var = tk.StringVar(value="")
         self.scene_status_var = tk.StringVar(value="Ready")
@@ -432,6 +445,18 @@ class PipelineMasterGUI:
         self.depth_worker_script_var = tk.StringVar(
             value=self._config.get("depth_worker_script", "./depthcrafter_nogui_batch.py")
         )
+        depth_scale_factor_raw = self._config.get(
+            "depth_scale_factor", self.DEFAULT_DEPTH_SCALE_FACTOR
+        )
+        try:
+            depth_scale_factor_cfg = float(depth_scale_factor_raw)
+        except Exception:
+            depth_scale_factor_cfg = float(self.DEFAULT_DEPTH_SCALE_FACTOR)
+        self.depth_scale_factor_var = tk.DoubleVar(value=depth_scale_factor_cfg)
+        self.depth_scale_factor_text_var = tk.StringVar(
+            value=f"{depth_scale_factor_cfg:.2f}x"
+        )
+        self.depth_pad_target_var = tk.StringVar(value="n.d.")
         self.depth_res_x_var = tk.StringVar(
             value=str(self._config.get("depth_res_x", "640"))
         )
@@ -653,6 +678,14 @@ class PipelineMasterGUI:
         self.merge_autoct_workers_var = tk.StringVar(
             value=str(self._config.get("merge_autoct_workers", "8"))
         )
+        self.merge_mask_formerge_workers_var = tk.StringVar(
+            value=str(
+                self._config.get(
+                    "merge_mask_formerge_workers",
+                    self._config.get("merge_autoct_workers", "8"),
+                )
+            )
+        )
         self.merge_parallel_var = tk.BooleanVar(
             value=bool(self._config.get("merge_parallel", True))
         )
@@ -781,6 +814,14 @@ class PipelineMasterGUI:
         self.pipeline_verify_after_var = tk.StringVar(
             value=self._config.get("pipeline_verify_after", "Disabled")
         )
+        self.pipeline_test_run_files_var = tk.StringVar(
+            value=str(
+                self._config.get(
+                    "pipeline_test_run_files",
+                    str(self.DEFAULT_PIPELINE_TEST_RUN_FILES),
+                )
+            )
+        )
         self.pipeline_run_status_var = tk.StringVar(value="Idle")
         self.pipeline_run_progress_var = tk.DoubleVar(value=0.0)
         self.pipeline_checked_files_var = tk.StringVar(value="Check Files: not run")
@@ -818,6 +859,12 @@ class PipelineMasterGUI:
             self.depth_overlap_var.set("20")
         if self.depth_inference_steps_var.get().strip() == "":
             self.depth_inference_steps_var.set("5")
+        self.depth_scale_factor_var.set(
+            self._normalize_depth_scale_factor(self.depth_scale_factor_var.get())
+        )
+        self.depth_scale_factor_text_var.set(
+            f"{float(self.depth_scale_factor_var.get()):.2f}x"
+        )
         if self.depth_realesrgan_source_var.get().strip() not in {
             "Bundled (Utilities/realesrgan)",
             "Local (system/custom path)",
@@ -890,6 +937,10 @@ class PipelineMasterGUI:
             self.merge_ct_preset_var.set("1")
         if self.merge_autoct_workers_var.get().strip() == "":
             self.merge_autoct_workers_var.set("8")
+        if self.merge_mask_formerge_workers_var.get().strip() == "":
+            self.merge_mask_formerge_workers_var.set(
+                self.merge_autoct_workers_var.get().strip() or "8"
+            )
         if self.merge_parallel_workers_var.get().strip() == "":
             self.merge_parallel_workers_var.set("2")
         if self.merge_chunks_var.get().strip() == "":
@@ -947,6 +998,16 @@ class PipelineMasterGUI:
                 raise ValueError
         except Exception:
             self.verify_scenes_workers_var.set(str(max(1, int(os.cpu_count() or 1))))
+        try:
+            if int(self.scene_split_threads_var.get().strip()) < 1:
+                raise ValueError
+        except Exception:
+            self.scene_split_threads_var.set(str(self.DEFAULT_SPLIT_SCENES_WORKERS))
+        try:
+            if int(self.pipeline_test_run_files_var.get().strip()) < 1:
+                raise ValueError
+        except Exception:
+            self.pipeline_test_run_files_var.set(str(self.DEFAULT_PIPELINE_TEST_RUN_FILES))
         if self.pipeline_verify_after_var.get().strip() not in self.PIPELINE_VERIFY_CHOICES:
             self.pipeline_verify_after_var.set("Disabled")
 
@@ -969,6 +1030,7 @@ class PipelineMasterGUI:
         self.scene_encoder_preset_var.trace_add("write", self._on_scene_encode_var_changed)
         self.scene_pix_fmt_var.trace_add("write", self._on_scene_encode_var_changed)
         self.scene_crop_target_h_var.trace_add("write", self._on_scene_crop_target_changed)
+        self.depth_scale_factor_var.trace_add("write", self._on_depth_scale_factor_changed)
 
     def _build_ui(self) -> None:
         self.root.grid_rowconfigure(0, weight=1)
@@ -1059,6 +1121,11 @@ class PipelineMasterGUI:
         )
         self.scene_backend_combo.grid(row=0, column=5, sticky="w", padx=(6, 12))
         self.scene_backend_combo.bind("<<ComboboxSelected>>", self._on_backend_changed)
+
+        ttk.Label(options_frame, text="Split threads:").grid(row=0, column=6, sticky="w")
+        ttk.Entry(options_frame, textvariable=self.scene_split_threads_var, width=6).grid(
+            row=0, column=7, sticky="w", padx=(6, 0)
+        )
 
         ttk.Label(options_frame, text="Auto crop:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.crop_mode_auto_toggle = ttk.Checkbutton(
@@ -1208,20 +1275,24 @@ class PipelineMasterGUI:
             buttons, text="Run SceneDetect", command=self._start_scene_detect
         )
         self.scene_run_btn.grid(row=0, column=2, padx=6)
+        self.scene_split_btn = ttk.Button(
+            buttons, text="Split Scenes", command=self._start_split_scenes
+        )
+        self.scene_split_btn.grid(row=0, column=3, padx=6)
         self.scene_verify_quick_btn = ttk.Button(
             buttons, text="Verify Scenes (Quick)", command=self._start_verify_quick
         )
-        self.scene_verify_quick_btn.grid(row=0, column=3, padx=6)
+        self.scene_verify_quick_btn.grid(row=0, column=4, padx=6)
         self.scene_verify_deep_btn = ttk.Button(
             buttons, text="Verify Scenes (Deep)", command=self._start_verify_deep
         )
-        self.scene_verify_deep_btn.grid(row=0, column=4, padx=6)
+        self.scene_verify_deep_btn.grid(row=0, column=5, padx=6)
         self.scene_stop_btn = ttk.Button(
             buttons, text="Stop", command=self._stop_scene_detect, state=tk.DISABLED
         )
-        self.scene_stop_btn.grid(row=0, column=5, padx=6)
+        self.scene_stop_btn.grid(row=0, column=6, padx=6)
         ttk.Button(buttons, text="Clear Log", command=self._clear_scene_log).grid(
-            row=0, column=6, padx=6
+            row=0, column=7, padx=6
         )
 
         status_frame = ttk.Frame(parent)
@@ -1397,19 +1468,40 @@ class PipelineMasterGUI:
         self.depth_res_y_entry = ttk.Entry(params_frame, textvariable=self.depth_res_y_var, width=8)
         self.depth_res_y_entry.grid(row=1, column=7, sticky="w", padx=(6, 0), pady=(8, 0))
 
+        ttk.Label(params_frame, text="Scale factor:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.depth_scale_factor_scale = ttk.Scale(
+            params_frame,
+            from_=self.MIN_DEPTH_SCALE_FACTOR,
+            to=self.MAX_DEPTH_SCALE_FACTOR,
+            variable=self.depth_scale_factor_var,
+            orient=tk.HORIZONTAL,
+            command=self._on_depth_scale_slider_moved,
+            length=220,
+        )
+        self.depth_scale_factor_scale.grid(
+            row=2, column=1, columnspan=3, sticky="w", padx=(6, 12), pady=(8, 0)
+        )
+        ttk.Label(params_frame, textvariable=self.depth_scale_factor_text_var, width=7).grid(
+            row=2, column=4, sticky="w", pady=(8, 0)
+        )
+        ttk.Label(params_frame, text="Pad target:").grid(row=2, column=5, sticky="w", pady=(8, 0))
+        ttk.Label(params_frame, textvariable=self.depth_pad_target_var).grid(
+            row=2, column=6, columnspan=2, sticky="w", padx=(6, 0), pady=(8, 0)
+        )
+
         ttk.Label(params_frame, text="ESRGAN workers:").grid(
-            row=2, column=0, sticky="w", pady=(8, 0)
+            row=3, column=0, sticky="w", pady=(8, 0)
         )
         self.depth_realesrgan_workers_entry = ttk.Entry(
             params_frame, textvariable=self.depth_realesrgan_workers_var, width=8
         )
         self.depth_realesrgan_workers_entry.grid(
-            row=2, column=1, sticky="w", padx=(6, 12), pady=(8, 0)
+            row=3, column=1, sticky="w", padx=(6, 12), pady=(8, 0)
         )
         ttk.Label(
             params_frame,
             text="Used by Run ESRGAN (editable in Auto mode).",
-        ).grid(row=2, column=2, columnspan=6, sticky="w", pady=(8, 0))
+        ).grid(row=3, column=2, columnspan=6, sticky="w", pady=(8, 0))
 
         encode_frame = ttk.LabelFrame(parent, text="Encoding Args (inherited)", padding=8)
         encode_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
@@ -2271,6 +2363,7 @@ class PipelineMasterGUI:
         mask_dir = self.inpaint_mask_var.get().strip()
         work_dir = self.work_folder_var.get().strip() or "./work"
         sharp_base = os.path.normpath(work_dir)
+        sharp_csv_path = self.inpaint_sharpness_csv_var.get().strip()
         use_sharpness_csv = bool(self.inpaint_use_sharpness_csv_var.get())
         codec_value = self._normalize_ffmpeg_codec(
             self.inpaint_codec_var.get(),
@@ -2299,6 +2392,7 @@ class PipelineMasterGUI:
             "OUTPUT_EXTRA_ARGS": self.inpaint_extra_ffmpeg_args_var.get().strip(),
             "NO_SHARPNESS_CSV": "0" if use_sharpness_csv else "1",
             "SHARPNESS_BASE": sharp_base,
+            "SHARPNESS_CSV_PATH": sharp_csv_path,
             "FIXED_STEPS": self.inpaint_inference_steps_var.get().strip() or "8",
             # Hardcoded unsupported features in this tab.
             "ENABLE_POST_INPAINTING_BLEND": "0",
@@ -2966,6 +3060,7 @@ class PipelineMasterGUI:
                 text=True,
                 bufsize=1,
                 universal_newlines=True,
+                preexec_fn=(os.setsid if hasattr(os, "setsid") else None),
             )
             assert proc.stdout is not None
             for raw in proc.stdout:
@@ -3085,21 +3180,23 @@ class PipelineMasterGUI:
         )
         self.merge_autoct_workers_entry.grid(row=0, column=1, sticky="w", padx=(6, 12))
 
-        self.merge_parallel_check = ttk.Checkbutton(
-            params_frame,
-            text="Parallel merging",
-            variable=self.merge_parallel_var,
-            command=self._on_merge_parallel_toggle,
-        )
-        self.merge_parallel_check.grid(row=0, column=2, sticky="w")
-
-        ttk.Label(params_frame, text="Parallel workers:").grid(
-            row=0, column=3, sticky="w", padx=(12, 0)
+        ttk.Label(params_frame, text="Merge workers:").grid(
+            row=0, column=2, sticky="w", padx=(12, 0)
         )
         self.merge_parallel_workers_entry = ttk.Entry(
             params_frame, textvariable=self.merge_parallel_workers_var, width=7
         )
-        self.merge_parallel_workers_entry.grid(row=0, column=4, sticky="w", padx=(6, 12))
+        self.merge_parallel_workers_entry.grid(row=0, column=3, sticky="w", padx=(6, 12))
+        self.merge_parallel_workers_entry.bind("<KeyRelease>", self._on_merge_workers_changed)
+        self.merge_parallel_workers_entry.bind("<FocusOut>", self._on_merge_workers_changed)
+
+        ttk.Label(params_frame, text="Mask-for-merge workers:").grid(
+            row=0, column=5, sticky="w", padx=(12, 0)
+        )
+        self.merge_mask_formerge_workers_entry = ttk.Entry(
+            params_frame, textvariable=self.merge_mask_formerge_workers_var, width=7
+        )
+        self.merge_mask_formerge_workers_entry.grid(row=0, column=6, sticky="w", padx=(6, 12))
 
         self.merge_use_gpu_check = ttk.Checkbutton(
             params_frame,
@@ -3107,9 +3204,9 @@ class PipelineMasterGUI:
             variable=self.merge_use_gpu_var,
             command=self._preview_merge_command,
         )
-        self.merge_use_gpu_check.grid(row=0, column=5, sticky="w")
+        self.merge_use_gpu_check.grid(row=0, column=7, sticky="w")
 
-        ttk.Label(params_frame, text="Output:").grid(row=0, column=6, sticky="w", padx=(12, 0))
+        ttk.Label(params_frame, text="Output:").grid(row=0, column=8, sticky="w", padx=(12, 0))
         self.merge_output_format_combo = ttk.Combobox(
             params_frame,
             textvariable=self.merge_output_format_var,
@@ -3117,12 +3214,12 @@ class PipelineMasterGUI:
             state="readonly",
             width=10,
         )
-        self.merge_output_format_combo.grid(row=0, column=7, sticky="w", padx=(6, 12))
+        self.merge_output_format_combo.grid(row=0, column=9, sticky="w", padx=(6, 12))
         self.merge_output_format_combo.bind("<<ComboboxSelected>>", self._preview_merge_command)
 
-        ttk.Label(params_frame, text="Chunks:").grid(row=0, column=8, sticky="w")
+        ttk.Label(params_frame, text="Chunks:").grid(row=0, column=10, sticky="w")
         self.merge_chunks_entry = ttk.Entry(params_frame, textvariable=self.merge_chunks_var, width=7)
-        self.merge_chunks_entry.grid(row=0, column=9, sticky="w", padx=(6, 0))
+        self.merge_chunks_entry.grid(row=0, column=11, sticky="w", padx=(6, 0))
 
         ttk.Label(params_frame, text="Binarize thresh:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.merge_mask_binarize_entry = ttk.Entry(
@@ -3333,7 +3430,8 @@ class PipelineMasterGUI:
 
         self._merge_auto_widgets = [
             self.merge_autoct_workers_entry,
-            self.merge_parallel_check,
+            self.merge_parallel_workers_entry,
+            self.merge_mask_formerge_workers_entry,
             self.merge_use_gpu_check,
             self.merge_output_format_combo,
             self.merge_chunks_entry,
@@ -3357,7 +3455,7 @@ class PipelineMasterGUI:
         ]
 
         self._on_merge_mode_changed()
-        self._on_merge_parallel_toggle()
+        self._on_merge_workers_changed()
         self._on_merge_override_toggle(initial=True)
         self._update_replace_mask_dependent_controls()
         self._preview_merge_command()
@@ -3421,7 +3519,9 @@ class PipelineMasterGUI:
             self.merge_mode_var.set("Auto (recommended)")
             self.merge_info_text_var.set(self.MERGE_AUTO_INFO)
             self.merge_autoct_workers_var.set("8")
-            self.merge_parallel_var.set(True)
+            self.merge_mask_formerge_workers_var.set(
+                self.merge_autoct_workers_var.get().strip() or "8"
+            )
             self.merge_parallel_workers_var.set("2")
             self.merge_use_gpu_var.set(False)
             self.merge_output_format_var.set("Full SBS")
@@ -3438,17 +3538,27 @@ class PipelineMasterGUI:
             self.merge_ct_auto_mode_var.set("CSV Blend")
             self.merge_ct_exclude_black_var.set(True)
         self._apply_merge_control_states()
+        self._on_merge_workers_changed()
         self._refresh_pipeline_status_panel()
 
     def _on_merge_ct_auto_mode_changed(self, _event=None) -> None:
         self._preview_merge_command()
         self._refresh_pipeline_status_panel()
 
-    def _on_merge_parallel_toggle(self) -> None:
-        if bool(self.merge_parallel_var.get()):
-            self.merge_parallel_workers_entry.configure(state=tk.NORMAL)
-        else:
-            self.merge_parallel_workers_entry.configure(state=tk.DISABLED)
+    def _get_merge_worker_count(self) -> int:
+        workers_raw = self.merge_parallel_workers_var.get().strip()
+        try:
+            workers = max(1, int(workers_raw))
+        except Exception:
+            workers = 2
+        if str(workers) != workers_raw:
+            self.merge_parallel_workers_var.set(str(workers))
+        self.merge_parallel_var.set(workers >= 2)
+        return workers
+
+    def _on_merge_workers_changed(self, _event=None) -> None:
+        self._get_merge_worker_count()
+        self.merge_parallel_workers_entry.configure(state=tk.NORMAL)
         self._preview_merge_command()
 
     def _apply_merge_control_states(self) -> None:
@@ -3470,7 +3580,7 @@ class PipelineMasterGUI:
         self.merge_use_replace_mask_var.set(True)
         self.merge_use_replace_mask_check.configure(state=tk.DISABLED)
 
-        self._on_merge_parallel_toggle()
+        self._on_merge_workers_changed()
         self._preview_merge_command()
         self._refresh_pipeline_status_panel()
 
@@ -3506,7 +3616,8 @@ class PipelineMasterGUI:
 
     def _build_merge_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
         output_dir = self.merge_output_var.get().strip()
-        use_parallel = bool(self.merge_parallel_var.get())
+        workers = self._get_merge_worker_count()
+        use_parallel = workers >= 2
         ct_mode = self.merge_ct_auto_mode_var.get().strip() or "CSV Blend"
         output_format_ui = self.merge_output_format_var.get().strip()
         output_format_runner = (
@@ -3555,7 +3666,7 @@ class PipelineMasterGUI:
             "FFMPEG_EXTRA_ARGS": self.merge_extra_ffmpeg_args_var.get().strip(),
         }
         if use_parallel:
-            env_updates["WORKERS"] = self.merge_parallel_workers_var.get().strip() or "2"
+            env_updates["WORKERS"] = str(workers)
         cmd = ["bash", "run_merging_nogui_batch_parallel.sh" if use_parallel else "run_merging_nogui_batch.sh"]
         preview = " ".join(
             [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
@@ -3583,13 +3694,24 @@ class PipelineMasterGUI:
 
     def _build_mask_formerge_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
         motion_enabled = bool(self.merge_shadow_motion_enabled_var.get())
+        mask_workers_raw = self.merge_mask_formerge_workers_var.get().strip()
+        try:
+            mask_workers = max(1, int(mask_workers_raw))
+        except Exception:
+            autoct_raw = self.merge_autoct_workers_var.get().strip()
+            try:
+                mask_workers = max(1, int(autoct_raw))
+            except Exception:
+                mask_workers = 8
+        if str(mask_workers) != mask_workers_raw:
+            self.merge_mask_formerge_workers_var.set(str(mask_workers))
         env_updates: dict[str, str] = {
             "PYTHON": sys.executable,
             "RUNNER": "mask_formerge_nogui.py",
             "REPLACE_MASK_FOLDER": self.merge_replace_mask_var.get().strip(),
             "OUTPUT_FOLDER": self.merge_mask_formerge_var.get().strip(),
             "INPUT_GLOB": "*_replace_mask.*",
-            "WORKERS": self.merge_autoct_workers_var.get().strip() or "8",
+            "WORKERS": str(mask_workers),
             "CHUNK_SIZE": self.merge_chunks_var.get().strip() or "20",
             "USE_GPU": "1" if bool(self.merge_use_gpu_var.get()) else "0",
             "MASK_BINARIZE_THRESHOLD": self.merge_mask_binarize_var.get().strip() or "0.5",
@@ -3685,6 +3807,7 @@ class PipelineMasterGUI:
                 line = raw_line.rstrip("\n")
                 if line:
                     self._log_queue.put(("merge_line", f"[MASK] {line}"))
+                    self._try_parse_merge_progress(line)
                 if self._merge_stop_requested:
                     break
             rc = proc.wait()
@@ -4398,6 +4521,7 @@ class PipelineMasterGUI:
                 text=True,
                 bufsize=1,
                 universal_newlines=True,
+                preexec_fn=(os.setsid if hasattr(os, "setsid") else None),
             )
             assert proc.stdout is not None
             for raw in proc.stdout:
@@ -5879,6 +6003,15 @@ class PipelineMasterGUI:
             run_opts,
             textvariable=self.pipeline_checked_files_var,
         ).grid(row=0, column=2, columnspan=4, sticky="w", padx=(8, 0))
+        ttk.Label(run_opts, text="Test run files:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(
+            run_opts,
+            textvariable=self.pipeline_test_run_files_var,
+            width=6,
+        ).grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(6, 0))
+        ttk.Label(run_opts, text="(max files from incomplete list)").grid(
+            row=1, column=2, columnspan=4, sticky="w", pady=(6, 0)
+        )
 
         step_frame = ttk.LabelFrame(parent, text="Pipeline Step State", padding=8)
         step_frame.grid(row=4, column=0, sticky="ew", pady=6)
@@ -6254,10 +6387,12 @@ class PipelineMasterGUI:
         scene_stems = [s for s in scene_stems if s]
 
         scene_dir = self.scene_output_var.get().strip()
-        state["scenedetect"]["completed"] = bool(
+        scene_files_ready = bool(
             scene_names
             and all((Path(scene_dir) / name).is_file() for name in scene_names)
         )
+        state["scenedetect"]["completed"] = scene_files_ready
+        state["split_scenes"]["completed"] = scene_files_ready
         state["depthcrafter"]["completed"] = self._pipeline_test_has_scene_outputs(
             self.depth_output_var.get().strip(),
             scene_stems,
@@ -6476,7 +6611,7 @@ class PipelineMasterGUI:
 
         self._pipeline_autorun = False
         self._pipeline_pending_action = None
-        self._pipeline_pause_after_scenedetect = False
+        self._pipeline_pause_after_split_scenes = False
         self._pipeline_step_state = self._default_pipeline_step_state()
         self._pipeline_test_step_state = self._default_pipeline_step_state()
         self.pipeline_checked_files_var.set("Check Files: not run")
@@ -6529,6 +6664,7 @@ class PipelineMasterGUI:
         self.depth_decode_chunk_size_var.set("2")
         self.depth_restart_every_var.set("100")
         self.depth_debug_mem_var.set(True)
+        self.depth_scale_factor_var.set(self.DEFAULT_DEPTH_SCALE_FACTOR)
         self.depth_glob_var.set("*.mp4")
         self.depth_worker_script_var.set("./depthcrafter_nogui_batch.py")
         self.depth_encode_override_var.set(False)
@@ -6573,8 +6709,10 @@ class PipelineMasterGUI:
         self._on_join_pixfmt_override_toggle()
 
         # Options defaults.
+        self.scene_split_threads_var.set(str(self.DEFAULT_SPLIT_SCENES_WORKERS))
         self.verify_scenes_workers_var.set(str(max(1, int(os.cpu_count() or 1))))
         self.pipeline_verify_after_var.set("Disabled")
+        self.pipeline_test_run_files_var.set(str(self.DEFAULT_PIPELINE_TEST_RUN_FILES))
         self.resume_enabled_var.set(True)
         self.stop_on_error_var.set(True)
         self.auto_advance_var.set(False)
@@ -6734,6 +6872,150 @@ class PipelineMasterGUI:
             self.verify_scenes_workers_var.set(str(workers))
         return workers
 
+    def _scene_csv_path(self) -> str:
+        work_dir = self.work_folder_var.get().strip() or "./work"
+        return os.path.normpath(os.path.join(work_dir, "scenedetect.csv"))
+
+    def _get_scene_split_workers(self) -> int:
+        raw = self.scene_split_threads_var.get().strip()
+        try:
+            workers = int(raw)
+        except Exception:
+            workers = self.DEFAULT_SPLIT_SCENES_WORKERS
+        if workers < 1:
+            workers = self.DEFAULT_SPLIT_SCENES_WORKERS
+        if str(workers) != raw:
+            self.scene_split_threads_var.set(str(workers))
+        return workers
+
+    def _get_pipeline_test_run_limit(self) -> int:
+        raw = self.pipeline_test_run_files_var.get().strip()
+        try:
+            count = int(raw)
+        except Exception:
+            count = self.DEFAULT_PIPELINE_TEST_RUN_FILES
+        if count < 1:
+            count = self.DEFAULT_PIPELINE_TEST_RUN_FILES
+        if str(count) != raw:
+            self.pipeline_test_run_files_var.set(str(count))
+        return count
+
+    @staticmethod
+    def _parse_scene_seconds_or_timecode(value: str) -> float | None:
+        txt = str(value or "").strip()
+        if not txt:
+            return None
+        try:
+            return float(txt)
+        except Exception:
+            pass
+        m = re.match(r"^(\d+):(\d+):(\d+)(?:\.(\d+))?$", txt)
+        if not m:
+            return None
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        ss = int(m.group(3))
+        frac = m.group(4) or "0"
+        frac_sec = float(f"0.{frac}")
+        return float(hh * 3600 + mm * 60 + ss) + frac_sec
+
+    @staticmethod
+    def _scene_output_filename(source_path: str, scene_number: int) -> str:
+        stem = Path(str(source_path or "")).stem or "source"
+        return f"{stem}-Scene-{int(scene_number):03d}.mp4"
+
+    def _load_scene_csv_entries(
+        self,
+        scene_csv_path: str | None = None,
+    ) -> tuple[list[dict[str, float | int]], str]:
+        csv_path = str(scene_csv_path or self._scene_csv_path()).strip()
+        if not csv_path or not os.path.isfile(csv_path):
+            return [], f"Scene CSV not found: {csv_path or '(empty)'}"
+        rows: list[dict[str, float | int]] = []
+        try:
+            with open(csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for idx, row in enumerate(reader, start=1):
+                    if not isinstance(row, dict):
+                        continue
+                    norm = {
+                        str(k or "").strip().lower(): str(v or "").strip()
+                        for k, v in row.items()
+                    }
+                    scene_raw = (
+                        norm.get("scene number")
+                        or norm.get("scene")
+                        or norm.get("scene #")
+                        or ""
+                    )
+                    try:
+                        scene_num = int(float(scene_raw)) if scene_raw else idx
+                    except Exception:
+                        scene_num = idx
+                    start_raw = (
+                        norm.get("start time (seconds)")
+                        or norm.get("start seconds")
+                        or norm.get("start timecode")
+                        or ""
+                    )
+                    end_raw = (
+                        norm.get("end time (seconds)")
+                        or norm.get("end seconds")
+                        or norm.get("end timecode")
+                        or ""
+                    )
+                    start_sec = self._parse_scene_seconds_or_timecode(start_raw)
+                    end_sec = self._parse_scene_seconds_or_timecode(end_raw)
+                    if start_sec is None or end_sec is None:
+                        continue
+                    if float(end_sec) <= float(start_sec):
+                        continue
+                    rows.append(
+                        {
+                            "scene_number": int(scene_num),
+                            "start_sec": float(start_sec),
+                            "end_sec": float(end_sec),
+                        }
+                    )
+        except Exception as exc:
+            return [], f"Failed reading Scene CSV: {type(exc).__name__}: {exc}"
+        if not rows:
+            return [], f"No valid scene rows found in CSV: {csv_path}"
+        return rows, ""
+
+    def _collect_expected_split_scene_outputs(
+        self,
+        seg_dir: str,
+        scene_csv_path: str | None = None,
+    ) -> tuple[list[str], list[str], str]:
+        entries, err = self._load_scene_csv_entries(scene_csv_path)
+        if err:
+            return [], [], err
+        input_path = self.scene_input_var.get().strip()
+        seg_root = Path(seg_dir).resolve()
+        seg_mono_root: Path | None = None
+        if not self._pipeline_test_active:
+            try:
+                seg_mono_candidate = Path(
+                    self.work_folder_var.get().strip() or "./work"
+                ).resolve() / "seg-mono"
+                if seg_mono_candidate.is_dir() and seg_mono_candidate.resolve() != seg_root:
+                    seg_mono_root = seg_mono_candidate.resolve()
+            except Exception:
+                seg_mono_root = None
+        expected: list[str] = []
+        missing: list[str] = []
+        for idx, entry in enumerate(entries, start=1):
+            scene_num = int(entry.get("scene_number", idx))
+            out_name = self._scene_output_filename(input_path, scene_num)
+            expected_path = str((seg_root / out_name).resolve())
+            expected.append(expected_path)
+            in_seg = Path(expected_path).is_file()
+            in_seg_mono = bool(seg_mono_root and (seg_mono_root / out_name).is_file())
+            if not (in_seg or in_seg_mono):
+                missing.append(expected_path)
+        return expected, missing, ""
+
     @staticmethod
     def _count_video_files(folder: str) -> int:
         if not folder or not os.path.isdir(folder):
@@ -6749,10 +7031,26 @@ class PipelineMasterGUI:
         seg_dir = self.scene_output_var.get().strip()
         out_dir = self.merge_output_var.get().strip()
         seg_files = sorted([p for p in Path(seg_dir).glob("*.mp4") if p.is_file()]) if os.path.isdir(seg_dir) else []
-        if not seg_files:
-            self.pipeline_checked_files_var.set("Check Files: no scene files found")
+        scene_csv_path = self._scene_csv_path()
+        scene_entries, scene_csv_err = self._load_scene_csv_entries(scene_csv_path)
+        scene_csv_ok = bool(scene_entries) and not scene_csv_err
+
+        expected_outputs, missing_split_outputs, split_cov_err = self._collect_expected_split_scene_outputs(
+            seg_dir
+        )
+        split_expected_count = len(expected_outputs)
+        split_missing_count = len(missing_split_outputs)
+
+        if (not seg_files) and (not scene_csv_ok):
+            self.pipeline_checked_files_var.set("Check Files: missing scene CSV and split files")
             if show_popup:
-                messagebox.showwarning("Check Files", "No scene files found. Complete SceneDetect first.")
+                messagebox.showwarning(
+                    "Check Files",
+                    (
+                        "No scene CSV and no split scene files found.\n\n"
+                        "Run SceneDetect first."
+                    ),
+                )
             return False
 
         incomplete: list[str] = []
@@ -6782,52 +7080,75 @@ class PipelineMasterGUI:
         remux_done = Path(self._default_remux_output_path()).is_file()
         sharp_done = Path(self.inpaint_sharpness_csv_var.get().strip()).is_file()
         autoct_done = Path(self.merge_autoct_csv_var.get().strip()).is_file()
+        split_ok = bool(scene_csv_ok and split_expected_count > 0 and split_missing_count == 0 and not split_cov_err)
+        split_ref_count = split_expected_count if split_expected_count > 0 else seg_count
 
-        self._pipeline_set_completed("scenedetect", seg_count > 0)
-        self._pipeline_set_completed("depthcrafter", seg_count > 0 and depth_count >= seg_count)
-        self._pipeline_set_completed("depth_upscale", seg_count > 0 and depth_upscaled_count >= seg_count)
-        self._pipeline_set_completed("splatting", seg_count > 0 and splat_count >= seg_count)
+        self._pipeline_set_completed("scenedetect", bool(scene_csv_ok))
+        self._pipeline_set_completed("split_scenes", split_ok)
+        self._pipeline_set_completed(
+            "depthcrafter", split_ok and split_ref_count > 0 and depth_count >= split_ref_count
+        )
+        self._pipeline_set_completed(
+            "depth_upscale", split_ok and split_ref_count > 0 and depth_upscaled_count >= split_ref_count
+        )
+        self._pipeline_set_completed(
+            "splatting", split_ok and split_ref_count > 0 and splat_count >= split_ref_count
+        )
         self._pipeline_set_completed("sharpness_csv", sharp_done)
-        self._pipeline_set_completed("inpaint", seg_count > 0 and inpaint_count >= seg_count)
+        self._pipeline_set_completed(
+            "inpaint", split_ok and split_ref_count > 0 and inpaint_count >= split_ref_count
+        )
         self._pipeline_set_completed("autoct_csv", autoct_done)
-        self._pipeline_set_completed("mask_for_merge", seg_count > 0 and mask_formerge_count >= seg_count)
-        self._pipeline_set_completed("merging", seg_count > 0 and merge_count >= seg_count)
+        self._pipeline_set_completed(
+            "mask_for_merge", split_ok and split_ref_count > 0 and mask_formerge_count >= split_ref_count
+        )
+        self._pipeline_set_completed(
+            "merging", split_ok and split_ref_count > 0 and merge_count >= split_ref_count
+        )
         self._pipeline_set_completed("mono_to_sbs", bool(mono_to_sbs_ok))
         self._pipeline_set_completed("join", bool(join_done))
         self._pipeline_set_completed("remux", bool(remux_done))
 
         self._pipeline_file_scan = {
             "seg_total": seg_count,
+            "seg_expected": split_ref_count,
+            "split_missing": [str(Path(p).name) for p in missing_split_outputs],
             "completed_final": completed,
             "incomplete_final": incomplete,
         }
         self._pipeline_check_files_done = True
         self.pipeline_checked_files_var.set(
-            f"Check Files: scenes={seg_count}, final done={len(completed)}, incomplete={len(incomplete)}"
+            (
+                f"Check Files: csv={'ok' if scene_csv_ok else 'missing'}, "
+                f"split={seg_count}/{split_ref_count}, "
+                f"final done={len(completed)}, incomplete={len(incomplete)}"
+            )
         )
         self._refresh_pipeline_status_panel()
         self._save_pipeline_state()
 
         if show_popup:
+            csv_details = ""
+            if scene_csv_err:
+                csv_details = f"\nScene CSV details: {scene_csv_err}"
+            elif split_cov_err:
+                csv_details = f"\nSplit CSV details: {split_cov_err}"
             messagebox.showinfo(
                 "Check Files",
                 (
                     f"Scan completed.\n\n"
-                    f"Scene files: {seg_count}\n"
+                    f"Scene CSV: {'OK' if scene_csv_ok else 'MISSING'}\n"
+                    f"Split files: {seg_count}/{split_ref_count}\n"
+                    f"Missing split files: {split_missing_count}\n"
                     f"Final completed: {len(completed)}\n"
                     f"Incomplete: {len(incomplete)}"
+                    f"{csv_details}"
                 ),
             )
         return True
 
     def _pipeline_test_run(self) -> None:
-        self._pipeline_ui_noninteractive = True
-        self._pipeline_pause_after_scenedetect = False
-        self._append_pipeline_popup_log(
-            "INFO",
-            "Test Run",
-            "Non-interactive mode enabled: popups are suppressed and auto-accepted.",
-        )
+        self._pipeline_pause_after_split_scenes = False
         if self._any_pipeline_activity():
             messagebox.showinfo("Test Run", "Stop running tasks before starting a test run.")
             self._pipeline_sync_noninteractive_mode()
@@ -6836,10 +7157,24 @@ class PipelineMasterGUI:
             if not self._pipeline_check_files(show_popup=False):
                 self._pipeline_sync_noninteractive_mode()
                 return
-        if not bool(self._pipeline_step_state.get("scenedetect", {}).get("completed", False)):
+        split_state = self._pipeline_step_state.get(
+            "split_scenes", {"completed": False, "verified": "none"}
+        )
+        if not bool(split_state.get("completed", False)):
             messagebox.showwarning(
                 "Test Run",
-                "Complete SceneDetect first. Test Run requires scene clips.",
+                "Complete Split Scenes first. Test Run requires scene clips.",
+            )
+            self._pipeline_sync_noninteractive_mode()
+            return
+        split_verified = str(split_state.get("verified", "none")).strip().lower()
+        if split_verified not in {"quick", "deep"}:
+            messagebox.showwarning(
+                "Test Run",
+                (
+                    "Run Verify Scenes (Quick or Deep) first.\n\n"
+                    "Test Run can start only after scene verification."
+                ),
             )
             self._pipeline_sync_noninteractive_mode()
             return
@@ -6849,12 +7184,13 @@ class PipelineMasterGUI:
             messagebox.showinfo("Test Run", "No incomplete files found. Nothing to test.")
             self._pipeline_sync_noninteractive_mode()
             return
-        selected = incomplete[:10]
+        test_run_limit = self._get_pipeline_test_run_limit()
+        selected = incomplete[:test_run_limit]
         preview = "\n".join(selected)
         if not messagebox.askyesno(
             "Test Run",
             (
-                "Test run will process these files (max 10):\n\n"
+                f"Test run will process these files (max {test_run_limit}):\n\n"
                 f"{preview}\n\nProceed?"
             ),
         ):
@@ -6864,6 +7200,12 @@ class PipelineMasterGUI:
         if not self._prepare_test_scene_subset(selected):
             self._pipeline_sync_noninteractive_mode()
             return
+        self._pipeline_ui_noninteractive = True
+        self._append_pipeline_popup_log(
+            "INFO",
+            "Test Run",
+            "Non-interactive mode enabled: popups are suppressed and auto-accepted.",
+        )
         self.pipeline_run_status_var.set("Test run active (isolated subset)")
         self._pipeline_autorun = True
         self._pipeline_pending_action = None
@@ -7056,11 +7398,270 @@ class PipelineMasterGUI:
         self._refresh_pipeline_status_panel()
         return True
 
+    @staticmethod
+    def _copy_or_replace_file(src: Path, dst: Path) -> bool:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists() or dst.is_symlink():
+                try:
+                    if os.path.samefile(str(src), str(dst)):
+                        return True
+                except Exception:
+                    pass
+                try:
+                    if dst.is_dir():
+                        shutil.rmtree(dst)
+                    else:
+                        dst.unlink()
+                except Exception:
+                    return False
+            shutil.copy2(str(src), str(dst), follow_symlinks=True)
+            return True
+        except Exception:
+            return False
+
+    def _pipeline_sync_test_scene_files(
+        self,
+        src_dir: Path,
+        dst_dir: str,
+        patterns: list[str],
+        scene_stems: list[str],
+        *,
+        must_contain: str = "",
+    ) -> tuple[int, int]:
+        if not scene_stems:
+            return 0, 0
+        if not str(dst_dir or "").strip():
+            return 0, 0
+        if not src_dir.is_dir():
+            return 0, 0
+        dst_root = Path(dst_dir).expanduser().resolve()
+        copied = 0
+        errors = 0
+        src_files = self._pipeline_collect_scene_matched_files(
+            str(src_dir),
+            patterns,
+            scene_stems,
+            must_contain=must_contain,
+        )
+        for src in src_files:
+            dst = dst_root / src.name
+            if self._copy_or_replace_file(src, dst):
+                copied += 1
+            else:
+                errors += 1
+        return copied, errors
+
+    def _pipeline_merge_test_csv_rows(
+        self,
+        test_csv: Path,
+        dst_csv: str,
+        key_fields: str | list[str] | tuple[str, ...],
+    ) -> tuple[int, int]:
+        if not test_csv.is_file():
+            return 0, 0
+        dst_txt = str(dst_csv or "").strip()
+        if not dst_txt:
+            return 0, 0
+        if isinstance(key_fields, str):
+            key_names = [str(key_fields).strip()]
+        else:
+            key_names = [str(k).strip() for k in (key_fields or []) if str(k).strip()]
+        key_names = [k for k in key_names if k]
+        if not key_names:
+            return 0, 1
+
+        def _row_key(row: dict[str, str]) -> tuple[str, ...] | None:
+            parts: list[str] = []
+            for field in key_names:
+                value = str((row or {}).get(field, "")).strip()
+                if not value:
+                    return None
+                parts.append(value)
+            return tuple(parts)
+
+        try:
+            with open(test_csv, "r", newline="", encoding="utf-8") as f:
+                src_reader = csv.DictReader(f)
+                src_fieldnames = [str(x) for x in (src_reader.fieldnames or []) if str(x).strip()]
+                if any(field not in src_fieldnames for field in key_names):
+                    return 0, 1
+                src_rows = [dict(r or {}) for r in src_reader]
+        except Exception:
+            return 0, 1
+
+        src_index: dict[tuple[str, ...], dict[str, str]] = {}
+        src_order: list[tuple[str, ...]] = []
+        for row in src_rows:
+            key = _row_key(dict(row or {}))
+            if key is None:
+                continue
+            if key not in src_index:
+                src_order.append(key)
+            src_index[key] = dict(row or {})
+        if not src_index:
+            return 0, 0
+
+        dst_path = Path(dst_txt).expanduser().resolve()
+        try:
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return 0, 1
+
+        dst_rows_by_key: dict[tuple[str, ...], dict[str, str]] = {}
+        write_order: list[tuple[str, ...]] = []
+        dst_fieldnames: list[str] = []
+        if dst_path.is_file():
+            try:
+                with open(dst_path, "r", newline="", encoding="utf-8") as f:
+                    dst_reader = csv.DictReader(f)
+                    dst_fieldnames = [str(x) for x in (dst_reader.fieldnames or []) if str(x).strip()]
+                    for field in key_names:
+                        if field not in dst_fieldnames:
+                            dst_fieldnames.append(field)
+                    for row in dst_reader:
+                        row_dict = dict(row or {})
+                        key = _row_key(row_dict)
+                        if key is None:
+                            continue
+                        if key not in dst_rows_by_key:
+                            write_order.append(key)
+                        dst_rows_by_key[key] = row_dict
+            except Exception:
+                return 0, 1
+
+        if not dst_fieldnames:
+            dst_fieldnames = list(src_fieldnames)
+        for field in src_fieldnames:
+            if field not in dst_fieldnames:
+                dst_fieldnames.append(field)
+        for field in reversed(key_names):
+            if field in dst_fieldnames:
+                dst_fieldnames = [f for f in dst_fieldnames if f != field]
+            dst_fieldnames.insert(0, field)
+
+        merged_count = 0
+        for key in src_order:
+            row = dict(src_index[key])
+            if key not in dst_rows_by_key:
+                write_order.append(key)
+            dst_rows_by_key[key] = row
+            merged_count += 1
+
+        try:
+            with open(dst_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=dst_fieldnames)
+                writer.writeheader()
+                for key in write_order:
+                    row = dict(dst_rows_by_key.get(key, {}))
+                    for field in dst_fieldnames:
+                        row.setdefault(field, "")
+                    writer.writerow(row)
+        except Exception:
+            return 0, 1
+
+        return merged_count, 0
+
+    def _sync_test_scene_subset_to_real(
+        self,
+        prev_paths: dict[str, str],
+        test_root: Path | None,
+    ) -> tuple[int, int, int]:
+        if test_root is None or not test_root.is_dir():
+            return 0, 0, 0
+
+        scene_stems = [str(s).strip() for s in (self._pipeline_test_scene_stems or []) if str(s).strip()]
+        if not scene_stems:
+            scene_stems = [
+                self._pipeline_scene_stem_from_name(x)
+                for x in (self._pipeline_test_manifest or [])
+                if str(x).strip()
+            ]
+            scene_stems = [str(s).strip() for s in scene_stems if str(s).strip()]
+
+        copied_total = 0
+        error_total = 0
+        csv_merged_total = 0
+
+        def _sync_dir(src_dir: Path, dst_var: str, patterns: list[str], *, must_contain: str = "") -> None:
+            nonlocal copied_total, error_total
+            dst_dir = str(prev_paths.get(dst_var, "")).strip()
+            copied, errs = self._pipeline_sync_test_scene_files(
+                src_dir,
+                dst_dir,
+                patterns,
+                scene_stems,
+                must_contain=must_contain,
+            )
+            copied_total += copied
+            error_total += errs
+
+        video_patterns = ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"]
+        _sync_dir(test_root / "depthmap", "depth_output_var", video_patterns)
+        _sync_dir(test_root / "depthmap" / "upscaled", "depth_upscaled_var", video_patterns)
+        _sync_dir(test_root / "mask", "splat_mask_output_var", ["*_replace_mask.*"], must_contain="_replace_mask")
+        _sync_dir(
+            test_root / "output",
+            "inpaint_output_var",
+            ["*_inpainted_right_eye.mp4", "*_inpainted_sbs.mp4"],
+            must_contain="_inpainted_",
+        )
+        _sync_dir(
+            test_root / "mask_for_merge",
+            "merge_mask_formerge_var",
+            ["*_replace_mask.*"],
+            must_contain="_replace_mask",
+        )
+        _sync_dir(test_root / "sbs", "merge_output_var", video_patterns, must_contain="_merged_")
+
+        splat_root = str(prev_paths.get("splat_output_var", "")).strip()
+        if splat_root:
+            splat_root_path = Path(splat_root).expanduser().resolve()
+            splat_hires_dst = splat_root_path if splat_root_path.name.lower() == "hires" else splat_root_path / "hires"
+            copied, errs = self._pipeline_sync_test_scene_files(
+                test_root / "splat" / "hires",
+                str(splat_hires_dst),
+                video_patterns,
+                scene_stems,
+                must_contain="_splatted",
+            )
+            copied_total += copied
+            error_total += errs
+
+        join_src = Path(self.join_output_var.get().strip())
+        join_dst = str(prev_paths.get("join_output_var", "")).strip()
+        if join_src.is_file() and join_dst:
+            if self._copy_or_replace_file(join_src, Path(join_dst).expanduser().resolve()):
+                copied_total += 1
+            else:
+                error_total += 1
+
+        merged_rows, csv_err = self._pipeline_merge_test_csv_rows(
+            test_root / "sharpness_test.csv",
+            prev_paths.get("inpaint_sharpness_csv_var", ""),
+            ("file",),
+        )
+        csv_merged_total += merged_rows
+        error_total += csv_err
+        merged_rows, csv_err = self._pipeline_merge_test_csv_rows(
+            test_root / "autoct_test.csv",
+            prev_paths.get("merge_autoct_csv_var", ""),
+            ("video", "frame"),
+        )
+        csv_merged_total += merged_rows
+        error_total += csv_err
+
+        return copied_total, csv_merged_total, error_total
+
     def _restore_test_scene_subset(self) -> None:
         if not self._pipeline_test_active:
             return
         prev_paths = dict(self._pipeline_test_prev_paths)
         test_root = Path(self._pipeline_test_dir) if self._pipeline_test_dir else None
+        copied_count, csv_rows_count, sync_errors = self._sync_test_scene_subset_to_real(
+            prev_paths,
+            test_root,
+        )
 
         for var_name in self._pipeline_test_path_var_names():
             var_obj = getattr(self, var_name, None)
@@ -7070,7 +7671,7 @@ class PipelineMasterGUI:
                 var_obj.set(str(prev_paths[var_name]))
 
         cleaned = False
-        if test_root is not None and test_root.exists():
+        if test_root is not None and test_root.exists() and sync_errors == 0:
             try:
                 shutil.rmtree(test_root, ignore_errors=True)
                 cleaned = True
@@ -7091,40 +7692,51 @@ class PipelineMasterGUI:
         self._preview_merge_command()
         self._preview_join_command()
         self._refresh_pipeline_status_panel()
-        self.pipeline_run_status_var.set(
-            "Test run subset cleaned." if cleaned else "Test run subset closed."
-        )
+        if sync_errors > 0:
+            self.pipeline_run_status_var.set(
+                (
+                    f"Test run synced {copied_count} file(s), {csv_rows_count} CSV row(s), "
+                    f"errors={sync_errors}; subset kept."
+                )
+            )
+        else:
+            self.pipeline_run_status_var.set(
+                (
+                    f"Test run synced {copied_count} file(s), {csv_rows_count} CSV row(s); "
+                    f"{'subset cleaned' if cleaned else 'subset closed'}."
+                )
+            )
         self._pipeline_sync_noninteractive_mode()
 
     def _pipeline_start_resume(self) -> None:
+        if self._any_pipeline_activity():
+            messagebox.showinfo("Start/Resume", "Another task is currently running.")
+            self._pipeline_sync_noninteractive_mode()
+            return
+        self._pipeline_pause_after_split_scenes = False
+        if not self._pipeline_test_active and self._pipeline_split_scenes_gate_pending():
+            gate_msg = (
+                "Pipeline will pause after Split Scenes verification.\n\n"
+                "When Split Scenes verify is done, move clips you do NOT want to convert "
+                "into the seg-mono folder.\n\n"
+                "Then press Start/Resume again to continue."
+            )
+            self._append_pipeline_popup_log("INFO", "Start/Resume", gate_msg)
+            self._show_pipeline_force_info("Start/Resume", gate_msg)
+            self._pipeline_pause_after_split_scenes = True
         self._pipeline_ui_noninteractive = True
         self._append_pipeline_popup_log(
             "INFO",
             "Start/Resume",
             "Non-interactive mode enabled: popups are suppressed and routed to this log.",
         )
-        if self._any_pipeline_activity():
-            messagebox.showinfo("Start/Resume", "Another task is currently running.")
-            self._pipeline_sync_noninteractive_mode()
-            return
-        self._pipeline_pause_after_scenedetect = False
-        if not self._pipeline_test_active and self._pipeline_scenedetect_gate_pending():
-            gate_msg = (
-                "Pipeline will pause after SceneDetect verification.\n\n"
-                "When SceneDetect verify is done, move clips you do NOT want to convert "
-                "into the seg-mono folder.\n\n"
-                "Then press Start/Resume again to continue."
-            )
-            self._append_pipeline_popup_log("INFO", "Start/Resume", gate_msg)
-            self._show_pipeline_force_info("Start/Resume", gate_msg)
-            self._pipeline_pause_after_scenedetect = True
         self._pipeline_autorun = True
         self._pipeline_pending_action = None
         self.pipeline_run_status_var.set("Start/Resume running...")
         self._pipeline_trigger_next_action()
 
-    def _pipeline_scenedetect_gate_pending(self) -> bool:
-        st = self._pipeline_step_state.get("scenedetect", {"completed": False, "verified": "none"})
+    def _pipeline_split_scenes_gate_pending(self) -> bool:
+        st = self._pipeline_step_state.get("split_scenes", {"completed": False, "verified": "none"})
         if not bool(st.get("completed", False)):
             return True
         verify_mode = self.pipeline_verify_after_var.get().strip().lower()
@@ -7195,7 +7807,7 @@ class PipelineMasterGUI:
             st = step_state.get(step, {"completed": False, "verified": "none"})
             if not bool(st.get("completed", False)):
                 return step, "run", "none"
-            if self._pipeline_test_active and step == "scenedetect":
+            if self._pipeline_test_active and step in {"scenedetect", "split_scenes"}:
                 continue
             if step in self.PIPELINE_STEPS_WITH_VERIFY and verify_mode in {"quick", "deep"}:
                 current = str(st.get("verified", "none"))
@@ -7212,6 +7824,10 @@ class PipelineMasterGUI:
         if step == "scenedetect":
             before = bool(self._scene_thread and self._scene_thread.is_alive())
             self._start_scene_detect()
+            return bool(self._scene_thread and self._scene_thread.is_alive()) and not before
+        if step == "split_scenes":
+            before = bool(self._scene_thread and self._scene_thread.is_alive())
+            self._start_split_scenes()
             return bool(self._scene_thread and self._scene_thread.is_alive()) and not before
         if step == "depthcrafter":
             before = bool(self._depth_thread and self._depth_thread.is_alive())
@@ -7262,7 +7878,7 @@ class PipelineMasterGUI:
     def _pipeline_dispatch_verify(self, step: str, mode: str) -> bool:
         self.pipeline_run_status_var.set(f"Verifying {step} ({mode})")
         before = self._verify_running
-        if step == "scenedetect":
+        if step == "split_scenes":
             self._start_verify_deep() if mode == "deep" else self._start_verify_quick()
         elif step == "depthcrafter":
             self._start_depth_verify_deep() if mode == "deep" else self._start_depth_verify_quick()
@@ -7323,21 +7939,21 @@ class PipelineMasterGUI:
                 self.pipeline_run_status_var.set(f"Pipeline stopped: step failed ({step})")
                 self._pipeline_sync_noninteractive_mode()
                 return
-            if step == "scenedetect" and self._pipeline_pause_after_scenedetect and not self._pipeline_test_active:
+            if step == "split_scenes" and self._pipeline_pause_after_split_scenes and not self._pipeline_test_active:
                 verify_mode = self.pipeline_verify_after_var.get().strip().lower()
                 if verify_mode not in {"quick", "deep"}:
-                    self._pipeline_pause_after_scenedetect = False
+                    self._pipeline_pause_after_split_scenes = False
                     self._pipeline_autorun = False
                     pause_msg = (
-                        "SceneDetect completed.\n\n"
+                        "Split Scenes completed.\n\n"
                         "Please move clips you do NOT want to convert into seg-mono,\n"
                         "then press Start/Resume again to continue."
                     )
                     self.pipeline_run_status_var.set(
-                        "Paused after SceneDetect. Move files to seg-mono, then Start/Resume."
+                        "Paused after Split Scenes. Move files to seg-mono, then Start/Resume."
                     )
-                    self._append_pipeline_popup_log("INFO", "SceneDetect Pause", pause_msg)
-                    self._show_pipeline_force_info("SceneDetect Pause", pause_msg)
+                    self._append_pipeline_popup_log("INFO", "Split Scenes Pause", pause_msg)
+                    self._show_pipeline_force_info("Split Scenes Pause", pause_msg)
                     self._pipeline_sync_noninteractive_mode()
                     return
             self._pipeline_trigger_next_action()
@@ -7372,19 +7988,19 @@ class PipelineMasterGUI:
                 self.pipeline_run_status_var.set(f"Pipeline stopped: verify failed ({step})")
                 self._pipeline_sync_noninteractive_mode()
                 return
-            if step == "scenedetect" and self._pipeline_pause_after_scenedetect and not self._pipeline_test_active:
-                self._pipeline_pause_after_scenedetect = False
+            if step == "split_scenes" and self._pipeline_pause_after_split_scenes and not self._pipeline_test_active:
+                self._pipeline_pause_after_split_scenes = False
                 self._pipeline_autorun = False
                 pause_msg = (
-                    "SceneDetect verify completed.\n\n"
+                    "Split Scenes verify completed.\n\n"
                     "Please move clips you do NOT want to convert into seg-mono,\n"
                     "then press Start/Resume again to continue."
                 )
                 self.pipeline_run_status_var.set(
-                    "Paused after SceneDetect verify. Move files to seg-mono, then Start/Resume."
+                    "Paused after Split Scenes verify. Move files to seg-mono, then Start/Resume."
                 )
-                self._append_pipeline_popup_log("INFO", "SceneDetect Verify Pause", pause_msg)
-                self._show_pipeline_force_info("SceneDetect Verify Pause", pause_msg)
+                self._append_pipeline_popup_log("INFO", "Split Scenes Verify Pause", pause_msg)
+                self._show_pipeline_force_info("Split Scenes Verify Pause", pause_msg)
                 self._pipeline_sync_noninteractive_mode()
                 return
             self._pipeline_trigger_next_action()
@@ -7431,15 +8047,131 @@ class PipelineMasterGUI:
         self.depth_overlap_entry.configure(state=state_auto)
         self.depth_inference_steps_entry.configure(state=state_auto)
         self.depth_seed_entry.configure(state=state_auto)
+        self.depth_scale_factor_scale.configure(state=state_auto)
         self.depth_cpu_offload_combo.configure(state="readonly" if state_auto == tk.NORMAL else tk.DISABLED)
         self.depth_res_x_entry.configure(state=state_res)
         self.depth_res_y_entry.configure(state=state_res)
+        self._update_depth_resolution_preview()
         self._preview_depth_command()
 
     def _reset_depth_auto_locked_defaults(self) -> None:
-        # Fields disabled in Auto mode.
-        self.depth_res_x_var.set("640")
-        self.depth_res_y_var.set("384")
+        # Fields disabled in Auto mode are informational and update dynamically.
+        self._update_depth_resolution_preview()
+
+    def _normalize_depth_scale_factor(self, value) -> float:
+        try:
+            parsed = float(value)
+        except Exception:
+            parsed = float(self.DEFAULT_DEPTH_SCALE_FACTOR)
+        parsed = max(float(self.MIN_DEPTH_SCALE_FACTOR), min(float(self.MAX_DEPTH_SCALE_FACTOR), parsed))
+        return round(parsed, 2)
+
+    @staticmethod
+    def _round_up_multiple(n: int, m: int) -> int:
+        return ((int(n) + int(m) - 1) // int(m)) * int(m)
+
+    @staticmethod
+    def _ensure_even_min2(n: int) -> int:
+        v = max(2, int(n))
+        if v % 2:
+            v -= 1
+        return max(2, v)
+
+    def _depth_scene_strip_pad(self) -> tuple[int, int]:
+        strip_top = 0
+        strip_bottom = 0
+        try:
+            rec = self._recommended_crop_filters.get("auto") or {}
+            strip_top = max(0, int(rec.get("pad_top_src") or 0))
+            strip_bottom = max(0, int(rec.get("pad_bottom_src") or 0))
+        except Exception:
+            strip_top = 0
+            strip_bottom = 0
+        return strip_top, strip_bottom
+
+    def _get_depth_scale_factor(self) -> float:
+        factor = self._normalize_depth_scale_factor(self.depth_scale_factor_var.get())
+        try:
+            current = float(self.depth_scale_factor_var.get())
+        except Exception:
+            current = factor
+        if abs(current - factor) > 1e-9:
+            self.depth_scale_factor_var.set(factor)
+        self.depth_scale_factor_text_var.set(f"{factor:.2f}x")
+        return factor
+
+    def _compute_depth_working_sizes(
+        self,
+    ) -> tuple[int, int, int, int, int, int, int, int, int] | None:
+        src_w, src_h = self._get_depth_input_reference_resolution()
+        if not isinstance(src_w, int) or not isinstance(src_h, int):
+            return None
+        if src_w <= 0 or src_h <= 0:
+            return None
+
+        strip_top, strip_bottom = self._depth_scene_strip_pad()
+        strip_total = max(0, strip_top + strip_bottom)
+        max_strip = max(0, int(src_h) - 2)
+        if strip_total > max_strip:
+            if strip_total > 0:
+                ratio_top = float(strip_top) / float(strip_total)
+            else:
+                ratio_top = 0.5
+            strip_top = int(round(float(max_strip) * ratio_top))
+            strip_top = max(0, min(max_strip, strip_top))
+            strip_bottom = max_strip - strip_top
+            strip_total = strip_top + strip_bottom
+
+        core_h = int(src_h) - strip_total
+        if core_h < 2:
+            strip_top = 0
+            strip_bottom = 0
+            core_h = int(src_h)
+
+        factor = self._get_depth_scale_factor()
+        content_w = self._ensure_even_min2(int(int(src_w) * factor))
+        content_h = self._ensure_even_min2(int(int(core_h) * factor))
+        pad_w = self._round_up_multiple(content_w, 64)
+        pad_h = self._round_up_multiple(content_h, 64)
+
+        return (
+            content_w,
+            content_h,
+            pad_w,
+            pad_h,
+            int(src_w),
+            int(src_h),
+            strip_top,
+            strip_bottom,
+        )
+
+    def _update_depth_resolution_preview(self) -> None:
+        sizes = self._compute_depth_working_sizes()
+        if sizes is None:
+            self.depth_pad_target_var.set("n.d.")
+            if self.depth_mode_var.get().strip() != "Manual":
+                self.depth_res_x_var.set("")
+                self.depth_res_y_var.set("")
+            return
+
+        content_w, content_h, pad_w, pad_h, _src_w, _src_h, _strip_top, _strip_bottom = sizes
+        self.depth_res_x_var.set(str(content_w))
+        self.depth_res_y_var.set(str(content_h))
+        self.depth_pad_target_var.set(f"{pad_w}x{pad_h} (bottom)")
+
+    def _on_depth_scale_slider_moved(self, _value=None) -> None:
+        factor = self._normalize_depth_scale_factor(self.depth_scale_factor_var.get())
+        try:
+            current = float(self.depth_scale_factor_var.get())
+        except Exception:
+            current = factor
+        if abs(current - factor) > 1e-9:
+            self.depth_scale_factor_var.set(factor)
+
+    def _on_depth_scale_factor_changed(self, *_args) -> None:
+        self._get_depth_scale_factor()
+        self._update_depth_resolution_preview()
+        self._preview_depth_command()
 
     def _normalize_ffmpeg_codec(self, value: str, fallback: str = "") -> str:
         raw = str(value or "").strip().lower()
@@ -7509,15 +8241,8 @@ class PipelineMasterGUI:
             self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
         )
         self.depth_codec_var.set(depth_codec)
-        scene_strip_pad_top = 0
-        scene_strip_pad_bottom = 0
-        try:
-            rec = self._recommended_crop_filters.get("auto") or {}
-            scene_strip_pad_top = max(0, int(rec.get("pad_top_src") or 0))
-            scene_strip_pad_bottom = max(0, int(rec.get("pad_bottom_src") or 0))
-        except Exception:
-            scene_strip_pad_top = 0
-            scene_strip_pad_bottom = 0
+        scene_strip_pad_top, scene_strip_pad_bottom = self._depth_scene_strip_pad()
+        scale_factor = self._get_depth_scale_factor()
 
         env_updates: dict[str, str] = {
             "PYTHON": sys.executable,
@@ -7534,6 +8259,7 @@ class PipelineMasterGUI:
             "DECODE_CHUNK_SIZE": self.depth_decode_chunk_size_var.get().strip() or "2",
             "DEBUG_MEM": "True" if self.depth_debug_mem_var.get() else "False",
             "FINAL_UPSCALE": final_upscale,
+            "SCALE_FACTOR": f"{scale_factor:.2f}",
             "RESTART_EVERY": self.depth_restart_every_var.get().strip() or "100",
             "PAD_ALIGN_BOTTOM": "True",
             "USE_REALESRGAN_UPSCALE": "False",
@@ -7760,6 +8486,123 @@ class PipelineMasterGUI:
             return ""
         return str(model_dir) if model_dir.is_dir() else ""
 
+    @staticmethod
+    def _probe_video_resolution_fast(path: str) -> tuple[int | None, int | None]:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+            str(path),
+        ]
+        try:
+            cp = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=20.0)
+        except Exception:
+            return None, None
+        if cp.returncode != 0:
+            return None, None
+        try:
+            doc = json.loads(cp.stdout or "{}")
+            streams = doc.get("streams") or []
+            if not streams:
+                return None, None
+            st = streams[0] or {}
+            w = int(st.get("width")) if st.get("width") not in (None, "", "N/A") else None
+            h = int(st.get("height")) if st.get("height") not in (None, "", "N/A") else None
+            return w, h
+        except Exception:
+            return None, None
+
+    def _get_depth_input_reference_resolution(self) -> tuple[int | None, int | None]:
+        input_dir = self.depth_input_var.get().strip()
+        if input_dir and os.path.isdir(input_dir):
+            root = Path(input_dir)
+            sample: Path | None = None
+            patterns = self.VERIFY_VIDEO_PATTERNS or ["*.mp4"]
+            for patt in patterns:
+                for p in sorted(root.glob(patt)):
+                    if p.is_file():
+                        sample = p
+                        break
+                if sample is not None:
+                    break
+
+            if sample is not None:
+                try:
+                    cache_key = (
+                        str(root.resolve()),
+                        str(sample.resolve()),
+                        int(sample.stat().st_mtime_ns),
+                    )
+                except Exception:
+                    cache_key = (str(root), str(sample), 0)
+
+                if cache_key == self._depth_input_resolution_cache_key:
+                    w_cached, h_cached = self._depth_input_resolution_cache_value
+                    if (
+                        isinstance(w_cached, int)
+                        and isinstance(h_cached, int)
+                        and w_cached > 0
+                        and h_cached > 0
+                    ):
+                        return w_cached, h_cached
+
+                w_probe, h_probe = self._probe_video_resolution_fast(str(sample))
+                self._depth_input_resolution_cache_key = cache_key
+                self._depth_input_resolution_cache_value = (w_probe, h_probe)
+                if (
+                    isinstance(w_probe, int)
+                    and isinstance(h_probe, int)
+                    and w_probe > 0
+                    and h_probe > 0
+                ):
+                    return w_probe, h_probe
+
+        # Fallback for pre-split/pre-analysis states.
+        src_w = self._source_video_info.get("width")
+        src_h = self._source_video_info.get("height")
+        if (
+            isinstance(src_w, int)
+            and isinstance(src_h, int)
+            and src_w > 0
+            and src_h > 0
+        ):
+            if self._needs_downscale_to_1080():
+                scale = 1920.0 / float(src_w)
+                est_w = self._ensure_even_min2(1920)
+                est_h = self._ensure_even_min2(int(round(float(src_h) * scale)))
+                return est_w, est_h
+            return int(src_w), int(src_h)
+        return None, None
+
+    def _resolve_depth_upscale_dest(self, scale_factor: float) -> str:
+        if abs(float(scale_factor) - 0.5) <= 1e-9:
+            return ""
+        ref_dir = self.depth_input_var.get().strip()
+        if ref_dir and os.path.isdir(ref_dir):
+            for p in sorted(Path(ref_dir).glob("*.mp4")):
+                if not p.is_file():
+                    continue
+                w, h = self._probe_video_resolution_fast(str(p))
+                if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+                    return f"{w}x{h}"
+        src_w = self._source_video_info.get("width")
+        src_h = self._source_video_info.get("height")
+        if (
+            isinstance(src_w, int)
+            and isinstance(src_h, int)
+            and src_w > 0
+            and src_h > 0
+            and not self._needs_downscale_to_1080()
+        ):
+            return f"{src_w}x{src_h}"
+        return ""
+
     def _build_depth_upscale_payload(self) -> tuple[list[str], dict[str, str], str]:
         depth_codec = (self.depth_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC).lower()
         uses_nvenc = "nvenc" in depth_codec
@@ -7786,7 +8629,8 @@ class PipelineMasterGUI:
         scale = "2"
         model = "realesr-animevideov3-x2"
         tile = "auto"
-        dest = ""
+        scale_factor = self._get_depth_scale_factor()
+        dest = self._resolve_depth_upscale_dest(scale_factor)
         try:
             jobs_num = max(
                 1,
@@ -10216,6 +11060,7 @@ class PipelineMasterGUI:
         self.analysis_length_var.set("n.d.")
         self.analysis_fps_var.set("n.d.")
         self.analysis_bitrate_var.set("n.d.")
+        self._update_depth_resolution_preview()
         self._apply_option_states()
 
     def _on_detector_changed(self, _event=None) -> None:
@@ -10615,6 +11460,7 @@ class PipelineMasterGUI:
             self.scene_crop_tile_compat_var.set("n.d.")
 
         self._refresh_crop_controls_state()
+        self._update_depth_resolution_preview()
         if preview:
             self._preview_scene_command()
 
@@ -10759,19 +11605,12 @@ class PipelineMasterGUI:
             filters.append(f"format={pix_fmt}")
         return filters
 
-    def _build_scenedetect_command(self) -> list[str]:
-        input_path = self.scene_input_var.get().strip()
-        output_path = self.scene_output_var.get().strip()
-        detector_ui = self.scene_detector_var.get().strip().lower()
-        threshold = self.scene_threshold_var.get().strip()
-        backend = self._backend_to_cli(self.scene_backend_var.get().strip())
+    def _build_scene_split_ffmpeg_tokens(self) -> list[str]:
         scene_codec = self._normalize_ffmpeg_codec(
             self.scene_codec_var.get(),
             self.DEFAULT_SCENE_CODEC,
         )
         self.scene_codec_var.set(scene_codec)
-
-        detect_cmd = "detect-content" if detector_ui == "content" else "detect-adaptive"
         ffmpeg_tokens = [
             "-map",
             "0:v:0",
@@ -10804,8 +11643,15 @@ class PipelineMasterGUI:
         extra_ffmpeg = self.scene_extra_ffmpeg_args_var.get().strip()
         if extra_ffmpeg:
             ffmpeg_tokens.extend(shlex.split(extra_ffmpeg))
+        return ffmpeg_tokens
 
-        split_args = " ".join(ffmpeg_tokens)
+    def _build_scenedetect_command(self) -> list[str]:
+        input_path = self.scene_input_var.get().strip()
+        detector_ui = self.scene_detector_var.get().strip().lower()
+        threshold = self.scene_threshold_var.get().strip()
+        backend = self._backend_to_cli(self.scene_backend_var.get().strip())
+        scene_csv_path = Path(self._scene_csv_path()).resolve()
+        detect_cmd = "detect-content" if detector_ui == "content" else "detect-adaptive"
         return [
             "scenedetect",
             "-i",
@@ -10815,11 +11661,38 @@ class PipelineMasterGUI:
             detect_cmd,
             "-t",
             threshold,
-            "split-video",
+            "list-scenes",
             "-o",
+            str(scene_csv_path.parent),
+            "-f",
+            scene_csv_path.name,
+            "--skip-cuts",
+        ]
+
+    def _build_split_scenes_command(self) -> list[str]:
+        input_path = self.scene_input_var.get().strip()
+        output_path = self.scene_output_var.get().strip()
+        scene_csv_path = str(Path(self._scene_csv_path()).resolve())
+        workers = self._get_scene_split_workers()
+        ffmpeg_tokens = self._build_scene_split_ffmpeg_tokens()
+        script_path = Path("Utilities/split_scenes_from_csv.py").resolve()
+        return [
+            sys.executable,
+            str(script_path),
+            "--input-video",
+            input_path,
+            "--scene-csv",
+            scene_csv_path,
+            "--output-dir",
             output_path,
-            "-a",
-            split_args,
+            "--threads",
+            str(workers),
+            "--ffmpeg-args",
+            " ".join(ffmpeg_tokens),
+            "--skip-existing",
+            "yes",
+            "--delete-failed",
+            "yes",
         ]
 
     def _preview_scene_command(self) -> None:
@@ -10829,7 +11702,7 @@ class PipelineMasterGUI:
         except Exception as exc:
             self.scene_cmd_preview_var.set(f"Invalid options: {exc}")
 
-    def _validate_scene_form(self) -> bool:
+    def _validate_scene_form(self, require_scenedetect: bool = True) -> bool:
         input_path = self.scene_input_var.get().strip()
         output_path = self.scene_output_var.get().strip()
         if not input_path:
@@ -10847,7 +11720,7 @@ class PipelineMasterGUI:
             messagebox.showerror("SceneDetect", "Threshold must be a valid number.")
             return False
 
-        if shutil.which("scenedetect") is None:
+        if require_scenedetect and shutil.which("scenedetect") is None:
             messagebox.showerror("SceneDetect", "scenedetect command not found in PATH.")
             return False
         return True
@@ -10855,6 +11728,7 @@ class PipelineMasterGUI:
     def _set_scene_running(self, is_running: bool) -> None:
         self.scene_preview_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
         self.scene_run_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
+        self.scene_split_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
         stop_enabled = bool(is_running or self._analysis_running)
         self.scene_stop_btn.configure(state=tk.NORMAL if stop_enabled else tk.DISABLED)
         if is_running:
@@ -10980,21 +11854,40 @@ class PipelineMasterGUI:
         if self._pipeline_test_active:
             return targets
 
-        seg_mono_raw = self.join_seg_mono_var.get().strip()
-        if seg_mono_raw:
-            try:
-                seg_mono_resolved = str(Path(seg_mono_raw).resolve())
-            except Exception:
-                seg_mono_resolved = str(seg_mono_raw)
-            if (
-                seg_mono_resolved
-                and os.path.isdir(seg_mono_resolved)
-                and os.path.normpath(seg_mono_resolved) != os.path.normpath(seg_resolved)
-            ):
-                mono_files = [p for p in Path(seg_mono_resolved).glob("*.mp4") if p.is_file()]
-                if mono_files:
-                    targets.append(seg_mono_resolved)
+        # seg-mono is always managed under the active work folder.
+        try:
+            seg_mono_resolved = str(
+                (Path(self.work_folder_var.get().strip() or "./work").resolve() / "seg-mono")
+            )
+        except Exception:
+            seg_mono_resolved = ""
+        if (
+            seg_mono_resolved
+            and os.path.isdir(seg_mono_resolved)
+            and os.path.normpath(seg_mono_resolved) != os.path.normpath(seg_resolved)
+        ):
+            mono_files = self._collect_files_for_patterns(
+                seg_mono_resolved, self._scene_quick_verify_patterns()
+            )
+            if mono_files:
+                targets.append(seg_mono_resolved)
         return targets
+
+    def _scene_quick_verify_patterns(self) -> list[str]:
+        patterns: list[str] = []
+        for ext_raw in str(self.VERIFY_ALL_VIDEO_EXTENSIONS).split(","):
+            ext = str(ext_raw or "").strip()
+            if not ext:
+                continue
+            low_pat = f"*{ext.lower()}"
+            up_pat = f"*{ext.upper()}"
+            if low_pat not in patterns:
+                patterns.append(low_pat)
+            if up_pat not in patterns:
+                patterns.append(up_pat)
+        if not patterns:
+            return ["*.mp4", "*.MP4"]
+        return patterns
 
     @staticmethod
     def _run_ffprobe_watchdog(cmd: list[str], timeout_sec: float) -> tuple[int, str, str, bool]:
@@ -11204,7 +12097,10 @@ class PipelineMasterGUI:
 
     def _start_verify_quick(self) -> None:
         if self._scene_thread and self._scene_thread.is_alive():
-            messagebox.showinfo("Verify Scenes", "Stop SceneDetect before running verification.")
+            messagebox.showinfo(
+                "Verify Scenes",
+                "Stop SceneDetect/Split Scenes before running verification.",
+            )
             return
         if self._verify_running:
             messagebox.showinfo("Verify Scenes", "Another verification is already running.")
@@ -11217,9 +12113,13 @@ class PipelineMasterGUI:
             return
 
         self._set_verify_running(True, mode="quick")
+        self._scene_verify_result_applied = False
         self.scene_status_var.set("Verify (Quick) running...")
         self._append_scene_log("=== Verify Scenes (Quick) started ===")
         target_dirs = self._scene_verify_target_dirs(seg_dir)
+        self._append_scene_log(
+            "Quick verify targets: " + ", ".join(target_dirs if target_dirs else [seg_dir])
+        )
         self._verify_thread = threading.Thread(
             target=self._run_verify_quick_worker,
             args=(source_path, target_dirs),
@@ -11232,8 +12132,16 @@ class PipelineMasterGUI:
             files: list[str] = []
             seg_count = 0
             seg_mono_count = 0
+            expected_split_outputs: list[str] = []
+            missing_split_outputs: list[str] = []
+            split_cov_err = ""
+            if target_dirs:
+                expected_split_outputs, missing_split_outputs, split_cov_err = (
+                    self._collect_expected_split_scene_outputs(target_dirs[0])
+                )
+            verify_patterns = self._scene_quick_verify_patterns()
             for idx, d in enumerate(target_dirs):
-                cur = [str(p) for p in Path(d).glob("*.mp4") if p.is_file()]
+                cur = self._collect_files_for_patterns(d, verify_patterns)
                 files.extend(cur)
                 if idx == 0:
                     seg_count = len(cur)
@@ -11243,8 +12151,10 @@ class PipelineMasterGUI:
             if not files:
                 self._log_queue.put(("verify_quick_result", {
                     "ok": False,
-                    "message": "No .mp4 scene files found in seg/seg-mono folders.",
+                    "message": "No scene video files found in seg/seg-mono folders.",
                     "broken": [],
+                    "missing_split": missing_split_outputs,
+                    "split_cov_err": split_cov_err,
                     "duration_ok": False,
                     "frames_ok": False,
                 }))
@@ -11331,19 +12241,40 @@ class PipelineMasterGUI:
 
             self._log_queue.put(("line", f"[QUICK] duration check: {duration_msg}"))
             self._log_queue.put(("line", f"[QUICK] packet check: {frames_msg}"))
-            ok_final = (len(broken) == 0) and (frames_ok or frames_msg == "n.d.")
+            if split_cov_err:
+                self._log_queue.put(("line", f"[QUICK] split CSV check: ERROR: {split_cov_err}"))
+            else:
+                self._log_queue.put(
+                    (
+                        "line",
+                        (
+                            f"[QUICK] split CSV check: expected={len(expected_split_outputs)}, "
+                            f"missing={len(missing_split_outputs)}"
+                        ),
+                    )
+                )
+            ok_final = (
+                (len(broken) == 0)
+                and (frames_ok or frames_msg == "n.d.")
+                and (not split_cov_err)
+                and (len(missing_split_outputs) == 0)
+            )
             message = (
                 f"Quick verify completed.\n"
                 f"Broken files: {len(broken)}\n"
                 f"Duration match (informational only): {'YES' if duration_ok else ('N.D.' if duration_msg == 'n.d.' else 'NO')}\n"
                 f"Duration details: {duration_msg}\n"
                 f"Packet match (quick): {'YES' if frames_ok else ('N.D.' if frames_msg == 'n.d.' else 'NO')}\n"
-                f"Packet details: {frames_msg}"
+                f"Packet details: {frames_msg}\n"
+                f"Split CSV expected: {len(expected_split_outputs)}\n"
+                f"Split CSV missing: {len(missing_split_outputs)}"
             )
             self._log_queue.put(("verify_quick_result", {
                 "ok": ok_final,
                 "message": message,
                 "broken": broken,
+                "missing_split": missing_split_outputs,
+                "split_cov_err": split_cov_err,
                 "duration_ok": duration_ok,
                 "frames_ok": frames_ok,
             }))
@@ -11352,6 +12283,8 @@ class PipelineMasterGUI:
                 "ok": False,
                 "message": f"Quick verify failed: {type(e).__name__}: {e}",
                 "broken": [],
+                "missing_split": [],
+                "split_cov_err": "",
                 "duration_ok": False,
                 "frames_ok": False,
             }))
@@ -11360,7 +12293,10 @@ class PipelineMasterGUI:
 
     def _start_verify_deep(self) -> None:
         if self._scene_thread and self._scene_thread.is_alive():
-            messagebox.showinfo("Verify Scenes", "Stop SceneDetect before running verification.")
+            messagebox.showinfo(
+                "Verify Scenes",
+                "Stop SceneDetect/Split Scenes before running verification.",
+            )
             return
         if self._verify_running:
             messagebox.showinfo("Verify Scenes", "Another verification is already running.")
@@ -11383,6 +12319,7 @@ class PipelineMasterGUI:
             targets.append(("seg-mono", extra_dir))
 
         self._set_verify_running(True, mode="deep")
+        self._scene_verify_result_applied = False
         self.scene_status_var.set("Verify (Deep) running...")
         self._append_scene_log("=== Verify Scenes (Deep) started ===")
         for label, target_dir in targets:
@@ -11425,6 +12362,12 @@ class PipelineMasterGUI:
         primary_target = targets[0][1] if targets else ""
         bad_files: list[str] = []
         seen_bad: set[str] = set()
+        missing_split_outputs: list[str] = []
+        split_cov_err = ""
+        if primary_target:
+            _expected, missing_split_outputs, split_cov_err = self._collect_expected_split_scene_outputs(
+                primary_target
+            )
         try:
             for label, target_dir in targets:
                 cmd = [
@@ -11468,6 +12411,22 @@ class PipelineMasterGUI:
                 rc = int(proc.wait() or 0)
                 if rc != 0:
                     overall_rc = rc if overall_rc == 0 else overall_rc
+            if split_cov_err:
+                self._log_queue.put(("line", f"[DEEP][split-csv] ERROR: {split_cov_err}"))
+                overall_rc = overall_rc or 1
+            elif missing_split_outputs:
+                self._log_queue.put(
+                    (
+                        "line",
+                        (
+                            f"[DEEP][split-csv] missing split files: "
+                            f"{len(missing_split_outputs)}"
+                        ),
+                    )
+                )
+                for miss in missing_split_outputs[:20]:
+                    self._log_queue.put(("line", f"[DEEP][split-csv][MISSING] {miss}"))
+                overall_rc = overall_rc or 1
         except Exception as e:
             self._log_queue.put(("line", f"[DEEP][ERROR] {type(e).__name__}: {e}"))
             overall_rc = 1
@@ -11475,7 +12434,13 @@ class PipelineMasterGUI:
             self._log_queue.put(
                 (
                     "verify_deep_result",
-                    {"rc": overall_rc, "seg_dir": primary_target, "bad_files": bad_files},
+                    {
+                        "rc": overall_rc,
+                        "seg_dir": primary_target,
+                        "bad_files": bad_files,
+                        "missing_split": missing_split_outputs,
+                        "split_cov_err": split_cov_err,
+                    },
                 )
             )
             self._log_queue.put(("verify_done", "deep"))
@@ -11791,6 +12756,7 @@ class PipelineMasterGUI:
         self.analysis_length_var.set(self._fmt_duration(info.get("duration_sec")))
         self.analysis_fps_var.set(self._fmt_number(info.get("fps"), nd="n.d.", suffix=" fps", decimals=3))
         self.analysis_bitrate_var.set(self._fmt_bitrate(info.get("bitrate")))
+        self._update_depth_resolution_preview()
 
     @staticmethod
     def _as_text(value) -> str:
@@ -11917,7 +12883,7 @@ class PipelineMasterGUI:
 
     def _start_scene_detect(self) -> None:
         if self._scene_thread and self._scene_thread.is_alive():
-            messagebox.showinfo("SceneDetect", "SceneDetect is already running.")
+            messagebox.showinfo("SceneDetect", "A SceneDetect task is already running.")
             return
         if not self._validate_scene_form():
             return
@@ -11927,6 +12893,7 @@ class PipelineMasterGUI:
         self.scene_status_var.set("Starting...")
         self._set_scene_running(True)
         self._scene_stop_requested = False
+        self._scene_active_step = "scenedetect"
         if not self._pipeline_test_active:
             self._pipeline_invalidate_from("scenedetect")
 
@@ -11938,12 +12905,21 @@ class PipelineMasterGUI:
 
     def _run_scene_detect_worker(self, cmd: list[str]) -> None:
         proc = None
+        step_name = "scenedetect"
         try:
             output_dir = self.scene_output_var.get().strip()
+            csv_path = self._scene_csv_path()
             os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(str(Path(csv_path).resolve().parent), exist_ok=True)
 
-            self._log_queue.put(("line", "=== SceneDetect started ==="))
+            self._log_queue.put(("line", "=== SceneDetect started (CSV only) ==="))
             self._log_queue.put(("line", "CMD: " + " ".join(shlex.quote(p) for p in cmd)))
+
+            popen_kwargs: dict[str, object] = {}
+            if os.name == "posix":
+                popen_kwargs["start_new_session"] = True
+            elif os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
             proc = subprocess.Popen(
                 cmd,
@@ -11952,6 +12928,7 @@ class PipelineMasterGUI:
                 text=True,
                 bufsize=1,
                 universal_newlines=True,
+                **popen_kwargs,
             )
             self._scene_process = proc
 
@@ -11973,6 +12950,7 @@ class PipelineMasterGUI:
                     self._log_queue.put(("line", f"[INFO] seg-mono folder ready: {mono_dir}"))
                 except Exception as exc:
                     self._log_queue.put(("line", f"[WARN] could not create seg-mono folder: {exc}"))
+                self._log_queue.put(("line", f"[INFO] scene CSV: {csv_path}"))
                 self._log_queue.put(("status", "Completed"))
                 self._log_queue.put(("progress", "100"))
             else:
@@ -11987,22 +12965,128 @@ class PipelineMasterGUI:
                     proc.stdout.close()
                 except Exception:
                     pass
-            self._log_queue.put(("done", "1"))
+            self._log_queue.put(
+                (
+                    "done",
+                    {
+                        "step": step_name,
+                        "success": (not self._scene_stop_requested and proc is not None and proc.returncode == 0),
+                    },
+                )
+            )
+
+    def _start_split_scenes(self) -> None:
+        if self._scene_thread and self._scene_thread.is_alive():
+            messagebox.showinfo("Split Scenes", "A SceneDetect task is already running.")
+            return
+        if self._verify_running:
+            messagebox.showinfo("Split Scenes", "Stop verification before splitting scenes.")
+            return
+        if not self._validate_scene_form(require_scenedetect=False):
+            return
+        scene_csv_path = self._scene_csv_path()
+        entries, csv_err = self._load_scene_csv_entries(scene_csv_path)
+        if csv_err or not entries:
+            messagebox.showerror(
+                "Split Scenes",
+                (
+                    f"Scene CSV missing or invalid:\n{scene_csv_path}\n\n"
+                    "Run SceneDetect first."
+                ),
+            )
+            return
+        script_path = Path("Utilities/split_scenes_from_csv.py").resolve()
+        if not script_path.is_file():
+            messagebox.showerror("Split Scenes", f"Script not found:\n{script_path}")
+            return
+        if shutil.which("ffmpeg") is None:
+            messagebox.showerror("Split Scenes", "ffmpeg not found in PATH.")
+            return
+
+        self.scene_progress_var.set(0.0)
+        self.scene_status_var.set("Starting...")
+        self._set_scene_running(True)
+        self._scene_stop_requested = False
+        self._scene_active_step = "split_scenes"
+        if not self._pipeline_test_active:
+            self._pipeline_invalidate_from("split_scenes")
+
+        cmd = self._build_split_scenes_command()
+        self._scene_thread = threading.Thread(
+            target=self._run_split_scenes_worker,
+            args=(cmd,),
+            daemon=True,
+        )
+        self._scene_thread.start()
+
+    def _run_split_scenes_worker(self, cmd: list[str]) -> None:
+        proc = None
+        step_name = "split_scenes"
+        try:
+            output_dir = self.scene_output_var.get().strip()
+            os.makedirs(output_dir, exist_ok=True)
+            self._log_queue.put(("line", "=== Split Scenes started ==="))
+            self._log_queue.put(("line", "CMD: " + " ".join(shlex.quote(p) for p in cmd)))
+
+            popen_kwargs: dict[str, object] = {}
+            if os.name == "posix":
+                popen_kwargs["start_new_session"] = True
+            elif os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                **popen_kwargs,
+            )
+            self._scene_process = proc
+
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip("\n")
+                self._log_queue.put(("line", line))
+                self._try_parse_progress(line)
+                if self._scene_stop_requested:
+                    break
+
+            rc = proc.wait()
+            if self._scene_stop_requested:
+                self._log_queue.put(("status", "Stopped by user"))
+            elif rc == 0:
+                self._log_queue.put(("status", "Completed"))
+                self._log_queue.put(("progress", "100"))
+            else:
+                self._log_queue.put(("status", f"Failed (exit {rc})"))
+        except Exception as exc:
+            self._log_queue.put(("line", f"[ERROR] {exc}"))
+            self._log_queue.put(("status", "Failed"))
+        finally:
+            self._scene_process = None
+            if proc and proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            self._log_queue.put(
+                (
+                    "done",
+                    {
+                        "step": step_name,
+                        "success": (not self._scene_stop_requested and proc is not None and proc.returncode == 0),
+                    },
+                )
+            )
 
     def _stop_scene_detect(self, prompt_user: bool = True) -> None:
         scene_running = bool(self._scene_thread and self._scene_thread.is_alive())
         analysis_running = bool(self._analysis_running)
         if not scene_running and not analysis_running:
             return
-        if prompt_user:
-            messagebox.showwarning("Stop SceneDetect", self.STOP_SCENE_NOTICE)
-
-        clear_output = False
-        if scene_running and prompt_user:
-            clear_output = messagebox.askyesno(
-                "Stop SceneDetect",
-                "Clear SceneDetect output folder now?\n\n(yes/no)",
-            )
+        active_label = "Split Scenes" if self._scene_active_step == "split_scenes" else "SceneDetect"
 
         if analysis_running:
             self._analysis_stop_requested = True
@@ -12018,35 +13102,56 @@ class PipelineMasterGUI:
         if scene_running:
             self._scene_stop_requested = True
             self.scene_status_var.set("Stopping...")
-            self._append_scene_log("Stopping SceneDetect...")
+            self._append_scene_log(f"Stopping {active_label}...")
             proc_s = self._scene_process
             if proc_s is not None and proc_s.poll() is None:
-                try:
-                    proc_s.terminate()
-                except Exception as exc:
-                    self._append_scene_log(f"Terminate failed: {exc}")
-            self.root.after(2500, self._force_kill_scene_detect)
-
-            if clear_output:
-                out_dir = self.scene_output_var.get().strip()
-                if out_dir:
-                    deleted_files, deleted_dirs, errors = self._delete_folder_contents(out_dir)
-                    self._append_scene_log(
-                        f"[STOP] output cleanup: files={deleted_files}, dirs={deleted_dirs}, errors={len(errors)}"
-                    )
-                    for err in errors[:10]:
-                        self._append_scene_log(f"[STOP][CLEANUP][ERR] {err}")
+                stop_sig = signal.SIGINT if self._scene_active_step == "split_scenes" else signal.SIGTERM
+                sent = False
+                if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+                    try:
+                        os.killpg(os.getpgid(proc_s.pid), stop_sig)
+                        sent = True
+                        self._append_scene_log(
+                            f"[STOP] sent {stop_sig.name} to process group (pid={proc_s.pid})."
+                        )
+                    except Exception:
+                        sent = False
+                if not sent:
+                    try:
+                        proc_s.send_signal(stop_sig)
+                        self._append_scene_log(
+                            f"[STOP] sent {stop_sig.name} to process (no process-group signal)."
+                        )
+                    except Exception as send_exc:
+                        try:
+                            proc_s.terminate()
+                            self._append_scene_log("[STOP] sent terminate() to process.")
+                        except Exception as term_exc:
+                            self._append_scene_log(
+                                f"Terminate failed after send_signal error ({send_exc}): {term_exc}"
+                            )
+            # Give ffmpeg/python splitter time to flush and close current output.
+            self.root.after(6000, self._force_kill_scene_detect)
 
     def _force_kill_scene_detect(self) -> None:
         proc = self._scene_process
         if proc is None:
             return
         if proc.poll() is None:
-            try:
-                proc.kill()
-                self._append_scene_log("Process killed after timeout.")
-            except Exception as exc:
-                self._append_scene_log(f"Kill failed: {exc}")
+            killed = False
+            if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    killed = True
+                    self._append_scene_log("Process group killed after timeout.")
+                except Exception:
+                    killed = False
+            if not killed:
+                try:
+                    proc.kill()
+                    self._append_scene_log("Process killed after timeout.")
+                except Exception as exc:
+                    self._append_scene_log(f"Kill failed: {exc}")
 
     def _try_parse_progress(self, line: str) -> None:
         match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
@@ -12124,60 +13229,113 @@ class PipelineMasterGUI:
                     except Exception:
                         pass
                 elif kind == "done":
+                    stop_requested = bool(self._scene_stop_requested)
                     self._set_scene_running(False)
                     status_txt = self.scene_status_var.get().strip().lower()
-                    self._pipeline_on_run_finished("scenedetect", status_txt == "completed")
+                    step_name = self._scene_active_step or "scenedetect"
+                    success = status_txt == "completed"
+                    if isinstance(payload, dict):
+                        step_name = str(payload.get("step", step_name)).strip().lower() or step_name
+                        if "success" in payload:
+                            success = bool(payload.get("success", False))
+                            if (not success) and ("completed" in status_txt):
+                                success = True
+                    if step_name not in {"scenedetect", "split_scenes"}:
+                        step_name = "scenedetect"
+                    self._scene_active_step = step_name
+                    self._pipeline_on_run_finished(step_name, success)
+                    if stop_requested:
+                        stop_label = "Split Scenes" if step_name == "split_scenes" else "SceneDetect"
+                        self._append_scene_log(f"[STOP] {stop_label} stopped.")
+                    self._scene_stop_requested = False
                 elif kind == "depth_done":
-                    self._set_depth_running(False)
+                    stop_requested = bool(self._depth_stop_requested)
+                    status_txt = self.depth_status_var.get().strip().lower()
+                    step_name = ""
+                    success = False
                     if isinstance(payload, dict):
                         step_name = str(payload.get("step", "")).strip().lower()
                         success = bool(payload.get("success", False))
-                        if step_name in {"depthcrafter", "depth_upscale"}:
-                            self._pipeline_on_run_finished(step_name, success)
                     else:
-                        status_txt = self.depth_status_var.get().strip().lower()
+                        step_name = "depthcrafter"
+                        success = "completed" in status_txt
+                    self._set_depth_running(False)
+                    if step_name in {"depthcrafter", "depth_upscale"}:
+                        self._pipeline_on_run_finished(step_name, success)
+                    else:
                         self._pipeline_on_run_finished("depthcrafter", "completed" in status_txt)
+                        step_name = "depthcrafter"
+                    if stop_requested:
+                        stop_label = "Depth Upscale" if step_name == "depth_upscale" else "DepthCrafter"
+                        self._append_depth_log(f"[STOP] {stop_label} stopped.")
                 elif kind == "splat_done":
+                    stop_requested = bool(self._splat_stop_requested)
                     self._set_splat_running(False)
                     status_txt = self.splat_status_var.get().strip().lower()
                     self._pipeline_on_run_finished("splatting", "completed" in status_txt)
+                    if stop_requested:
+                        self._append_splat_log("[STOP] Splatting stopped.")
                 elif kind == "inpaint_done":
-                    self._set_inpaint_running(False)
+                    stop_requested = bool(self._inpaint_stop_requested)
+                    step_name = ""
+                    success = False
                     if isinstance(payload, dict):
                         step_name = str(payload.get("step", "")).strip().lower()
                         success = bool(payload.get("success", False))
-                        if step_name in {"sharpness_csv", "inpaint"}:
-                            self._pipeline_on_run_finished(step_name, success)
+                    self._set_inpaint_running(False)
+                    if step_name in {"sharpness_csv", "inpaint"}:
+                        self._pipeline_on_run_finished(step_name, success)
                     else:
                         status_txt = self.inpaint_status_var.get().strip().lower()
                         if "sharpness csv created" in status_txt:
                             self._pipeline_on_run_finished("sharpness_csv", True)
+                            step_name = "sharpness_csv"
                         elif "completed" in status_txt:
                             self._pipeline_on_run_finished("inpaint", True)
+                            step_name = "inpaint"
                         else:
                             pending = self._pipeline_pending_action
                             if pending and pending[1] == "run" and pending[0] in {"sharpness_csv", "inpaint"}:
                                 self._pipeline_on_run_finished(pending[0], False)
+                                step_name = pending[0]
+                    if stop_requested:
+                        stop_label = "Sharpness CSV" if step_name == "sharpness_csv" else "Inpainting"
+                        self._append_inpaint_log(f"[STOP] {stop_label} stopped.")
                 elif kind == "merge_done":
-                    self._set_merge_running(False)
+                    stop_requested = bool(self._merge_stop_requested)
+                    step_name = ""
+                    success = False
                     if isinstance(payload, dict):
                         step_name = str(payload.get("step", "")).strip().lower()
                         success = bool(payload.get("success", False))
-                        if step_name in {"autoct_csv", "mask_for_merge", "merging"}:
-                            self._pipeline_on_run_finished(step_name, success)
+                    self._set_merge_running(False)
+                    if step_name in {"autoct_csv", "mask_for_merge", "merging"}:
+                        self._pipeline_on_run_finished(step_name, success)
                     else:
                         status_txt = self.merge_status_var.get().strip().lower()
                         if "autoct csv created" in status_txt:
                             self._pipeline_on_run_finished("autoct_csv", True)
+                            step_name = "autoct_csv"
                         elif "mask-for-merge completed" in status_txt:
                             self._pipeline_on_run_finished("mask_for_merge", True)
+                            step_name = "mask_for_merge"
                         elif "completed" in status_txt:
                             self._pipeline_on_run_finished("merging", True)
+                            step_name = "merging"
                         else:
                             pending = self._pipeline_pending_action
                             if pending and pending[1] == "run" and pending[0] in {"autoct_csv", "mask_for_merge", "merging"}:
                                 self._pipeline_on_run_finished(pending[0], False)
+                                step_name = pending[0]
+                    if stop_requested:
+                        label_map = {
+                            "autoct_csv": "AutoCT CSV",
+                            "mask_for_merge": "Mask-for-merge",
+                            "merging": "Merging",
+                        }
+                        self._append_merge_log(f"[STOP] {label_map.get(step_name, 'Merging')} stopped.")
                 elif kind == "join_done":
+                    stop_requested = bool(self._join_stop_requested)
                     self._set_join_running(False)
                     status_txt = self.join_status_var.get().strip().lower()
                     step_name = "join"
@@ -12194,6 +13352,13 @@ class PipelineMasterGUI:
                         self._pipeline_on_run_finished("mono_to_sbs", success)
                     else:
                         self._pipeline_on_run_finished("join", success)
+                    if stop_requested:
+                        label_map = {
+                            "mono_to_sbs": "Mono->SBS",
+                            "remux": "Remux",
+                            "join": "Join",
+                        }
+                        self._append_join_log(f"[STOP] {label_map.get(step_name, 'Join')} stopped.")
                 elif kind == "analysis_info" and isinstance(payload, dict):
                     self._source_video_info = payload
                     self._update_source_capabilities(payload)
@@ -12205,12 +13370,17 @@ class PipelineMasterGUI:
                 elif kind == "analysis_status":
                     self.scene_analysis_status_var.set(str(payload))
                 elif kind == "analysis_done":
+                    analysis_stopped = bool(self._analysis_stop_requested)
                     self._set_analysis_running(False)
+                    if analysis_stopped:
+                        self._append_scene_log("[STOP] Source analysis stopped.")
                     self._analysis_stop_requested = False
                 elif kind == "verify_quick_result" and isinstance(payload, dict):
                     ok = bool(payload.get("ok", False))
                     msg = str(payload.get("message", "Quick verification finished."))
                     broken_files = [str(p) for p in (payload.get("broken") or []) if str(p).strip()]
+                    missing_split = [str(p) for p in (payload.get("missing_split") or []) if str(p).strip()]
+                    split_cov_err = str(payload.get("split_cov_err", "")).strip()
                     if ok:
                         self.scene_status_var.set("Verify (Quick) completed")
                         messagebox.showinfo("Verify Scenes (Quick)", msg)
@@ -12233,11 +13403,21 @@ class PipelineMasterGUI:
                                 broken_files,
                                 "Corrupted scene files",
                             )
+                        if split_cov_err:
+                            msg += f"\n\nSplit CSV check error:\n{split_cov_err}"
+                        if missing_split:
+                            msg += self._format_corrupted_files_block(
+                                missing_split,
+                                "Missing split files (from CSV)",
+                            )
                         messagebox.showwarning("Verify Scenes (Quick)", msg)
-                    self._pipeline_on_verify_finished("scenedetect", ok, "quick")
+                    self._scene_verify_result_applied = True
+                    self._pipeline_on_verify_finished("split_scenes", ok, "quick")
                 elif kind == "verify_deep_result" and isinstance(payload, dict):
                     rc = int(payload.get("rc", 1))
                     bad_files = [str(p) for p in (payload.get("bad_files") or []) if str(p).strip()]
+                    missing_split = [str(p) for p in (payload.get("missing_split") or []) if str(p).strip()]
+                    split_cov_err = str(payload.get("split_cov_err", "")).strip()
                     if rc == 0:
                         self.scene_status_var.set("Verify (Deep) completed")
                         messagebox.showinfo(
@@ -12246,18 +13426,26 @@ class PipelineMasterGUI:
                         )
                     else:
                         self.scene_status_var.set(f"Verify (Deep) failed (exit {rc})")
+                        warn_msg = (
+                            "Deep verification failed.\n\n"
+                            "Broken files were auto-deleted by verifier where possible."
+                        )
+                        if split_cov_err:
+                            warn_msg += f"\n\nSplit CSV check error:\n{split_cov_err}"
+                        warn_msg += self._format_corrupted_files_block(
+                            bad_files,
+                            "Corrupted scene files",
+                        )
+                        warn_msg += self._format_corrupted_files_block(
+                            missing_split,
+                            "Missing split files (from CSV)",
+                        )
                         messagebox.showwarning(
                             "Verify Scenes (Deep)",
-                            (
-                                "Deep verification failed.\n\n"
-                                "Broken files were auto-deleted by verifier where possible."
-                            )
-                            + self._format_corrupted_files_block(
-                                bad_files,
-                                "Corrupted scene files",
-                            ),
+                            warn_msg,
                         )
-                    self._pipeline_on_verify_finished("scenedetect", rc == 0, "deep")
+                    self._scene_verify_result_applied = True
+                    self._pipeline_on_verify_finished("split_scenes", rc == 0, "deep")
                 elif kind == "depth_verify_quick_result" and isinstance(payload, dict):
                     ok = bool(payload.get("ok", False))
                     msg = str(payload.get("message", "Depth quick verification finished."))
@@ -12680,6 +13868,12 @@ class PipelineMasterGUI:
                         messagebox.showwarning("Verify Mono->SBS", msg)
                     self._pipeline_on_verify_finished("mono_to_sbs", ok, mode)
                 elif kind == "verify_done":
+                    mode_txt = str(payload or "").strip().lower()
+                    if mode_txt in {"quick", "deep"} and not self._scene_verify_result_applied:
+                        status_txt = self.scene_status_var.get().strip().lower()
+                        verify_ok = ("completed" in status_txt) and ("failed" not in status_txt)
+                        self._pipeline_on_verify_finished("split_scenes", verify_ok, mode_txt)
+                    self._scene_verify_result_applied = False
                     self._set_verify_running(False)
                     if self._pipeline_autorun:
                         self._pipeline_trigger_next_action()
@@ -12718,6 +13912,7 @@ class PipelineMasterGUI:
             "depth_debug_mem": bool(self.depth_debug_mem_var.get()),
             "depth_glob": self.depth_glob_var.get().strip(),
             "depth_worker_script": self.depth_worker_script_var.get().strip(),
+            "depth_scale_factor": f"{self._get_depth_scale_factor():.2f}",
             "depth_res_x": self.depth_res_x_var.get().strip(),
             "depth_res_y": self.depth_res_y_var.get().strip(),
             "depth_encode_override": bool(self.depth_encode_override_var.get()),
@@ -12777,7 +13972,8 @@ class PipelineMasterGUI:
             "inpaint_extra_ffmpeg_args": self.inpaint_extra_ffmpeg_args_var.get().strip(),
             "merge_mode": self.merge_mode_var.get().strip(),
             "merge_autoct_workers": self.merge_autoct_workers_var.get().strip(),
-            "merge_parallel": bool(self.merge_parallel_var.get()),
+            "merge_mask_formerge_workers": self.merge_mask_formerge_workers_var.get().strip(),
+            "merge_parallel": bool(self._get_merge_worker_count() >= 2),
             "merge_parallel_workers": self.merge_parallel_workers_var.get().strip(),
             "merge_use_gpu": bool(self.merge_use_gpu_var.get()),
             "merge_output_format": self.merge_output_format_var.get().strip(),
@@ -12806,8 +14002,10 @@ class PipelineMasterGUI:
             "join_pix_fmt_override": bool(self.join_pix_fmt_override_var.get()),
             "join_pix_fmt": self.join_pix_fmt_var.get().strip(),
             "join_extra_args": self.join_extra_args_var.get().strip(),
+            "scene_split_threads": self.scene_split_threads_var.get().strip(),
             "verify_scenes_workers": self.verify_scenes_workers_var.get().strip(),
             "pipeline_verify_after": self.pipeline_verify_after_var.get().strip(),
+            "pipeline_test_run_files": self.pipeline_test_run_files_var.get().strip(),
             "resume_enabled": bool(self.resume_enabled_var.get()),
             "stop_on_error": bool(self.stop_on_error_var.get()),
             "auto_advance": bool(self.auto_advance_var.get()),

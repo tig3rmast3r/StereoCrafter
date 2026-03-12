@@ -49,6 +49,16 @@ STOP_REQUESTED=0
 FORCE_STOP=0
 pids=()
 wids=()
+worker_logs=()
+worker_jobs=()
+worker_line_offsets=()
+worker_done_counts=()
+worker_total_counts=()
+worker_exit_reported=()
+worker_exit_codes=()
+
+last_progress_done=-1
+last_progress_total=-1
 
 if ! [[ "$WORKERS" =~ ^[0-9]+$ ]] || [ "$WORKERS" -le 0 ]; then
   echo "[ERR ] invalid WORKERS='$WORKERS' (must be integer > 0)"
@@ -65,13 +75,25 @@ mkdir -p "$RUN_STATE_DIR"
 
 FILES=()
 while IFS= read -r -d '' f; do
+  if [ ! -f "$f" ]; then
+    echo "[WARN] skipping unreadable input (broken link?): $f"
+    continue
+  fi
   FILES+=("$f")
-done < <(find "$REPLACE_MASK_FOLDER" -maxdepth 1 -type f -name "$INPUT_GLOB" -print0 | sort -z)
+done < <(find "$REPLACE_MASK_FOLDER" -maxdepth 1 \( -type f -o -type l \) -name "$INPUT_GLOB" -print0 | sort -z)
 
 if [ "${#FILES[@]}" -eq 0 ]; then
   echo "[WARN] no files found in $REPLACE_MASK_FOLDER matching '$INPUT_GLOB'"
   exit 0
 fi
+
+for ((wid=0; wid<WORKERS; wid++)); do
+  worker_jobs[$wid]=0
+done
+for idx in "${!FILES[@]}"; do
+  wid=$((idx % WORKERS))
+  worker_jobs[$wid]=$((worker_jobs[$wid] + 1))
+done
 
 echo "[CFG ] workers=$WORKERS files=${#FILES[@]} use_gpu=$USE_GPU chunk=$CHUNK_SIZE"
 echo "[CFG ] input=$REPLACE_MASK_FOLDER"
@@ -106,16 +128,138 @@ wait_for_pid() {
   local pid="$1"
   local code=0
   while true; do
-    set +e
-    wait "$pid"
-    code=$?
-    set -e
+    if wait "$pid"; then
+      code=0
+    else
+      code=$?
+    fi
     if ! kill -0 "$pid" 2>/dev/null; then
       break
     fi
     sleep 0.1
   done
   return "$code"
+}
+
+is_uint() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+emit_progress_snapshot() {
+  local sum_done=0
+  local sum_total=0
+  local wid d t
+  for ((wid=0; wid<WORKERS; wid++)); do
+    d="${worker_done_counts[$wid]:-0}"
+    t="${worker_total_counts[$wid]:-0}"
+    if is_uint "$d"; then
+      sum_done=$((sum_done + d))
+    fi
+    if is_uint "$t"; then
+      sum_total=$((sum_total + t))
+    fi
+  done
+  if [ "$sum_total" -le 0 ]; then
+    return
+  fi
+  if [ "$sum_done" -gt "$sum_total" ]; then
+    sum_done="$sum_total"
+  fi
+  if [ "$sum_done" -ne "$last_progress_done" ] || [ "$sum_total" -ne "$last_progress_total" ]; then
+    last_progress_done="$sum_done"
+    last_progress_total="$sum_total"
+    echo "[RUN ] ${sum_done}/${sum_total}"
+  fi
+}
+
+increment_worker_done() {
+  local wid="$1"
+  local cur="${worker_done_counts[$wid]:-0}"
+  if ! is_uint "$cur"; then
+    cur=0
+  fi
+  cur=$((cur + 1))
+  local total="${worker_total_counts[$wid]:-0}"
+  if is_uint "$total" && [ "$total" -gt 0 ] && [ "$cur" -gt "$total" ]; then
+    cur="$total"
+  fi
+  worker_done_counts[$wid]="$cur"
+}
+
+parse_worker_log_line() {
+  local wid="$1"
+  local raw_line="$2"
+  local line="${raw_line//$'\r'/}"
+  line="${line#"${line%%[![:space:]]*}"}"
+
+  if [[ "$line" == *"[DONE]"* ]]; then
+    increment_worker_done "$wid"
+    return
+  fi
+  if [[ "$line" == *"[SKIP]"* ]]; then
+    increment_worker_done "$wid"
+    return
+  fi
+  if [[ "$line" == *"[ERR w${wid}] file failed rc="* ]]; then
+    increment_worker_done "$wid"
+    echo "[ERR ] worker $wid ${line}"
+    return
+  fi
+
+  if [[ "$line" == *"[RETRY w${wid}]"* ]]; then
+    echo "[RETRY] worker $wid ${line#*] }"
+    return
+  fi
+  if [[ "$line" == *"[FAIL w${wid}]"* ]]; then
+    echo "[ERR ] worker $wid ${line}"
+    return
+  fi
+  if [[ "$line" == *"[STOP w${wid}]"* ]]; then
+    echo "[STOP] worker $wid ${line#*] }"
+    return
+  fi
+
+  local lc="${line,,}"
+  if [[ "$lc" == *"cuda out of memory"* || "$lc" == *"out of memory"* || "$lc" == *"cudnn_status_alloc_failed"* || "$lc" == *"std::bad_alloc"* ]]; then
+    echo "[ERR ][OOM] worker $wid ${line}"
+    return
+  fi
+  if [[ "$lc" == *"cuda error"* || "$lc" == *"torch.acceleratorerror"* || "$lc" == *"invalid configuration argument"* ]]; then
+    echo "[ERR ][CUDA] worker $wid ${line}"
+    return
+  fi
+}
+
+poll_worker_log() {
+  local wid="$1"
+  local log_file="$2"
+  if [ ! -f "$log_file" ]; then
+    return
+  fi
+  local offset="${worker_line_offsets[$wid]:-0}"
+  if ! is_uint "$offset"; then
+    offset=0
+  fi
+  local -a new_lines=()
+  mapfile -s "$offset" -t new_lines <"$log_file" || true
+  local new_count="${#new_lines[@]}"
+  if [ "$new_count" -le 0 ]; then
+    return
+  fi
+  worker_line_offsets[$wid]=$((offset + new_count))
+  local line
+  for line in "${new_lines[@]}"; do
+    parse_worker_log_line "$wid" "$line"
+  done
+}
+
+poll_all_worker_logs() {
+  local i wid log_file
+  for i in "${!worker_logs[@]}"; do
+    wid="${wids[$i]}"
+    log_file="${worker_logs[$i]}"
+    poll_worker_log "$wid" "$log_file"
+  done
 }
 
 should_retry() {
@@ -360,30 +504,77 @@ run_worker_with_retries() {
 
 for ((wid=0; wid<WORKERS; wid++)); do
   wids+=("$wid")
-  run_worker_with_retries "$wid" > "mask_formerge_worker_${wid}.log" 2>&1 &
+  log_file="mask_formerge_worker_${wid}.log"
+  worker_logs+=("$log_file")
+  worker_line_offsets[$wid]=0
+  worker_done_counts[$wid]=0
+  worker_total_counts[$wid]="${worker_jobs[$wid]:-0}"
+  run_worker_with_retries "$wid" > "$log_file" 2>&1 &
   pids+=("$!")
-  echo "[START] worker $wid pid=${pids[-1]} log=mask_formerge_worker_${wid}.log"
+  echo "[START] worker $wid jobs=${worker_jobs[$wid]:-0} pid=${pids[-1]} log=$log_file"
 done
 
 fail=0
 fail_code=0
 for i in "${!pids[@]}"; do
-  pid="${pids[$i]}"
-  wid="${wids[$i]}"
-  set +e
-  wait_for_pid "$pid"
-  code=$?
-  set -e
-  if [ "$code" -ne 0 ]; then
-    echo "[DONE] worker $wid FAILED exit_code=$code (see mask_formerge_worker_${wid}.log)"
-    fail=1
-    if [ "$fail_code" -eq 0 ]; then
-      fail_code="$code"
+  worker_exit_reported[$i]=0
+  worker_exit_codes[$i]=-1
+done
+
+remaining="${#pids[@]}"
+while [ "$remaining" -gt 0 ]; do
+  poll_all_worker_logs
+  emit_progress_snapshot
+
+  for i in "${!pids[@]}"; do
+    if [ "${worker_exit_reported[$i]:-0}" -eq 1 ]; then
+      continue
     fi
-  else
-    echo "[DONE] worker $wid OK"
+    pid="${pids[$i]}"
+    if kill -0 "$pid" 2>/dev/null; then
+      continue
+    fi
+
+    set +e
+    wait "$pid"
+    code=$?
+    set -e
+
+    worker_exit_reported[$i]=1
+    worker_exit_codes[$i]="$code"
+    remaining=$((remaining - 1))
+    wid="${wids[$i]}"
+
+    if [ "$code" -ne 0 ]; then
+      echo "[ERR ][CRASH] worker $wid exit_code=$code (log: mask_formerge_worker_${wid}.log)"
+      fail=1
+      if [ "$fail_code" -eq 0 ]; then
+        fail_code="$code"
+      fi
+    else
+      echo "[WORKER] worker $wid OK"
+    fi
+  done
+
+  if [ "$remaining" -gt 0 ]; then
+    sleep 0.4
   fi
 done
+
+poll_all_worker_logs
+if [ "$fail" -eq 0 ]; then
+  for i in "${!pids[@]}"; do
+    if [ "${worker_exit_codes[$i]:-1}" -ne 0 ]; then
+      continue
+    fi
+    wid="${wids[$i]}"
+    total_for_wid="${worker_total_counts[$wid]:-0}"
+    if is_uint "$total_for_wid" && [ "$total_for_wid" -gt 0 ]; then
+      worker_done_counts[$wid]="$total_for_wid"
+    fi
+  done
+fi
+emit_progress_snapshot
 
 if [ "$FORCE_STOP" -eq 1 ]; then
   exit 130
@@ -402,4 +593,4 @@ if [ "$STOP_REQUESTED" -eq 1 ] || [ -f "$STOP_REQUEST_FILE" ]; then
   exit 0
 fi
 
-echo "[DONE] parallel mask_formerge completed"
+echo "[OK] parallel mask_formerge completed"

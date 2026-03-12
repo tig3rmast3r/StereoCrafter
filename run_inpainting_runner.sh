@@ -31,6 +31,7 @@ PROCESS_LENGTH="${PROCESS_LENGTH:--1}"
 # - If you want fixed steps for all files, set NO_SHARPNESS_CSV=1 and FIXED_STEPS.
 NO_SHARPNESS_CSV="${NO_SHARPNESS_CSV:-0}"
 SHARPNESS_BASE="${SHARPNESS_BASE:-./work/}"                    # folder containing sharpness.csv; empty => defaults to input folder
+SHARPNESS_CSV_PATH="${SHARPNESS_CSV_PATH:-}"                    # optional explicit sharpness CSV path
 FIXED_STEPS="${FIXED_STEPS:-8}"
 
 # Mask settings
@@ -83,7 +84,9 @@ CMD+=(--output_dir "$OUTPUT_DIR"
 if [[ "$NO_SHARPNESS_CSV" == "1" ]]; then
   CMD+=(--no_sharpness_csv)
 else
-  if [[ -n "$SHARPNESS_BASE" ]]; then
+  if [[ -n "$SHARPNESS_CSV_PATH" ]]; then
+    CMD+=(--sharpness_csv_path "$SHARPNESS_CSV_PATH")
+  elif [[ -n "$SHARPNESS_BASE" ]]; then
     CMD+=(--sharpness_base "$SHARPNESS_BASE")
   fi
 fi
