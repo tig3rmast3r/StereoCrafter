@@ -1285,6 +1285,7 @@ class SplatterGUI(ThemedTk):
             while True:
                 message = self.progress_queue.get_nowait()
                 if message == "finished":
+                    release_cuda_memory(aggressive=True)
                     self.status_label.config(text="Processing finished")
                     self.start_button.config(state="normal")
                     self.start_single_button.config(state="normal")
@@ -2823,7 +2824,7 @@ class SplatterGUI(ThemedTk):
             self.processing_thread.join(timeout=5.0)
             if self.processing_thread.is_alive():
                 logger.debug("==> Thread did not terminate gracefully within timeout.")
-        release_cuda_memory()
+        release_cuda_memory(aggressive=True)
         self.destroy()
 
     def _find_preview_sources_callback(self) -> list:
@@ -3886,7 +3887,7 @@ class SplatterGUI(ThemedTk):
             if render_blur_x > 0 or render_blur_y > 0:
                 tensor_4d = custom_blur(tensor_4d, float(render_blur_x), float(render_blur_y), False, max_raw_value)
             batch_depth_numpy_float = tensor_4d.squeeze(1).cpu().numpy()
-            release_cuda_memory()
+            release_cuda_memory(aggressive=True)
 
         return batch_depth_numpy_float
 
@@ -4404,7 +4405,7 @@ class SplatterGUI(ThemedTk):
         pil_img = Image.fromarray((final_tensor.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8))
 
         del stereo_projector, disp_map_tensor, right_eye_tensor_raw, occlusion_mask
-        release_cuda_memory()
+        release_cuda_memory(aggressive=True)
         logger.debug("--- Finished Preview Processing Callback ---")
         return pil_img
 

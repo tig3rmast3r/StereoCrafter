@@ -48,6 +48,7 @@ MOVE_FINISHED="${MOVE_FINISHED:-0}"
 FINISHED_SUBDIR="${FINISHED_SUBDIR:-finished}"
 
 DISABLE_DYNAMIC_CHUNK="${DISABLE_DYNAMIC_CHUNK:-1}"
+RETRY_POLICY_JSON="${RETRY_POLICY_JSON:-}"
 
 DEBUG="${DEBUG:-0}"
 STOP_MARKER="${STOP_MARKER:-$OUTPUT_DIR/.stop_after_current}"
@@ -102,6 +103,7 @@ if [[ "$SKIP_EXISTING" == "1" ]]; then CMD+=(--skip_existing); fi
 if [[ "$MOVE_FINISHED" == "1" ]]; then CMD+=(--move_finished); fi
 if [[ "$DEBUG" == "1" ]]; then CMD+=(--debug); fi
 if [[ "$DISABLE_DYNAMIC_CHUNK" == "1" ]]; then CMD+=(--no_dynamic_chunk); fi
+if [[ -n "$RETRY_POLICY_JSON" ]]; then CMD+=(--retry_policy_json "$RETRY_POLICY_JSON"); fi
 
 echo "[CMD] ${CMD[*]}"
 

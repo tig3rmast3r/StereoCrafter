@@ -386,7 +386,7 @@ class BatchProcessor:
             self.logger.error(f"Batch processing error: {e}", exc_info=True)
             self.progress_queue.put(("status", f"Error: {e}"))
         finally:
-            release_cuda_memory()
+            release_cuda_memory(aggressive=True)
             self.progress_queue.put("finished")
 
     def _process_single_video_orchestration(
@@ -401,6 +401,26 @@ class BatchProcessor:
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         self.logger.info(f"==> Processing Video: {video_name}")
         self.progress_queue.put(("update_info", {"filename": video_name}))
+
+        def _cleanup_task_readers(readers_dict: Optional[dict]) -> None:
+            if not isinstance(readers_dict, dict):
+                return
+            for key in ("source", "depth"):
+                reader_obj = readers_dict.get(key)
+                if reader_obj is None:
+                    continue
+                try:
+                    close_fn = getattr(reader_obj, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+                except Exception:
+                    pass
+            try:
+                readers_dict.clear()
+            except Exception:
+                pass
+            gc.collect()
+            release_cuda_memory(aggressive=True)
 
         # 1. Resolve Settings (Sidecar + GUI)
         vid_settings = self._get_video_specific_settings(video_path, settings, is_single_file_mode)
@@ -442,59 +462,63 @@ class BatchProcessor:
             output_layout = str(getattr(settings, "output_layout", "") or "").strip().lower()
             if output_layout not in {"quad", "dual", "single_warp"}:
                 output_layout = "dual" if bool(getattr(settings, "dual_output", False)) else "quad"
-            success = renderer.render_video(
-                input_video_reader=readers["source"],
-                depth_map_reader=readers["depth"],
-                total_frames_to_process=readers["total_frames"],
-                processed_fps=readers["fps"],
-                output_video_path_base=os.path.join(settings.output_splatted, task.output_subdir, f"{video_name}.mp4"),
-                target_output_height=readers["target_h"],
-                target_output_width=readers["target_w"],
-                max_disp=vid_settings["max_disparity_percentage"],
-                batch_size=task.batch_size,
-                dual_output=(output_layout == "dual"),
-                output_layout=output_layout,
-                zero_disparity_anchor_val=conv_val,
-                video_stream_info=readers["source_info"],
-                input_bias=vid_settings["input_bias"],
-                assume_raw_input=not vid_settings["enable_global_norm"],
-                global_depth_min=vid_settings.get("global_min", 0.0), # Will handle normalization inside renderer if needed
-                global_depth_max=vid_settings.get("global_max", 1.0),
-                depth_stream_info=readers["depth_info"],
-                user_output_crf=settings.output_crf_low if task.is_low_res else settings.output_crf_full,
-                is_low_res_task=task.is_low_res,
-                depth_gamma=vid_settings["depth_gamma"],
-                depth_dilate_size_x=vid_settings["depth_dilate_size_x"],
-                depth_dilate_size_y=vid_settings["depth_dilate_size_y"],
-                depth_blur_size_x=vid_settings["depth_blur_size_x"],
-                depth_blur_size_y=vid_settings["depth_blur_size_y"],
-                depth_dilate_left=vid_settings["depth_dilate_left"],
-                depth_blur_left=vid_settings["depth_blur_left"],
-                depth_blur_left_mix=vid_settings["depth_blur_left_mix"],
-                skip_lowres_preproc=settings.skip_lowres_preproc,
-                color_tags_mode=settings.color_tags_mode,
-                is_test_mode=settings.is_test_mode,
-                test_target_frame_idx=settings.test_target_frame_idx,
-                stair_smooth_enabled=settings.stair_smooth_enabled,
-                stair_blur_kernel=settings.stair_blur_kernel,
-                stair_edge_x_offset=settings.stair_edge_x_offset,
-                stair_strip_px=settings.stair_strip_px,
-                stair_strength=settings.stair_strength,
-                stair_debug_mask=settings.stair_debug_mask,
-                replace_mask_enabled=settings.replace_mask_enabled,
-                replace_mask_dir=settings.replace_mask_dir,
-                replace_mask_scale=settings.replace_mask_scale,
-                replace_mask_min_px=settings.replace_mask_min_px,
-                replace_mask_max_px=settings.replace_mask_max_px,
-                replace_mask_gap_tol=settings.replace_mask_gap_tol,
-                replace_mask_codec=settings.replace_mask_codec,
-                replace_mask_draw_edge=settings.replace_mask_draw_edge,
-            )
+            try:
+                renderer.render_video(
+                    input_video_reader=readers["source"],
+                    depth_map_reader=readers["depth"],
+                    total_frames_to_process=readers["total_frames"],
+                    processed_fps=readers["fps"],
+                    output_video_path_base=os.path.join(settings.output_splatted, task.output_subdir, f"{video_name}.mp4"),
+                    target_output_height=readers["target_h"],
+                    target_output_width=readers["target_w"],
+                    max_disp=vid_settings["max_disparity_percentage"],
+                    batch_size=task.batch_size,
+                    dual_output=(output_layout == "dual"),
+                    output_layout=output_layout,
+                    zero_disparity_anchor_val=conv_val,
+                    video_stream_info=readers["source_info"],
+                    input_bias=vid_settings["input_bias"],
+                    assume_raw_input=not vid_settings["enable_global_norm"],
+                    global_depth_min=vid_settings.get("global_min", 0.0), # Will handle normalization inside renderer if needed
+                    global_depth_max=vid_settings.get("global_max", 1.0),
+                    depth_stream_info=readers["depth_info"],
+                    user_output_crf=settings.output_crf_low if task.is_low_res else settings.output_crf_full,
+                    is_low_res_task=task.is_low_res,
+                    depth_gamma=vid_settings["depth_gamma"],
+                    depth_dilate_size_x=vid_settings["depth_dilate_size_x"],
+                    depth_dilate_size_y=vid_settings["depth_dilate_size_y"],
+                    depth_blur_size_x=vid_settings["depth_blur_size_x"],
+                    depth_blur_size_y=vid_settings["depth_blur_size_y"],
+                    depth_dilate_left=vid_settings["depth_dilate_left"],
+                    depth_blur_left=vid_settings["depth_blur_left"],
+                    depth_blur_left_mix=vid_settings["depth_blur_left_mix"],
+                    skip_lowres_preproc=settings.skip_lowres_preproc,
+                    color_tags_mode=settings.color_tags_mode,
+                    is_test_mode=settings.is_test_mode,
+                    test_target_frame_idx=settings.test_target_frame_idx,
+                    stair_smooth_enabled=settings.stair_smooth_enabled,
+                    stair_blur_kernel=settings.stair_blur_kernel,
+                    stair_edge_x_offset=settings.stair_edge_x_offset,
+                    stair_strip_px=settings.stair_strip_px,
+                    stair_strength=settings.stair_strength,
+                    stair_debug_mask=settings.stair_debug_mask,
+                    replace_mask_enabled=settings.replace_mask_enabled,
+                    replace_mask_dir=settings.replace_mask_dir,
+                    replace_mask_scale=settings.replace_mask_scale,
+                    replace_mask_min_px=settings.replace_mask_min_px,
+                    replace_mask_max_px=settings.replace_mask_max_px,
+                    replace_mask_gap_tol=settings.replace_mask_gap_tol,
+                    replace_mask_codec=settings.replace_mask_codec,
+                    replace_mask_draw_edge=settings.replace_mask_draw_edge,
+                )
+            finally:
+                _cleanup_task_readers(readers)
             processed_count += 1
             # Note: RenderProcessor already puts 'processed' events, but maybe we should synchronize here?
             # renderer.render_video might need to be told the start index.
             # For now, let's assume Rendering handles it and we just return count.
-
+        gc.collect()
+        release_cuda_memory(aggressive=True)
         return len(tasks)
 
     def _get_video_specific_settings(self, video_path: str, settings: ProcessingSettings, is_single_file_mode: bool) -> dict:

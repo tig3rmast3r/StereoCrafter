@@ -413,6 +413,159 @@ def _get_video_wh(path: str):
 
 DEFAULT_CHUNK_K = 3840 * 832 * 16  # reference: 1920x832 -> 16 frames_chunk
 
+RETRY_PROFILE_ORDER = ("run", "retry1", "retry2", "retry3")
+RETRY_OFFLOAD_CHOICES = {"none", "model", "sequential"}
+RETRY_MAX_SPLIT_CHOICES = {64, 128, 256, 512}
+
+
+def _norm_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _norm_offload_mode(value: object, fallback: str = "model") -> str:
+    mode = str(value or "").strip().lower()
+    if mode in RETRY_OFFLOAD_CHOICES:
+        return mode
+    fb = str(fallback or "model").strip().lower()
+    return fb if fb in RETRY_OFFLOAD_CHOICES else "model"
+
+
+def _norm_max_split(value: object) -> int | None:
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if s in {"", "none", "off", "0", "false"}:
+        return None
+    try:
+        parsed = int(float(s))
+    except Exception:
+        return None
+    if parsed in RETRY_MAX_SPLIT_CHOICES:
+        return parsed
+    return None
+
+
+def _default_retry_profiles(base_offload: str) -> list[dict[str, object]]:
+    inherited = _norm_offload_mode(base_offload, "model")
+    return [
+        {
+            "name": "run",
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": None,
+            "cpu_offload_mode": inherited,
+        },
+        {
+            "name": "retry1",
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": 512,
+            "cpu_offload_mode": inherited,
+        },
+        {
+            "name": "retry2",
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": 64,
+            "cpu_offload_mode": inherited,
+        },
+        {
+            "name": "retry3",
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": 64,
+            "cpu_offload_mode": "sequential",
+        },
+    ]
+
+
+def _parse_retry_policy_profiles(
+    policy_json: str,
+    base_offload: str,
+) -> tuple[list[dict[str, object]], bool]:
+    defaults = _default_retry_profiles(base_offload)
+    txt = str(policy_json or "").strip()
+    if not txt:
+        return defaults, False
+    try:
+        raw = json.loads(txt)
+    except Exception as e:
+        print(f"[WARN] retry_policy_json parse failed: {e}. Using defaults.")
+        return defaults, True
+    if not isinstance(raw, dict):
+        print("[WARN] retry_policy_json is not an object. Using defaults.")
+        return defaults, True
+
+    out: list[dict[str, object]] = []
+    for idx, name in enumerate(RETRY_PROFILE_ORDER):
+        base = defaults[idx]
+        node = raw.get(name, {})
+        if not isinstance(node, dict):
+            node = {}
+        out.append(
+            {
+                "name": name,
+                "garbage_collection_threshold": _norm_bool(
+                    node.get(
+                        "garbage_collection_threshold",
+                        base["garbage_collection_threshold"],
+                    ),
+                    bool(base["garbage_collection_threshold"]),
+                ),
+                "expandable_segments": _norm_bool(
+                    node.get("expandable_segments", base["expandable_segments"]),
+                    bool(base["expandable_segments"]),
+                ),
+                "max_split_size_mb": _norm_max_split(
+                    node.get("max_split_size_mb", base["max_split_size_mb"])
+                ),
+                "cpu_offload_mode": _norm_offload_mode(
+                    node.get("cpu_offload_mode", base["cpu_offload_mode"]),
+                    str(base["cpu_offload_mode"]),
+                ),
+            }
+        )
+    return out, True
+
+
+def _allocator_conf_from_profile(profile: dict[str, object]) -> str:
+    parts: list[str] = []
+    if _norm_bool(profile.get("garbage_collection_threshold"), True):
+        parts.append("garbage_collection_threshold:0.8")
+    if _norm_bool(profile.get("expandable_segments"), True):
+        parts.append("expandable_segments:True")
+    max_split = _norm_max_split(profile.get("max_split_size_mb"))
+    if max_split is not None:
+        parts.append(f"max_split_size_mb:{max_split}")
+    return ",".join(parts)
+
+
+def _apply_allocator_conf(conf: str) -> None:
+    conf_s = str(conf or "").strip()
+    if conf_s:
+        os.environ["PYTORCH_ALLOC_CONF"] = conf_s
+    else:
+        os.environ.pop("PYTORCH_ALLOC_CONF", None)
+    try:
+        alt = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+        if callable(alt):
+            alt(conf_s)
+            return
+        setter = getattr(torch.cuda.memory, "_set_allocator_settings", None)
+        if callable(setter):
+            setter(conf_s)
+    except Exception as e:
+        print(f"[WARN] failed to apply allocator settings '{conf_s or 'default'}': {e}")
+
 
 def _steps_from_sharpness(val: float) -> int:
     """
@@ -456,15 +609,52 @@ def run_batch(args):
         mask_blur_kernel_size=args.mask_blur_kernel_size,
     )
 
-    # Load pipeline once (same as GUI)
-    pipeline = igs.load_inpainting_pipeline(
-        pre_trained_path=r"./weights/stable-video-diffusion-img2vid-xt-1-1",
-        unet_path=r"./weights/StereoCrafter",
-        device="cuda",
-        dtype=torch.float16,
-        offload_type=args.offload_type,
+    retry_profiles, policy_was_explicit = _parse_retry_policy_profiles(
+        getattr(args, "retry_policy_json", ""),
+        args.offload_type,
     )
-    runner.pipeline = pipeline
+    if policy_was_explicit:
+        print("[INFO] retry policy source=gui/env")
+    else:
+        print("[INFO] retry policy source=default")
+    for prof in retry_profiles:
+        alloc = _allocator_conf_from_profile(prof) or "default"
+        print(
+            "[INFO] retry profile "
+            f"{prof['name']}: offload={prof['cpu_offload_mode']} alloc={alloc}"
+        )
+    retry_skipped: list[str] = []
+
+    pipeline = None
+    pipeline_mode = ""
+
+    def _drop_pipeline():
+        nonlocal pipeline, pipeline_mode
+        if pipeline is not None:
+            try:
+                del pipeline
+            except Exception:
+                pass
+        pipeline = None
+        pipeline_mode = ""
+        runner.pipeline = None
+        _safe_release_cuda()
+
+    def _ensure_pipeline(offload_type: str):
+        nonlocal pipeline, pipeline_mode
+        mode = _norm_offload_mode(offload_type, "model")
+        if pipeline is not None and pipeline_mode == mode:
+            return
+        _drop_pipeline()
+        pipeline = igs.load_inpainting_pipeline(
+            pre_trained_path=r"./weights/stable-video-diffusion-img2vid-xt-1-1",
+            unet_path=r"./weights/StereoCrafter",
+            device="cuda",
+            dtype=torch.float16,
+            offload_type=mode,
+        )
+        runner.pipeline = pipeline
+        pipeline_mode = mode
 
     # Build file list
     if args.input_video:
@@ -651,34 +841,72 @@ def run_batch(args):
             })
             current_job_marked = True
 
-            completed, hi_res_input_path = runner.process_single_video(
-                pipeline=pipeline,
-                input_video_path=video_path,
-                save_dir=args.output_dir,
-                frames_chunk=frames_chunk,
-                overlap=overlap,
-                tail_pad=tail_pad,
-                tile_num=args.tile_num,
-                vf=None,
-                num_inference_steps=num_steps,
-                stop_event=stop_event,
-                update_info_callback=None,
-                original_input_blend_strength=args.original_input_blend_strength,
-                output_crf=args.output_crf,
-                output_codec=args.output_codec,
-                output_preset=args.output_preset,
-                output_pix_fmt=args.output_pix_fmt,
-                output_extra_args=args.output_extra_args,
-                process_length=args.process_length,
-            )
+            run_ok = False
+            for attempt_idx, prof in enumerate(retry_profiles, start=1):
+                alloc_conf = _allocator_conf_from_profile(prof)
+                offload_mode = str(prof["cpu_offload_mode"])
+                print(
+                    f"[RETRY] {idx}/{len(videos)} attempt {attempt_idx}/{len(retry_profiles)} "
+                    f"profile={prof['name']} offload={offload_mode} "
+                    f"alloc={alloc_conf or 'default'}"
+                )
+                _apply_allocator_conf(alloc_conf)
+                _ensure_pipeline(offload_mode)
 
+                try:
+                    completed, hi_res_input_path = runner.process_single_video(
+                        pipeline=pipeline,
+                        input_video_path=video_path,
+                        save_dir=args.output_dir,
+                        frames_chunk=frames_chunk,
+                        overlap=overlap,
+                        tail_pad=tail_pad,
+                        tile_num=args.tile_num,
+                        vf=None,
+                        num_inference_steps=num_steps,
+                        stop_event=stop_event,
+                        update_info_callback=None,
+                        original_input_blend_strength=args.original_input_blend_strength,
+                        output_crf=args.output_crf,
+                        output_codec=args.output_codec,
+                        output_preset=args.output_preset,
+                        output_pix_fmt=args.output_pix_fmt,
+                        output_extra_args=args.output_extra_args,
+                        process_length=args.process_length,
+                    )
+                except Exception as e:
+                    completed = False
+                    print(
+                        f"[ERR] attempt {attempt_idx}/{len(retry_profiles)} "
+                        f"failed: {type(e).__name__}: {e}"
+                    )
+                    _cleanup_outputs(out_path)
+                    _drop_pipeline()
+                    continue
 
-            if completed and _is_output_complete(
-                video_path,
-                out_path,
-                args.process_length,
-                replace_mask_path=validation_ref_path if validation_ref_kind == "replace_mask" else "",
-            ):
+                if completed and _is_output_complete(
+                    video_path,
+                    out_path,
+                    args.process_length,
+                    replace_mask_path=validation_ref_path if validation_ref_kind == "replace_mask" else "",
+                ):
+                    run_ok = True
+                    break
+
+                if completed:
+                    print(
+                        f"[FAIL] attempt {attempt_idx}/{len(retry_profiles)} "
+                        f"output incomplete, deleting: {out_path}"
+                    )
+                else:
+                    print(
+                        f"[FAIL] attempt {attempt_idx}/{len(retry_profiles)} "
+                        "processing returned incomplete"
+                    )
+                _cleanup_outputs(out_path)
+                _drop_pipeline()
+
+            if run_ok:
                 if current_job_marked:
                     _clear_current_job_state(current_job_path)
                     current_job_marked = False
@@ -701,30 +929,23 @@ def run_batch(args):
                     if hi_res_input_path and os.path.exists(hi_res_input_path):
                         _move_to_subfolder(hi_res_input_path, args.finished_subdir)
             else:
-                if completed:
-                    print(f"[FAIL] output incomplete, deleting: {out_path}")
-                else:
-                    print("[FAIL] processing returned incomplete")
+                print(
+                    f"[SKIP] {idx}/{len(videos)} {base} skipped after "
+                    f"{len(retry_profiles)} retry profiles"
+                )
+                retry_skipped.append(base)
                 _cleanup_outputs(out_path)
                 if current_job_marked:
                     _clear_current_job_state(current_job_path)
                     current_job_marked = False
 
-        except torch.OutOfMemoryError as e:
-            print(f"[OOM] {e}")
-            _cleanup_outputs(out_path)
-            if current_job_marked:
-                _clear_current_job_state(current_job_path)
-                current_job_marked = False
-            _safe_release_cuda()
-            continue
         except Exception as e:
             print(f"[ERR] {type(e).__name__}: {e}")
             _cleanup_outputs(out_path)
             if current_job_marked:
                 _clear_current_job_state(current_job_path)
                 current_job_marked = False
-            _safe_release_cuda()
+            _drop_pipeline()
             continue
         finally:
             try:
@@ -737,6 +958,13 @@ def run_batch(args):
     if _stop_marker_exists(stop_marker_path):
         print(f"[STOP] marker detected at end of batch, clearing: {stop_marker_path}")
         _clear_stop_marker(stop_marker_path)
+
+    if retry_skipped:
+        preview = ", ".join(retry_skipped[:10])
+        more = "" if len(retry_skipped) <= 10 else f", ... (+{len(retry_skipped) - 10} more)"
+        print(f"[DONE] retry-skip files ({len(retry_skipped)}): {preview}{more}")
+
+    _drop_pipeline()
 
     return 0
 
@@ -774,6 +1002,8 @@ def main():
 
     p.add_argument("--offload_type", type=str, default="model", choices=["none", "model", "sequential"],
                    help="Matches GUI offload_type")
+    p.add_argument("--retry_policy_json", type=str, default="",
+                   help="Optional JSON policy for per-file retries (run/retry1/retry2/retry3).")
     p.add_argument("--output_codec", type=str, default="", help="Optional ffmpeg output codec override")
     p.add_argument("--output_preset", type=str, default="", help="Optional ffmpeg preset override")
     p.add_argument("--output_pix_fmt", type=str, default="", help="Optional ffmpeg pixel format override")

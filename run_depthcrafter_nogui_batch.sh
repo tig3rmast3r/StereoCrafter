@@ -33,6 +33,8 @@ FFMPEG_CRF="${FFMPEG_CRF:--1}"
 FFMPEG_PRESET="${FFMPEG_PRESET:-}"
 FFMPEG_PIX_FMT="${FFMPEG_PIX_FMT:-}"
 FFMPEG_EXTRA_ARGS="${FFMPEG_EXTRA_ARGS:-}"
+RETRY_POLICY_JSON="${RETRY_POLICY_JSON:-}"
+RETRY_PROCESS_RESTART_ALLOC_MB="${RETRY_PROCESS_RESTART_ALLOC_MB:-1024}"
 
 # Optional RealESRGAN upscale stage (used by pipeline GUI auto mode)
 USE_REALESRGAN_UPSCALE="${USE_REALESRGAN_UPSCALE:-False}"
@@ -56,6 +58,8 @@ RETRY_CODES_DEFAULT="124 133 135 136 137 139 132 134"
 RETRY_CODES="${RETRY_CODES:-$RETRY_CODES_DEFAULT}"
 
 # Watchdog policy (output activity)
+# Disabled by default: long clips can legitimately take > idle timeout between output updates.
+WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-False}"
 WATCHDOG_POLL_SEC="${WATCHDOG_POLL_SEC:-20}"
 WATCHDOG_IDLE_SEC="${WATCHDOG_IDLE_SEC:-600}"
 WATCHDOG_TERM_GRACE_SEC="${WATCHDOG_TERM_GRACE_SEC:-10}"
@@ -110,6 +114,12 @@ fi
 if [[ -n "${FFMPEG_EXTRA_ARGS// }" ]]; then
   CMD+=(--ffmpeg_extra_args "$FFMPEG_EXTRA_ARGS")
 fi
+if [[ -n "${RETRY_POLICY_JSON// }" ]]; then
+  CMD+=(--retry_policy_json "$RETRY_POLICY_JSON")
+fi
+if [[ "$RETRY_PROCESS_RESTART_ALLOC_MB" =~ ^[0-9]+$ ]] && [[ "$RETRY_PROCESS_RESTART_ALLOC_MB" -ge 0 ]]; then
+  CMD+=(--retry_process_restart_alloc_mb "$RETRY_PROCESS_RESTART_ALLOC_MB")
+fi
 
 echo "[CMD] ${CMD[*]}"
 
@@ -120,9 +130,20 @@ cleanup_runtime() {
 
 _latest_mp4_in_output() {
   find "$OUTPUT_DIR" -maxdepth 1 -type f -name "*.mp4" -printf '%T@|%p\n' 2>/dev/null \
-    | sort -t'|' -nr -k1,1 \
-    | head -n1 \
-    | cut -d'|' -f2-
+    | awk -F'|' '
+      BEGIN { max_ts = -1; latest = "" }
+      {
+        ts = $1 + 0
+        if (ts > max_ts) {
+          max_ts = ts
+          latest = $2
+        }
+      }
+      END {
+        if (latest != "") print latest
+      }
+    ' || true
+  return 0
 }
 
 _ffprobe_quick_ok() {
@@ -159,8 +180,20 @@ _cleanup_depth_tmp() {
 
 _latest_output_token() {
   find "$OUTPUT_DIR" -type f ! -name ".stop_after_current" -printf '%T@|%s|%p\n' 2>/dev/null \
-    | sort -t'|' -nr -k1,1 \
-    | head -n1
+    | awk -F'|' '
+      BEGIN { max_ts = -1; latest = "" }
+      {
+        ts = $1 + 0
+        if (ts > max_ts) {
+          max_ts = ts
+          latest = $0
+        }
+      }
+      END {
+        if (latest != "") print latest
+      }
+    ' || true
+  return 0
 }
 
 _kill_child_group() {
@@ -284,13 +317,9 @@ _request_stop_signal() {
 }
 
 should_retry() {
-  local code="$1"
-  for c in $RETRY_CODES; do
-    if [[ "$code" -eq "$c" ]]; then
-      return 0
-    fi
-  done
-  return 1
+  local _code="${1:-1}"
+  # Retry on any non-zero exit code; MAX_RETRIES still applies.
+  return 0
 }
 
 _run_once_with_watchdog() {
@@ -307,6 +336,18 @@ _run_once_with_watchdog() {
   child_pgid="$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d '[:space:]')"
   CURRENT_CHILD_PID="$child_pid"
   CURRENT_CHILD_PGID="$child_pgid"
+
+  if ! _is_true "$WATCHDOG_ENABLED"; then
+    local rc=0
+    if wait "$child_pid"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    CURRENT_CHILD_PID=""
+    CURRENT_CHILD_PGID=""
+    return "$rc"
+  fi
 
   last_token="$(_latest_output_token)"
   last_activity_ts=$(date +%s)

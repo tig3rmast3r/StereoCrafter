@@ -264,13 +264,9 @@ run_once() {
 }
 
 should_retry() {
-  local code="$1"
-  for c in $RETRY_CODES; do
-    if [ "$code" -eq "$c" ]; then
-      return 0
-    fi
-  done
-  return 1
+  local _code="${1:-1}"
+  # Retry on any non-zero exit code; MAX_RETRIES still applies.
+  return 0
 }
 
 attempt=1

@@ -59,7 +59,24 @@ fi
 
 mkdir -p "$OUT_DIR"
 
-mapfile -d '' -t FILES < <(find "$IN_DIR" -maxdepth 1 -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mov' -o -iname '*.avi' \) -print0 | sort -z -V)
+mapfile -d '' -t FILES < <(
+  find "$IN_DIR" -maxdepth 1 \( -type f -o -type l \) \
+    \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mov' -o -iname '*.avi' \) \
+    -print0 | sort -z -V
+)
+READABLE_FILES=()
+for f in "${FILES[@]}"; do
+  if [[ -L "$f" && ! -e "$f" ]]; then
+    echo "[WARN] skipping broken link: $f" >&2
+    continue
+  fi
+  if [[ ! -r "$f" ]]; then
+    echo "[WARN] skipping unreadable input: $f" >&2
+    continue
+  fi
+  READABLE_FILES+=("$f")
+done
+FILES=("${READABLE_FILES[@]}")
 (( ${#FILES[@]} > 0 )) || { echo "Nessun video in: $IN_DIR" >&2; exit 1; }
 
 FIRST="${FILES[0]}"

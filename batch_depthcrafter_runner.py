@@ -29,8 +29,11 @@ Tries NVENC first; falls back to libx264 if NVENC fails.
 """
 import gc
 import importlib.util
+import json
+import os
 import shlex
 import subprocess
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -72,6 +75,76 @@ def _cuda_cleanup():
     except Exception:
         pass
     gc.collect()
+
+
+def _cuda_allocated_mb() -> float:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return float(torch.cuda.memory_allocated() / (1024.0 * 1024.0))
+    except Exception:
+        pass
+    return 0.0
+
+
+def _load_retry_resume_state(path: Path) -> dict[str, object] | None:
+    try:
+        if not path.exists():
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        pass
+    return None
+
+
+def _save_retry_resume_state(path: Path, input_name: str, next_attempt: int, total_attempts: int) -> None:
+    payload = {
+        "input_name": str(input_name),
+        "next_attempt": int(next_attempt),
+        "total_attempts": int(total_attempts),
+        "updated_at": int(time.time()),
+    }
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+    except Exception as e:
+        print(f"[WARN] failed writing retry resume state: {e}")
+
+
+def _clear_retry_resume_state(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def _load_retry_skip_manifest(path: Path) -> set[str]:
+    try:
+        if not path.exists():
+            return set()
+        out: set[str] = set()
+        for line in path.read_text(encoding="utf-8").splitlines():
+            name = str(line).strip()
+            if name:
+                out.add(name)
+        return out
+    except Exception:
+        return set()
+
+
+def _save_retry_skip_manifest(path: Path, names: set[str]) -> None:
+    try:
+        ordered = sorted({str(x).strip() for x in names if str(x).strip()})
+        if not ordered:
+            if path.exists():
+                path.unlink()
+            return
+        path.write_text("\n".join(ordered) + "\n", encoding="utf-8")
+    except Exception as e:
+        print(f"[WARN] failed writing retry skip manifest: {e}")
 
 
 def _ensure_dir(p: Path):
@@ -379,6 +452,8 @@ def run(
     ffmpeg_preset: str = "",
     ffmpeg_pix_fmt: str = "",
     ffmpeg_extra_args: str = "",
+    retry_policy_json: str = "",
+    retry_process_restart_alloc_mb: int = 1024,
 ):
     input_dir_p = Path(input_dir).resolve()
     output_dir_p = Path(output_dir).resolve()
@@ -424,7 +499,7 @@ def run(
 
     total = len(files)
     ok = skipped = failed = 0
-    processed = 0
+    processed_non_skip = 0
     try:
         scale_factor_f = float(scale_factor)
     except Exception:
@@ -451,21 +526,58 @@ def run(
         f"pix_fmt={ffmpeg_pix_fmt or 'default'} "
         f"extra={'set' if str(ffmpeg_extra_args).strip() else 'none'}"
     )
+    retry_profiles, policy_was_explicit = _parse_retry_policy_profiles(
+        retry_policy_json,
+        cpu_offload_mode,
+    )
+    retry_resume_state_file = output_dir_p / ".depth_retry_resume_state.json"
+    retry_skip_manifest_file = output_dir_p / ".depth_retry_skipped.txt"
+    retry_resume_state = _load_retry_resume_state(retry_resume_state_file)
+    retry_skip_persisted = _load_retry_skip_manifest(retry_skip_manifest_file)
+    if retry_resume_state and str(retry_resume_state.get("input_name") or "").strip():
+        print(
+            "[INFO] retry resume state found: "
+            f"input={retry_resume_state.get('input_name')} "
+            f"next_attempt={retry_resume_state.get('next_attempt')}"
+        )
+    if retry_skip_persisted:
+        print(f"[INFO] persisted retry-skip files loaded: {len(retry_skip_persisted)}")
+    if policy_was_explicit:
+        print("[INFO] retry policy source=gui/env")
+    else:
+        print("[INFO] retry policy source=default")
+    for prof in retry_profiles:
+        alloc = _allocator_conf_from_profile(prof) or "default"
+        print(
+            "[INFO] retry profile "
+            f"{prof['name']}: offload={prof['cpu_offload_mode']} alloc={alloc}"
+        )
+    retry_skipped: list[str] = []
 
     for i, in_path in enumerate(files, 1):
-        processed += 1
-
-        if restart_every and processed > 1 and (processed - 1) % int(restart_every) == 0:
-            print(f"[INFO] Restarting pipeline (restart_every={restart_every}) ...")
-            hard_reset_runner(cpu_offload_mode)
-
         out_name = _default_out_name(in_path, out_ext=out_ext, suffix=suffix)
         out_final = output_dir_p / out_name
+
+        if in_path.name in retry_skip_persisted:
+            skipped += 1
+            print(f"[SKIP] {i}/{total} {in_path.name} (retry-skip persisted)")
+            continue
 
         if out_final.exists() and out_final.stat().st_size > 0:
             skipped += 1
             print(f"[SKIP] {i}/{total} {in_path.name} -> {out_final.name} (exists)")
+            if retry_resume_state and str(retry_resume_state.get("input_name") or "") == in_path.name:
+                _clear_retry_resume_state(retry_resume_state_file)
+                retry_resume_state = None
             continue
+
+        processed_non_skip += 1
+        if restart_every and processed_non_skip > 1 and (processed_non_skip - 1) % int(restart_every) == 0:
+            print(
+                "[INFO] Restarting pipeline "
+                f"(restart_every={restart_every}, non_skip={processed_non_skip}) ..."
+            )
+            hard_reset_runner(cpu_offload_mode)
 
         # Probe original size
         try:
@@ -615,6 +727,131 @@ def run(
                 ffmpeg_extra_args=ffmpeg_extra_args,
             )
 
+        def _cleanup_local_temps():
+            if not keep_temps:
+                for p in (tmp_pre, tmp_depth):
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+
+        if policy_was_explicit:
+            success = False
+            last_exc: Exception | None = None
+            start_attempt_idx = 1
+            if retry_resume_state and str(retry_resume_state.get("input_name") or "") == in_path.name:
+                try:
+                    start_attempt_idx = int(retry_resume_state.get("next_attempt") or 1)
+                except Exception:
+                    start_attempt_idx = 1
+                start_attempt_idx = max(1, min(len(retry_profiles), start_attempt_idx))
+                if start_attempt_idx > 1:
+                    print(
+                        f"[RETRY] resuming {i}/{total} from attempt "
+                        f"{start_attempt_idx}/{len(retry_profiles)} after process restart"
+                    )
+            try:
+                for attempt_idx in range(start_attempt_idx, len(retry_profiles) + 1):
+                    prof = retry_profiles[attempt_idx - 1]
+                    alloc_conf = _allocator_conf_from_profile(prof)
+                    offload_mode = str(prof["cpu_offload_mode"])
+                    _save_retry_resume_state(
+                        retry_resume_state_file,
+                        in_path.name,
+                        attempt_idx,
+                        len(retry_profiles),
+                    )
+                    print(
+                        f"[RETRY] {i}/{total} attempt {attempt_idx}/{len(retry_profiles)} "
+                        f"profile={prof['name']} offload={offload_mode} "
+                        f"alloc={alloc_conf or 'default'}"
+                    )
+                    _apply_allocator_conf(alloc_conf)
+                    _cuda_cleanup()
+                    t_attempt = time.perf_counter()
+                    try:
+                        attempt(offload_mode, decode_chunk_size)
+                        success = True
+                        ok += 1
+                        dt = time.perf_counter() - t0
+                        dta = time.perf_counter() - t_attempt
+                        print(
+                            f"[OK  ] {i}/{total} done in {dt:.1f}s "
+                            f"(attempt={attempt_idx} profile={prof['name']} attempt_time={dta:.1f}s)"
+                        )
+                        if in_path.name in retry_skip_persisted:
+                            retry_skip_persisted.discard(in_path.name)
+                            _save_retry_skip_manifest(retry_skip_manifest_file, retry_skip_persisted)
+                        _clear_retry_resume_state(retry_resume_state_file)
+                        retry_resume_state = None
+                        break
+                    except Exception as e:
+                        last_exc = e
+                        dta = time.perf_counter() - t_attempt
+                        print(
+                            f"[ERR ] {i}/{total} attempt {attempt_idx}/{len(retry_profiles)} "
+                            f"failed in {dta:.1f}s: {type(e).__name__}: {e}"
+                        )
+                        _cuda_cleanup()
+                        alloc_after_fail_mb = _cuda_allocated_mb()
+                        print(
+                            f"[RETRY] post-fail cuda_alloc={alloc_after_fail_mb:.0f}MB "
+                            f"(threshold={int(retry_process_restart_alloc_mb)}MB)"
+                        )
+                        if remove_partial_output and out_final.exists():
+                            try:
+                                out_final.unlink()
+                            except Exception:
+                                pass
+                        if (
+                            attempt_idx < len(retry_profiles)
+                            and float(alloc_after_fail_mb) >= float(retry_process_restart_alloc_mb)
+                        ):
+                            next_attempt = attempt_idx + 1
+                            _save_retry_resume_state(
+                                retry_resume_state_file,
+                                in_path.name,
+                                next_attempt,
+                                len(retry_profiles),
+                            )
+                            print(
+                                f"[RETRY] requesting process restart before attempt "
+                                f"{next_attempt}/{len(retry_profiles)}: residual CUDA memory high"
+                            )
+                            try:
+                                sys.stdout.flush()
+                                sys.stderr.flush()
+                            except Exception:
+                                pass
+                            raise SystemExit(124)
+                        # Soft reset even when no process restart is needed.
+                        hard_reset_runner(offload_mode)
+
+                if not success:
+                    failed += 1
+                    retry_skipped.append(in_path.name)
+                    retry_skip_persisted.add(in_path.name)
+                    _save_retry_skip_manifest(retry_skip_manifest_file, retry_skip_persisted)
+                    dt = time.perf_counter() - t0
+                    print(
+                        f"[SKIP] {i}/{total} {in_path.name} skipped after "
+                        f"{len(retry_profiles)} retry profiles ({dt:.1f}s)"
+                    )
+                    if last_exc is not None:
+                        traceback.print_exception(
+                            type(last_exc),
+                            last_exc,
+                            last_exc.__traceback__,
+                        )
+                    _clear_retry_resume_state(retry_resume_state_file)
+                    retry_resume_state = None
+                    hard_reset_runner(cpu_offload_mode)
+            finally:
+                _cleanup_local_temps()
+                _cuda_cleanup()
+            continue
+
         try:
             attempt(cpu_offload_mode, decode_chunk_size)
             dt = time.perf_counter() - t0
@@ -651,14 +888,7 @@ def run(
                     _cuda_cleanup()
 
             if retried:
-                # even after a retry success, do a soft cleanup
-                if not keep_temps:
-                    for p in (tmp_pre, tmp_depth):
-                        if p.exists():
-                            try:
-                                p.unlink()
-                            except Exception:
-                                pass
+                _cleanup_local_temps()
                 _cuda_cleanup()
                 continue
 
@@ -671,22 +901,18 @@ def run(
                     pass
 
             traceback.print_exc()
-
-            # CRITICAL: hard reset after a failed file to avoid cascade failures
             hard_reset_runner(cpu_offload_mode)
 
         finally:
-            if not keep_temps:
-                for p in (tmp_pre, tmp_depth):
-                    if p.exists():
-                        try:
-                            p.unlink()
-                        except Exception:
-                            pass
+            _cleanup_local_temps()
             _cuda_cleanup()
 
     print("-----")
     print(f"[DONE] ok={ok} skipped={skipped} failed={failed} total={total}")
+    if retry_skipped:
+        preview = ", ".join(retry_skipped[:10])
+        more = "" if len(retry_skipped) <= 10 else f", ... (+{len(retry_skipped) - 10} more)"
+        print(f"[DONE] retry-skip files ({len(retry_skipped)}): {preview}{more}")
     print(f"[DIR ] output_dir={output_dir_p}")
     print(f"[DIR ] temp_dir={temp_dir} (kept={keep_temps})")
 
@@ -708,6 +934,162 @@ def _split_by_ratio(total: int, top_ref: int, bottom_ref: int) -> tuple[int, int
         top = int(round((total_i * float(top_i)) / float(den)))
     top = max(0, min(total_i, top))
     return top, total_i - top
+
+
+RETRY_PROFILE_ORDER = ("run", "retry1", "retry2", "retry3")
+RETRY_OFFLOAD_CHOICES = {"none", "model", "sequential"}
+RETRY_MAX_SPLIT_CHOICES = {64, 128, 256, 512}
+
+
+def _norm_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _norm_offload_mode(value: object, fallback: str = "model") -> str:
+    mode = str(value or "").strip().lower()
+    if mode in RETRY_OFFLOAD_CHOICES:
+        return mode
+    fb = str(fallback or "model").strip().lower()
+    return fb if fb in RETRY_OFFLOAD_CHOICES else "model"
+
+
+def _norm_max_split(value: object) -> int | None:
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if s in {"", "none", "off", "0", "false"}:
+        return None
+    try:
+        parsed = int(float(s))
+    except Exception:
+        return None
+    if parsed in RETRY_MAX_SPLIT_CHOICES:
+        return parsed
+    return None
+
+
+def _default_retry_profiles(base_offload: str) -> list[dict[str, object]]:
+    inherited = _norm_offload_mode(base_offload, "model")
+    return [
+        {
+            "name": "run",
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": None,
+            "cpu_offload_mode": inherited,
+        },
+        {
+            "name": "retry1",
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": 512,
+            "cpu_offload_mode": inherited,
+        },
+        {
+            "name": "retry2",
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": 64,
+            "cpu_offload_mode": inherited,
+        },
+        {
+            "name": "retry3",
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": 64,
+            "cpu_offload_mode": "sequential",
+        },
+    ]
+
+
+def _parse_retry_policy_profiles(
+    policy_json: str,
+    base_offload: str,
+) -> tuple[list[dict[str, object]], bool]:
+    defaults = _default_retry_profiles(base_offload)
+    txt = str(policy_json or "").strip()
+    if not txt:
+        return defaults, False
+    try:
+        raw = json.loads(txt)
+    except Exception as e:
+        print(f"[WARN] retry_policy_json parse failed: {e}. Using defaults.")
+        return defaults, True
+    if not isinstance(raw, dict):
+        print("[WARN] retry_policy_json is not an object. Using defaults.")
+        return defaults, True
+
+    out: list[dict[str, object]] = []
+    for idx, name in enumerate(RETRY_PROFILE_ORDER):
+        base = defaults[idx]
+        node = raw.get(name, {})
+        if not isinstance(node, dict):
+            node = {}
+        out.append(
+            {
+                "name": name,
+                "garbage_collection_threshold": _norm_bool(
+                    node.get(
+                        "garbage_collection_threshold",
+                        base["garbage_collection_threshold"],
+                    ),
+                    bool(base["garbage_collection_threshold"]),
+                ),
+                "expandable_segments": _norm_bool(
+                    node.get("expandable_segments", base["expandable_segments"]),
+                    bool(base["expandable_segments"]),
+                ),
+                "max_split_size_mb": _norm_max_split(
+                    node.get("max_split_size_mb", base["max_split_size_mb"])
+                ),
+                "cpu_offload_mode": _norm_offload_mode(
+                    node.get("cpu_offload_mode", base["cpu_offload_mode"]),
+                    str(base["cpu_offload_mode"]),
+                ),
+            }
+        )
+    return out, True
+
+
+def _allocator_conf_from_profile(profile: dict[str, object]) -> str:
+    parts: list[str] = []
+    if _norm_bool(profile.get("garbage_collection_threshold"), True):
+        parts.append("garbage_collection_threshold:0.8")
+    if _norm_bool(profile.get("expandable_segments"), True):
+        parts.append("expandable_segments:True")
+    max_split = _norm_max_split(profile.get("max_split_size_mb"))
+    if max_split is not None:
+        parts.append(f"max_split_size_mb:{max_split}")
+    return ",".join(parts)
+
+
+def _apply_allocator_conf(conf: str) -> None:
+    conf_s = str(conf or "").strip()
+    if conf_s:
+        os.environ["PYTORCH_ALLOC_CONF"] = conf_s
+    else:
+        os.environ.pop("PYTORCH_ALLOC_CONF", None)
+    try:
+        import torch
+
+        alt = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+        if callable(alt):
+            alt(conf_s)
+            return
+        setter = getattr(torch.cuda.memory, "_set_allocator_settings", None)
+        if callable(setter):
+            setter(conf_s)
+    except Exception as e:
+        print(f"[WARN] failed to apply allocator settings '{conf_s or 'default'}': {e}")
 
 
 def main():
@@ -761,6 +1143,8 @@ def main():
     ap.add_argument("--ffmpeg_preset", default="")
     ap.add_argument("--ffmpeg_pix_fmt", default="")
     ap.add_argument("--ffmpeg_extra_args", default="")
+    ap.add_argument("--retry_policy_json", default="")
+    ap.add_argument("--retry_process_restart_alloc_mb", type=int, default=1024)
 
     args = ap.parse_args()
     run(**vars(args))

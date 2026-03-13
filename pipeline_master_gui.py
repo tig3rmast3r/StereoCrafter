@@ -23,13 +23,14 @@ try:
 except Exception:
     ThemedTk = None
 
-GUI_VERSION = "26-03-12.1"
+GUI_VERSION = "2026-03-13"
 
 
 class PipelineMasterGUI:
     CONFIG_FILENAME = "config_pipeline_master_gui.json"
     DEFAULT_SCENE_BACKEND = "OpenCV"
-    DEFAULT_SCENE_CODEC = "h264_nvenc"
+    DEFAULT_SCENE_CODEC = "libx264"
+    DEFAULT_WINDOW_GEOMETRY = "1400x1050"
     FFMPEG_CODEC_CHOICES = ("libx264", "libx265", "h264_nvenc", "hevc_nvenc")
     FFMPEG_CODEC_ALIASES = {
         "x264": "libx264",
@@ -42,6 +43,39 @@ class PipelineMasterGUI:
     DEFAULT_DEPTH_REALESRGAN_WORKERS = 4
     DEFAULT_SPLIT_SCENES_WORKERS = 8
     DEFAULT_PIPELINE_TEST_RUN_FILES = 5
+    RETRY_POLICY_PROFILES = ("run", "retry1", "retry2", "retry3")
+    RETRY_POLICY_MAX_SPLIT_CHOICES = ("off", "64", "128", "256", "512")
+    RETRY_POLICY_OFFLOAD_CHOICES = ("none", "model", "sequential")
+    RETRY_POLICY_DEFAULT = {
+        "run": {
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": "off",
+            "cpu_offload_inherited": True,
+            "cpu_offload_mode": "model",
+        },
+        "retry1": {
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": "512",
+            "cpu_offload_inherited": True,
+            "cpu_offload_mode": "model",
+        },
+        "retry2": {
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": "64",
+            "cpu_offload_inherited": True,
+            "cpu_offload_mode": "model",
+        },
+        "retry3": {
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": "64",
+            "cpu_offload_inherited": False,
+            "cpu_offload_mode": "sequential",
+        },
+    }
     VERIFY_QUICK_FFPROBE_TIMEOUT_SEC = 3600.0
     VERIFY_QUICK_FFPROBE_TIMEOUT_RETRIES = 1
     VERIFY_DEEP_FFPROBE_TIMEOUT_SEC = 180.0
@@ -215,9 +249,9 @@ class PipelineMasterGUI:
             try:
                 self.root.geometry(saved_geometry)
             except Exception:
-                self.root.geometry("1400x900")
+                self.root.geometry(self.DEFAULT_WINDOW_GEOMETRY)
         else:
-            self.root.geometry("1400x900")
+            self.root.geometry(self.DEFAULT_WINDOW_GEOMETRY)
         self.root.minsize(1180, 760)
         self._log_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
 
@@ -248,6 +282,7 @@ class PipelineMasterGUI:
         self._inpaint_process: subprocess.Popen | None = None
         self._inpaint_stop_requested = False
         self._inpaint_stop_clicks = 0
+        self._inpaint_resume_after_sharpness = False
         self._merge_thread: threading.Thread | None = None
         self._merge_process: subprocess.Popen | None = None
         self._merge_stop_requested = False
@@ -513,7 +548,7 @@ class PipelineMasterGUI:
             value=str(self._config.get("splat_batch_size", "50"))
         )
         self.splat_workers_var = tk.StringVar(
-            value=str(self._config.get("splat_workers", "4"))
+            value=str(self._config.get("splat_workers", "2"))
         )
         self.splat_disparity_var = tk.StringVar(
             value=str(self._config.get("splat_disparity", "20"))
@@ -525,10 +560,10 @@ class PipelineMasterGUI:
             value=self._config.get("splat_auto_convergence", "Min Borders")
         )
         self.splat_dilate_x_var = tk.StringVar(
-            value=str(self._config.get("splat_dilate_x", "1"))
+            value=str(self._config.get("splat_dilate_x", "3"))
         )
         self.splat_dilate_y_var = tk.StringVar(
-            value=str(self._config.get("splat_dilate_y", "1"))
+            value=str(self._config.get("splat_dilate_y", "3"))
         )
         self.splat_blur_x_var = tk.StringVar(
             value=str(self._config.get("splat_blur_x", "0"))
@@ -558,7 +593,7 @@ class PipelineMasterGUI:
             value=str(self._config.get("splat_stair_x_off", "2"))
         )
         self.splat_stair_strip_var = tk.StringVar(
-            value=str(self._config.get("splat_stair_strip", "3"))
+            value=str(self._config.get("splat_stair_strip", "4"))
         )
         self.splat_stair_strength_var = tk.StringVar(
             value=str(self._config.get("splat_stair_strength", "1"))
@@ -633,7 +668,7 @@ class PipelineMasterGUI:
         self.inpaint_use_sharpness_csv_var = tk.BooleanVar(
             value=bool(self._config.get("inpaint_use_sharpness_csv", True))
         )
-        default_sharp_workers = str(max(1, int(os.cpu_count() or 1)))
+        default_sharp_workers = "19"
         self.inpaint_sharpness_workers_var = tk.StringVar(
             value=str(self._config.get("inpaint_sharpness_workers", default_sharp_workers))
         )
@@ -807,12 +842,12 @@ class PipelineMasterGUI:
         self.join_progress_var = tk.DoubleVar(value=0.0)
 
         # Options and Run.
-        default_verify_workers = str(max(1, int(os.cpu_count() or 1)))
+        default_verify_workers = "19"
         self.verify_scenes_workers_var = tk.StringVar(
             value=str(self._config.get("verify_scenes_workers", default_verify_workers))
         )
         self.pipeline_verify_after_var = tk.StringVar(
-            value=self._config.get("pipeline_verify_after", "Disabled")
+            value=self._config.get("pipeline_verify_after", "Quick")
         )
         self.pipeline_test_run_files_var = tk.StringVar(
             value=str(
@@ -822,6 +857,49 @@ class PipelineMasterGUI:
                 )
             )
         )
+        depth_retry_cfg = self._retry_policy_from_config_key("depth_retry_policy")
+        inpaint_retry_cfg = self._retry_policy_from_config_key("inpaint_retry_policy")
+        self.depth_retry_policy_vars: dict[str, dict[str, tk.Variable]] = {}
+        self.inpaint_retry_policy_vars: dict[str, dict[str, tk.Variable]] = {}
+        for profile in self.RETRY_POLICY_PROFILES:
+            dcfg = depth_retry_cfg.get(profile, self.RETRY_POLICY_DEFAULT[profile])
+            icfg = inpaint_retry_cfg.get(profile, self.RETRY_POLICY_DEFAULT[profile])
+            self.depth_retry_policy_vars[profile] = {
+                "garbage_collection_threshold": tk.BooleanVar(
+                    value=bool(dcfg.get("garbage_collection_threshold", True))
+                ),
+                "expandable_segments": tk.BooleanVar(
+                    value=bool(dcfg.get("expandable_segments", True))
+                ),
+                "max_split_size_mb": tk.StringVar(
+                    value=self._normalize_retry_max_split(dcfg.get("max_split_size_mb", "off"))
+                ),
+                "cpu_offload_inherited": tk.BooleanVar(
+                    value=bool(dcfg.get("cpu_offload_inherited", True))
+                ),
+                "cpu_offload_mode": tk.StringVar(
+                    value=self._normalize_retry_offload_mode(dcfg.get("cpu_offload_mode", "model"))
+                ),
+            }
+            self.inpaint_retry_policy_vars[profile] = {
+                "garbage_collection_threshold": tk.BooleanVar(
+                    value=bool(icfg.get("garbage_collection_threshold", True))
+                ),
+                "expandable_segments": tk.BooleanVar(
+                    value=bool(icfg.get("expandable_segments", True))
+                ),
+                "max_split_size_mb": tk.StringVar(
+                    value=self._normalize_retry_max_split(icfg.get("max_split_size_mb", "off"))
+                ),
+                "cpu_offload_inherited": tk.BooleanVar(
+                    value=bool(icfg.get("cpu_offload_inherited", True))
+                ),
+                "cpu_offload_mode": tk.StringVar(
+                    value=self._normalize_retry_offload_mode(icfg.get("cpu_offload_mode", "model"))
+                ),
+            }
+        self._depth_retry_offload_widgets: dict[str, ttk.Combobox] = {}
+        self._inpaint_retry_offload_widgets: dict[str, ttk.Combobox] = {}
         self.pipeline_run_status_var = tk.StringVar(value="Idle")
         self.pipeline_run_progress_var = tk.DoubleVar(value=0.0)
         self.pipeline_checked_files_var = tk.StringVar(value="Check Files: not run")
@@ -881,7 +959,7 @@ class PipelineMasterGUI:
             if int(self.splat_workers_var.get().strip()) < 1:
                 raise ValueError
         except Exception:
-            self.splat_workers_var.set("4")
+            self.splat_workers_var.set("2")
         if self.splat_layout_var.get().strip() not in {"Single Warp", "Dual", "Quad"}:
             self.splat_layout_var.set("Single Warp")
         if self.splat_auto_convergence_var.get().strip() not in {"Min Borders", "Off"}:
@@ -926,7 +1004,7 @@ class PipelineMasterGUI:
             if int(self.inpaint_sharpness_workers_var.get().strip()) < 1:
                 raise ValueError
         except Exception:
-            self.inpaint_sharpness_workers_var.set(str(max(1, int(os.cpu_count() or 1))))
+            self.inpaint_sharpness_workers_var.set("19")
         if self.merge_mode_var.get().strip() not in {"Auto (recommended)", "Manual"}:
             self.merge_mode_var.set("Auto (recommended)")
         if self.merge_output_format_var.get().strip() not in {"Full SBS", "Half SBS"}:
@@ -997,7 +1075,7 @@ class PipelineMasterGUI:
             if int(self.verify_scenes_workers_var.get().strip()) < 1:
                 raise ValueError
         except Exception:
-            self.verify_scenes_workers_var.set(str(max(1, int(os.cpu_count() or 1))))
+            self.verify_scenes_workers_var.set("19")
         try:
             if int(self.scene_split_threads_var.get().strip()) < 1:
                 raise ValueError
@@ -1009,7 +1087,7 @@ class PipelineMasterGUI:
         except Exception:
             self.pipeline_test_run_files_var.set(str(self.DEFAULT_PIPELINE_TEST_RUN_FILES))
         if self.pipeline_verify_after_var.get().strip() not in self.PIPELINE_VERIFY_CHOICES:
-            self.pipeline_verify_after_var.set("Disabled")
+            self.pipeline_verify_after_var.set("Quick")
 
         # Keep pix_fmt aligned to chroma at startup.
         self.scene_pix_fmt_var.set(self._chroma_to_pixfmt(self.scene_chroma_var.get().strip()))
@@ -2402,6 +2480,10 @@ class PipelineMasterGUI:
                 output_dir or os.path.join(work_dir, self.STANDARD_SUBDIRS["inpaint"]),
                 ".stop_after_current",
             ),
+            "RETRY_POLICY_JSON": self._build_retry_policy_json(
+                self.inpaint_retry_policy_vars,
+                self.inpaint_cpu_offload_var.get().strip() or "model",
+            ),
         }
 
         cmd = ["bash", "run_inpainting_runner.sh"]
@@ -2518,7 +2600,7 @@ class PipelineMasterGUI:
                     ),
                 )
                 self.inpaint_status_var.set("Sharpness CSV incomplete, rebuilding...")
-                self._start_inpaint_sharpness_csv()
+                self._start_inpaint_sharpness_csv(resume_inpaint_after=True)
                 return
             if not self._pipeline_test_active:
                 self._pipeline_set_completed("sharpness_csv", True)
@@ -2526,6 +2608,7 @@ class PipelineMasterGUI:
                 self._refresh_pipeline_status_panel()
                 self._save_pipeline_state()
 
+        self._inpaint_resume_after_sharpness = False
         self._inpaint_stop_requested = False
         self._inpaint_stop_clicks = 0
         self.inpaint_status_var.set("Starting...")
@@ -2592,7 +2675,9 @@ class PipelineMasterGUI:
                     pass
             self._log_queue.put(("inpaint_done", {"step": "inpaint", "success": step_success}))
 
-    def _start_inpaint_sharpness_csv(self) -> None:
+    def _start_inpaint_sharpness_csv(self, resume_inpaint_after: bool = False) -> None:
+        # Enable auto-resume only when Sharpness CSV is launched as Inpaint preflight.
+        self._inpaint_resume_after_sharpness = False
         if self._inpaint_thread and self._inpaint_thread.is_alive():
             messagebox.showinfo("Inpainting", "Another inpainting task is running.")
             return
@@ -2649,7 +2734,7 @@ class PipelineMasterGUI:
                 ),
             )
 
-        default_workers = max(1, int(os.cpu_count() or 1))
+        default_workers = 19
         try:
             workers = max(1, int(self.inpaint_sharpness_workers_var.get().strip() or str(default_workers)))
         except Exception:
@@ -2676,6 +2761,7 @@ class PipelineMasterGUI:
             self._pipeline_invalidate_from("sharpness_csv")
         self._append_inpaint_log("=== Sharpness CSV creation started ===")
         self._append_inpaint_log("CMD: " + " ".join(shlex.quote(x) for x in cmd))
+        self._inpaint_resume_after_sharpness = bool(resume_inpaint_after)
         self._inpaint_thread = threading.Thread(
             target=self._run_inpaint_sharpness_worker,
             args=(cmd, str(out_csv)),
@@ -5928,21 +6014,235 @@ class PipelineMasterGUI:
             font=("TkDefaultFont", 11),
         ).grid(row=0, column=0, sticky="nsew")
 
-    def _build_options_tab(self, parent: ttk.Frame) -> None:
-        parent.grid_rowconfigure(5, weight=1)
-        parent.grid_columnconfigure(0, weight=1)
+    def _retry_policy_default(self) -> dict[str, dict[str, object]]:
+        return {
+            key: {
+                "garbage_collection_threshold": bool(cfg.get("garbage_collection_threshold", True)),
+                "expandable_segments": bool(cfg.get("expandable_segments", True)),
+                "max_split_size_mb": self._normalize_retry_max_split(cfg.get("max_split_size_mb", "off")),
+                "cpu_offload_inherited": bool(cfg.get("cpu_offload_inherited", True)),
+                "cpu_offload_mode": self._normalize_retry_offload_mode(cfg.get("cpu_offload_mode", "model")),
+            }
+            for key, cfg in self.RETRY_POLICY_DEFAULT.items()
+        }
 
-        ttk.Label(
-            parent,
-            text=(
-                "Global pipeline options and orchestration controls.\n"
-                "Depth Auto mode uses this runtime selection for RealESRGAN upscaling."
-            ),
-            justify="left",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+    def _normalize_retry_max_split(self, value: object) -> str:
+        s = str(value or "").strip().lower()
+        if s in {"", "none", "0", "off", "false"}:
+            return "off"
+        if s in self.RETRY_POLICY_MAX_SPLIT_CHOICES:
+            return s
+        try:
+            parsed = int(float(s))
+            sval = str(parsed)
+            if sval in self.RETRY_POLICY_MAX_SPLIT_CHOICES:
+                return sval
+        except Exception:
+            pass
+        return "off"
+
+    def _normalize_retry_offload_mode(self, value: object) -> str:
+        s = str(value or "").strip().lower()
+        if s in self.RETRY_POLICY_OFFLOAD_CHOICES:
+            return s
+        return "model"
+
+    def _normalize_retry_policy_config(
+        self, data: object
+    ) -> dict[str, dict[str, object]]:
+        out = self._retry_policy_default()
+        if not isinstance(data, dict):
+            return out
+        for profile in self.RETRY_POLICY_PROFILES:
+            raw = data.get(profile)
+            if not isinstance(raw, dict):
+                continue
+            out[profile] = {
+                "garbage_collection_threshold": bool(
+                    raw.get(
+                        "garbage_collection_threshold",
+                        out[profile]["garbage_collection_threshold"],
+                    )
+                ),
+                "expandable_segments": bool(
+                    raw.get("expandable_segments", out[profile]["expandable_segments"])
+                ),
+                "max_split_size_mb": self._normalize_retry_max_split(
+                    raw.get("max_split_size_mb", out[profile]["max_split_size_mb"])
+                ),
+                "cpu_offload_inherited": bool(
+                    raw.get(
+                        "cpu_offload_inherited",
+                        out[profile]["cpu_offload_inherited"],
+                    )
+                ),
+                "cpu_offload_mode": self._normalize_retry_offload_mode(
+                    raw.get("cpu_offload_mode", out[profile]["cpu_offload_mode"])
+                ),
+            }
+        return out
+
+    def _retry_policy_from_config_key(self, key: str) -> dict[str, dict[str, object]]:
+        return self._normalize_retry_policy_config(self._config.get(key))
+
+    def _collect_retry_policy_config_from_vars(
+        self, vars_map: dict[str, dict[str, tk.Variable]]
+    ) -> dict[str, dict[str, object]]:
+        out: dict[str, dict[str, object]] = {}
+        for profile in self.RETRY_POLICY_PROFILES:
+            row = vars_map.get(profile, {})
+            out[profile] = {
+                "garbage_collection_threshold": bool(
+                    row["garbage_collection_threshold"].get()
+                ),
+                "expandable_segments": bool(row["expandable_segments"].get()),
+                "max_split_size_mb": self._normalize_retry_max_split(
+                    row["max_split_size_mb"].get()
+                ),
+                "cpu_offload_inherited": bool(row["cpu_offload_inherited"].get()),
+                "cpu_offload_mode": self._normalize_retry_offload_mode(
+                    row["cpu_offload_mode"].get()
+                ),
+            }
+        return out
+
+    def _build_retry_policy_runtime_payload(
+        self,
+        vars_map: dict[str, dict[str, tk.Variable]],
+        inherited_offload: str,
+    ) -> dict[str, dict[str, object]]:
+        fallback_offload = self._normalize_retry_offload_mode(inherited_offload or "model")
+        out: dict[str, dict[str, object]] = {}
+        for profile in self.RETRY_POLICY_PROFILES:
+            row = vars_map[profile]
+            max_split_s = self._normalize_retry_max_split(row["max_split_size_mb"].get())
+            max_split: int | None = None if max_split_s == "off" else int(max_split_s)
+            inherited = bool(row["cpu_offload_inherited"].get())
+            if inherited:
+                offload_mode = fallback_offload
+            else:
+                offload_mode = self._normalize_retry_offload_mode(
+                    row["cpu_offload_mode"].get()
+                )
+            out[profile] = {
+                "garbage_collection_threshold": bool(
+                    row["garbage_collection_threshold"].get()
+                ),
+                "expandable_segments": bool(row["expandable_segments"].get()),
+                "max_split_size_mb": max_split,
+                "cpu_offload_mode": offload_mode,
+            }
+        return out
+
+    def _build_retry_policy_json(
+        self,
+        vars_map: dict[str, dict[str, tk.Variable]],
+        inherited_offload: str,
+    ) -> str:
+        payload = self._build_retry_policy_runtime_payload(vars_map, inherited_offload)
+        return json.dumps(payload, separators=(",", ":"))
+
+    def _set_retry_policy_vars_to_defaults(self) -> None:
+        defaults = self._retry_policy_default()
+        for profile in self.RETRY_POLICY_PROFILES:
+            drow = defaults[profile]
+            for vars_map in (self.depth_retry_policy_vars, self.inpaint_retry_policy_vars):
+                row = vars_map[profile]
+                row["garbage_collection_threshold"].set(
+                    bool(drow["garbage_collection_threshold"])
+                )
+                row["expandable_segments"].set(bool(drow["expandable_segments"]))
+                row["max_split_size_mb"].set(str(drow["max_split_size_mb"]))
+                row["cpu_offload_inherited"].set(bool(drow["cpu_offload_inherited"]))
+                row["cpu_offload_mode"].set(str(drow["cpu_offload_mode"]))
+
+    def _set_retry_policy_offload_widget_state(
+        self,
+        vars_map: dict[str, dict[str, tk.Variable]],
+        widget_map: dict[str, ttk.Combobox],
+    ) -> None:
+        for profile in self.RETRY_POLICY_PROFILES:
+            combo = widget_map.get(profile)
+            row = vars_map.get(profile)
+            if combo is None or row is None:
+                continue
+            inherited = bool(row["cpu_offload_inherited"].get())
+            combo.configure(state=tk.DISABLED if inherited else "readonly")
+
+    def _on_depth_retry_policy_changed(self) -> None:
+        self._set_retry_policy_offload_widget_state(
+            self.depth_retry_policy_vars,
+            self._depth_retry_offload_widgets,
+        )
+        self._preview_depth_command()
+
+    def _on_inpaint_retry_policy_changed(self) -> None:
+        self._set_retry_policy_offload_widget_state(
+            self.inpaint_retry_policy_vars,
+            self._inpaint_retry_offload_widgets,
+        )
+        self._preview_inpaint_command()
+
+    def _build_retry_policy_table(
+        self,
+        parent: ttk.LabelFrame,
+        vars_map: dict[str, dict[str, tk.Variable]],
+        widget_map: dict[str, ttk.Combobox],
+        change_cb,
+    ) -> None:
+        parent.grid_columnconfigure(6, weight=1)
+        ttk.Label(parent, text="Profile").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(parent, text="Garbage 0.8").grid(row=0, column=1, sticky="w", padx=(0, 6))
+        ttk.Label(parent, text="Expandable").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Label(parent, text="Max split").grid(row=0, column=3, sticky="w", padx=(0, 6))
+        ttk.Label(parent, text="CPU mode").grid(row=0, column=4, sticky="w", padx=(0, 6))
+        ttk.Label(parent, text="Inherited").grid(row=0, column=5, sticky="w")
+
+        for ridx, profile in enumerate(self.RETRY_POLICY_PROFILES, start=1):
+            row = vars_map[profile]
+            ttk.Label(parent, text=profile).grid(row=ridx, column=0, sticky="w", pady=2)
+            ttk.Checkbutton(
+                parent,
+                variable=row["garbage_collection_threshold"],
+                command=change_cb,
+            ).grid(row=ridx, column=1, sticky="w", pady=2)
+            ttk.Checkbutton(
+                parent,
+                variable=row["expandable_segments"],
+                command=change_cb,
+            ).grid(row=ridx, column=2, sticky="w", pady=2)
+            split_combo = ttk.Combobox(
+                parent,
+                textvariable=row["max_split_size_mb"],
+                values=self.RETRY_POLICY_MAX_SPLIT_CHOICES,
+                state="readonly",
+                width=6,
+            )
+            split_combo.grid(row=ridx, column=3, sticky="w", pady=2)
+            split_combo.bind("<<ComboboxSelected>>", lambda _e: change_cb())
+            offload_combo = ttk.Combobox(
+                parent,
+                textvariable=row["cpu_offload_mode"],
+                values=self.RETRY_POLICY_OFFLOAD_CHOICES,
+                state="readonly",
+                width=10,
+            )
+            offload_combo.grid(row=ridx, column=4, sticky="w", pady=2)
+            offload_combo.bind("<<ComboboxSelected>>", lambda _e: change_cb())
+            ttk.Checkbutton(
+                parent,
+                variable=row["cpu_offload_inherited"],
+                command=change_cb,
+            ).grid(row=ridx, column=5, sticky="w", pady=2)
+            widget_map[profile] = offload_combo
+
+    def _build_options_tab(self, parent: ttk.Frame) -> None:
+        parent.grid_rowconfigure(4, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_columnconfigure(1, weight=1)
 
         verify_opts = ttk.LabelFrame(parent, text="VerifyScene (Global)", padding=8)
-        verify_opts.grid(row=1, column=0, sticky="ew", pady=4)
+        verify_opts.grid(row=0, column=0, columnspan=2, sticky="ew", pady=4)
         verify_opts.grid_columnconfigure(3, weight=1)
 
         ttk.Label(verify_opts, text="Workers (all verify quick/deep):").grid(
@@ -5958,7 +6258,7 @@ class PipelineMasterGUI:
         ).grid(row=0, column=2, columnspan=2, sticky="w")
 
         depth_opts = ttk.LabelFrame(parent, text="DepthCrafter", padding=8)
-        depth_opts.grid(row=2, column=0, sticky="ew", pady=4)
+        depth_opts.grid(row=1, column=0, sticky="nsew", pady=4, padx=(0, 4))
         depth_opts.grid_columnconfigure(2, weight=1)
 
         ttk.Label(depth_opts, text="RealESRGAN runtime:").grid(row=0, column=0, sticky="w")
@@ -5983,8 +6283,31 @@ class PipelineMasterGUI:
             justify="left",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
+        retry_opts = ttk.LabelFrame(parent, text="GPU Retry Policies", padding=8)
+        retry_opts.grid(row=2, column=0, columnspan=2, sticky="ew", pady=4)
+        retry_opts.grid_columnconfigure(0, weight=1)
+        retry_opts.grid_columnconfigure(1, weight=1)
+
+        depth_retry_frame = ttk.LabelFrame(retry_opts, text="DepthCrafter Retry Policy", padding=6)
+        depth_retry_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self._build_retry_policy_table(
+            depth_retry_frame,
+            self.depth_retry_policy_vars,
+            self._depth_retry_offload_widgets,
+            self._on_depth_retry_policy_changed,
+        )
+
+        inpaint_retry_frame = ttk.LabelFrame(retry_opts, text="Inpainting Retry Policy", padding=6)
+        inpaint_retry_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        self._build_retry_policy_table(
+            inpaint_retry_frame,
+            self.inpaint_retry_policy_vars,
+            self._inpaint_retry_offload_widgets,
+            self._on_inpaint_retry_policy_changed,
+        )
+
         run_opts = ttk.LabelFrame(parent, text="Pipeline Run Controls", padding=8)
-        run_opts.grid(row=3, column=0, sticky="ew", pady=6)
+        run_opts.grid(row=1, column=1, sticky="nsew", pady=4, padx=(4, 0))
         run_opts.grid_columnconfigure(5, weight=1)
 
         ttk.Label(run_opts, text="Verify after each step:").grid(row=0, column=0, sticky="w")
@@ -6014,7 +6337,7 @@ class PipelineMasterGUI:
         )
 
         step_frame = ttk.LabelFrame(parent, text="Pipeline Step State", padding=8)
-        step_frame.grid(row=4, column=0, sticky="ew", pady=6)
+        step_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=6)
         step_frame.grid_columnconfigure(0, weight=1)
         step_frame.grid_columnconfigure(1, weight=0)
         step_frame.grid_columnconfigure(2, weight=0)
@@ -6034,7 +6357,7 @@ class PipelineMasterGUI:
             }
 
         run_frame = ttk.LabelFrame(parent, text="Run & Progress", padding=8)
-        run_frame.grid(row=5, column=0, sticky="nsew", pady=6)
+        run_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=6)
         run_frame.grid_columnconfigure(0, weight=1)
         run_frame.grid_rowconfigure(3, weight=1)
 
@@ -6096,6 +6419,8 @@ class PipelineMasterGUI:
         popup_scroll.grid(row=0, column=1, sticky="ns")
         self.pipeline_popup_log_text.configure(yscrollcommand=popup_scroll.set)
         self._flush_pipeline_popup_log_buffer()
+        self._on_depth_retry_policy_changed()
+        self._on_inpaint_retry_policy_changed()
 
     def _build_progress_tab(self, parent: ttk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -6677,7 +7002,7 @@ class PipelineMasterGUI:
         # Splat defaults.
         self.splat_mode_var.set("Auto (recommended)")
         self.splat_batch_size_var.set("50")
-        self.splat_workers_var.set("4")
+        self.splat_workers_var.set("2")
         self.splat_disparity_var.set("20")
         self.splat_encode_override_var.set(False)
         self.splat_extra_ffmpeg_args_var.set("")
@@ -6688,7 +7013,7 @@ class PipelineMasterGUI:
         self.inpaint_mode_var.set("Auto (recommended)")
         self.inpaint_frames_chunk_var.set("50")
         self.inpaint_cpu_offload_var.set("model")
-        self.inpaint_sharpness_workers_var.set(str(max(1, int(os.cpu_count() or 1))))
+        self.inpaint_sharpness_workers_var.set("19")
         self.inpaint_encode_override_var.set(False)
         self.inpaint_extra_ffmpeg_args_var.set("")
         self._on_inpaint_mode_changed()
@@ -6710,9 +7035,12 @@ class PipelineMasterGUI:
 
         # Options defaults.
         self.scene_split_threads_var.set(str(self.DEFAULT_SPLIT_SCENES_WORKERS))
-        self.verify_scenes_workers_var.set(str(max(1, int(os.cpu_count() or 1))))
-        self.pipeline_verify_after_var.set("Disabled")
+        self.verify_scenes_workers_var.set("19")
+        self.pipeline_verify_after_var.set("Quick")
         self.pipeline_test_run_files_var.set(str(self.DEFAULT_PIPELINE_TEST_RUN_FILES))
+        self._set_retry_policy_vars_to_defaults()
+        self._on_depth_retry_policy_changed()
+        self._on_inpaint_retry_policy_changed()
         self.resume_enabled_var.set(True)
         self.stop_on_error_var.set(True)
         self.auto_advance_var.set(False)
@@ -6857,7 +7185,7 @@ class PipelineMasterGUI:
 
     @staticmethod
     def _default_verify_scenes_workers() -> int:
-        return max(1, int(os.cpu_count() or 1))
+        return 19
 
     def _get_verify_scenes_workers(self) -> int:
         default_workers = self._default_verify_scenes_workers()
@@ -8270,6 +8598,10 @@ class PipelineMasterGUI:
             "FFMPEG_PRESET": self.depth_preset_var.get().strip(),
             "FFMPEG_PIX_FMT": self.depth_pix_fmt_var.get().strip(),
             "FFMPEG_EXTRA_ARGS": self.depth_extra_ffmpeg_args_var.get().strip(),
+            "RETRY_POLICY_JSON": self._build_retry_policy_json(
+                self.depth_retry_policy_vars,
+                self.depth_cpu_offload_var.get().strip() or "model",
+            ),
         }
 
         cmd = ["bash", "run_depthcrafter_nogui_batch.sh"]
@@ -8972,8 +9304,8 @@ class PipelineMasterGUI:
         # Fields disabled in Auto mode.
         self.splat_layout_var.set("Single Warp")
         self.splat_auto_convergence_var.set("Min Borders")
-        self.splat_dilate_x_var.set("1")
-        self.splat_dilate_y_var.set("1")
+        self.splat_dilate_x_var.set("3")
+        self.splat_dilate_y_var.set("3")
         self.splat_blur_x_var.set("0")
         self.splat_blur_y_var.set("0")
         self.splat_dilate_left_var.set("2")
@@ -8983,7 +9315,7 @@ class PipelineMasterGUI:
         self.splat_stair_smooth_var.set(True)
         self.splat_stair_kernel_var.set("3")
         self.splat_stair_x_off_var.set("2")
-        self.splat_stair_strip_var.set("3")
+        self.splat_stair_strip_var.set("4")
         self.splat_stair_strength_var.set("1")
         self.splat_replace_mask_var.set(True)
         self.splat_replace_mask_scale_var.set("1")
@@ -9098,8 +9430,8 @@ class PipelineMasterGUI:
             "DISPARITY": self.splat_disparity_var.get().strip() or "20",
             "OUTPUT_LAYOUT": layout_cli,
             "AUTO_CONVERGENCE_MODE": auto_conv_cli,
-            "DILATE_X": self.splat_dilate_x_var.get().strip() or "1",
-            "DILATE_Y": self.splat_dilate_y_var.get().strip() or "1",
+            "DILATE_X": self.splat_dilate_x_var.get().strip() or "3",
+            "DILATE_Y": self.splat_dilate_y_var.get().strip() or "3",
             "BLUR_X": self.splat_blur_x_var.get().strip() or "0",
             "BLUR_Y": self.splat_blur_y_var.get().strip() or "0",
             "DILATE_LEFT": self.splat_dilate_left_var.get().strip() or "2",
@@ -9109,7 +9441,7 @@ class PipelineMasterGUI:
             "STAIR_SMOOTH": "1" if self.splat_stair_smooth_var.get() else "0",
             "STAIR_SMOOTH_KERNEL": self.splat_stair_kernel_var.get().strip() or "3",
             "STAIR_SMOOTH_X_OFF": self.splat_stair_x_off_var.get().strip() or "2",
-            "STAIR_SMOOTH_STRIP": self.splat_stair_strip_var.get().strip() or "3",
+            "STAIR_SMOOTH_STRIP": self.splat_stair_strip_var.get().strip() or "4",
             "STAIR_SMOOTH_STRENGTH": self.splat_stair_strength_var.get().strip() or "1",
             "USE_REPLACE_MASK": "1" if replace_mask_enabled else "0",
             "REPLACE_MASK_SCALE": self.splat_replace_mask_scale_var.get().strip() or "1",
@@ -13279,9 +13611,24 @@ class PipelineMasterGUI:
                     stop_requested = bool(self._inpaint_stop_requested)
                     step_name = ""
                     success = False
+                    pending_before = self._pipeline_pending_action
+                    pending_inpaint_run = (
+                        isinstance(pending_before, tuple)
+                        and len(pending_before) >= 2
+                        and str(pending_before[0]).strip().lower() == "inpaint"
+                        and str(pending_before[1]).strip().lower() == "run"
+                    )
+                    should_resume_inpaint = False
                     if isinstance(payload, dict):
                         step_name = str(payload.get("step", "")).strip().lower()
                         success = bool(payload.get("success", False))
+                        if (
+                            step_name == "sharpness_csv"
+                            and bool(self._inpaint_resume_after_sharpness)
+                            and success
+                            and not stop_requested
+                        ):
+                            should_resume_inpaint = True
                     self._set_inpaint_running(False)
                     if step_name in {"sharpness_csv", "inpaint"}:
                         self._pipeline_on_run_finished(step_name, success)
@@ -13298,6 +13645,16 @@ class PipelineMasterGUI:
                             if pending and pending[1] == "run" and pending[0] in {"sharpness_csv", "inpaint"}:
                                 self._pipeline_on_run_finished(pending[0], False)
                                 step_name = pending[0]
+                    if step_name == "sharpness_csv" and bool(self._inpaint_resume_after_sharpness):
+                        self._inpaint_resume_after_sharpness = False
+                        if should_resume_inpaint:
+                            self._append_inpaint_log(
+                                "[SHARP] CSV rebuilt. Resuming Inpainting automatically..."
+                            )
+                            self.root.after(10, self._run_inpaint_placeholder)
+                        elif pending_inpaint_run and not success:
+                            # Sharpness preflight failed while Inpaint run was pending.
+                            self._pipeline_on_run_finished("inpaint", False)
                     if stop_requested:
                         stop_label = "Sharpness CSV" if step_name == "sharpness_csv" else "Inpainting"
                         self._append_inpaint_log(f"[STOP] {stop_label} stopped.")
@@ -14006,6 +14363,12 @@ class PipelineMasterGUI:
             "verify_scenes_workers": self.verify_scenes_workers_var.get().strip(),
             "pipeline_verify_after": self.pipeline_verify_after_var.get().strip(),
             "pipeline_test_run_files": self.pipeline_test_run_files_var.get().strip(),
+            "depth_retry_policy": self._collect_retry_policy_config_from_vars(
+                self.depth_retry_policy_vars
+            ),
+            "inpaint_retry_policy": self._collect_retry_policy_config_from_vars(
+                self.inpaint_retry_policy_vars
+            ),
             "resume_enabled": bool(self.resume_enabled_var.get()),
             "stop_on_error": bool(self.stop_on_error_var.get()),
             "auto_advance": bool(self.auto_advance_var.get()),
@@ -14016,7 +14379,7 @@ class PipelineMasterGUI:
             self.root.update_idletasks()
             return str(self.root.geometry())
         except Exception:
-            return "1400x900"
+            return self.DEFAULT_WINDOW_GEOMETRY
 
     def _load_config(self) -> dict:
         if not os.path.isfile(self.CONFIG_FILENAME):

@@ -5,6 +5,7 @@ based on disparity maps for 3D video generation.
 """
 
 import logging
+import os
 from typing import Tuple, Union
 
 import torch
@@ -12,14 +13,56 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-try:
-    from Forward_Warp import forward_warp
+_FW_BACKEND_ENV = "SPLAT_FORWARD_WARP_BACKEND"
+_FW_BACKEND_DEFAULT = "pytorch"  # default chosen to avoid known VRAM accumulation on CUDA backend
 
-    logger.info("CUDA Forward Warp is available.")
-except Exception:
-    from dependency.forward_warp_pytorch import forward_warp
 
-    logger.info("Forward Warp Pytorch is active.")
+def _load_forward_warp_backend():
+    backend = os.environ.get(_FW_BACKEND_ENV, _FW_BACKEND_DEFAULT).strip().lower()
+    if backend not in {"auto", "cuda", "pytorch"}:
+        logger.warning(
+            "Invalid %s=%r, falling back to '%s'.",
+            _FW_BACKEND_ENV,
+            backend,
+            _FW_BACKEND_DEFAULT,
+        )
+        backend = _FW_BACKEND_DEFAULT
+
+    if backend == "pytorch":
+        from dependency.forward_warp_pytorch import forward_warp as fw_impl
+
+        logger.info("Forward warp backend: PyTorch fallback (forced).")
+        return fw_impl, "pytorch"
+
+    if backend == "cuda":
+        try:
+            from Forward_Warp import forward_warp as fw_impl
+
+            logger.info("Forward warp backend: CUDA Forward_Warp (forced).")
+            return fw_impl, "cuda"
+        except Exception as e:
+            logger.warning(
+                "CUDA Forward_Warp forced but unavailable (%s). Falling back to PyTorch.",
+                e,
+            )
+            from dependency.forward_warp_pytorch import forward_warp as fw_impl
+
+            return fw_impl, "pytorch"
+
+    # backend == "auto": try CUDA first, then fallback
+    try:
+        from Forward_Warp import forward_warp as fw_impl
+
+        logger.info("Forward warp backend: CUDA Forward_Warp (auto).")
+        return fw_impl, "cuda"
+    except Exception:
+        from dependency.forward_warp_pytorch import forward_warp as fw_impl
+
+        logger.info("Forward warp backend: PyTorch fallback (auto).")
+        return fw_impl, "pytorch"
+
+
+forward_warp, FORWARD_WARP_BACKEND = _load_forward_warp_backend()
 
 
 class ForwardWarpStereo(nn.Module):

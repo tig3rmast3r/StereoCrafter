@@ -142,9 +142,6 @@ class RenderProcessor:
         Returns:
             True if completed successfully, False otherwise
         """
-        logger.debug("==> Initializing ForwardWarpStereo module")
-        stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
-
         height, width = target_output_height, target_output_width
         os.makedirs(os.path.dirname(output_video_path_base), exist_ok=True)
 
@@ -203,6 +200,9 @@ class RenderProcessor:
         
         frame_count = 0
         encoding_successful = True
+        stereo_projector = None
+        logger.debug("==> Initializing ForwardWarpStereo module")
+        stereo_projector = ForwardWarpStereo(occlu_map=True).cuda()
         try:
             gpu_microbatch_size_i = max(1, int(gpu_microbatch_size))
         except (TypeError, ValueError):
@@ -392,7 +392,7 @@ class RenderProcessor:
                 
                 # Cleanup batch
                 del batch_video_numpy, batch_depth_numpy_raw, batch_depth_numpy_float, batch_processed_frames
-                release_cuda_memory()
+                release_cuda_memory(aggressive=True)
 
         except Exception as e:
             logger.error(f"Render error: {e}", exc_info=True)
@@ -418,8 +418,9 @@ class RenderProcessor:
                 except Exception as e:
                     logger.warning(f"Error closing replace-mask FFmpeg: {e}")
             
-            del stereo_projector
-            release_cuda_memory()
+            if stereo_projector is not None:
+                del stereo_projector
+            release_cuda_memory(aggressive=True)
 
         return encoding_successful
 
@@ -677,6 +678,15 @@ class RenderProcessor:
                 if replace_mask_u8 is not None:
                     item["replace_mask"] = replace_mask_u8[j]
                 results.append(item)
+
+            # Aggressive cleanup per micro-batch to avoid VRAM accumulation over long runs.
+            del source_tensor, depth_tensor, disp_map, right_eye_raw, right_eye_processed, occlusion_mask
+            del left_cpu, right_cpu, occl_cpu, depth_cpu, batch_video_mb, batch_depth_mb
+            if disp_out_winner is not None:
+                del disp_out_winner
+            if replace_mask_u8 is not None:
+                del replace_mask_u8
+            release_cuda_memory(aggressive=True)
 
         return results
 

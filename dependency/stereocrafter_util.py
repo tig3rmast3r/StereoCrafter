@@ -1667,13 +1667,30 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         return None
 
 
-def release_cuda_memory():
-    """Releases GPU memory and performs garbage collection."""
+def release_cuda_memory(aggressive: bool = False):
+    """Releases GPU memory and performs garbage collection.
+
+    Args:
+        aggressive: When True, perform a stronger CUDA flush suited for
+            between-task boundaries (sync + empty_cache + ipc_collect).
+    """
     try:
         if torch.cuda.is_available():
+            if aggressive:
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
             torch.cuda.empty_cache()
+            if aggressive:
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
             logger.debug("CUDA cache cleared.")
         gc.collect()
+        if aggressive:
+            gc.collect()
         logger.debug("Python garbage collector invoked.")
     except Exception as e:
         logger.error(

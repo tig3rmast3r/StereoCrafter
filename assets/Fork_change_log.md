@@ -88,7 +88,7 @@ Long live to 3D!!
 2026-03-06
 - First release, now that everything is completed and almost functional i'll track changes from now on. If you tried this fork before the above date, it probably was not working as intended.
 
-2026-03-12
+2026-03-12 (Pipeline Master GUI improvements and fixes)
 - [new] Scenedetect now detects scenes only, and saves to csv, a new step has been added on pipeline master gui for ffmpeg processing, with multithreading encoding and resume
 - [new] New depthcrafter slider allow for larger size instead of a fixed 0.5 for encoding, realesrgan will still double and additionally downscales to fit original size.
 - [new] Configurable number of clips for Test run
@@ -102,3 +102,10 @@ Long live to 3D!!
 - [fix] Missing workers option for Mask_for_merge batch
 - [fix] Feedback and progress for Splatting, Mask for merge and Merging batches when used in parallel
 - [fix] Run should not stop anymore after a script crash/error
+
+2926-03-13 (Pipeline Master GUI improvements)
+- [new] Auto-Retry configurable policies for Depthcrafting and Inpainting steps and skip-to-next on permanent fails
+- [changed] tuned some default and auto values (press "Reset Settings" to load new defaults if you have updated the repo from a previous version)
+- [fix] Simlink scan for Test Run missing in RealESRGAN scripts
+- [fix] Improved error handling and reduced chances of run stop
+- [fix] reverted forward-warp to pytorch version as default for depcthcrafter step as i'm experiencing memory leaks with the cuda version, will re-enable once fixed.
