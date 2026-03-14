@@ -103,9 +103,13 @@ Long live to 3D!!
 - [fix] Feedback and progress for Splatting, Mask for merge and Merging batches when used in parallel
 - [fix] Run should not stop anymore after a script crash/error
 
-2926-03-13 (Pipeline Master GUI improvements)
+2026-03-13 (Pipeline Master GUI improvements and fixes)
 - [new] Auto-Retry configurable policies for Depthcrafting and Inpainting steps and skip-to-next on permanent fails
 - [changed] tuned some default and auto values (press "Reset Settings" to load new defaults if you have updated the repo from a previous version)
 - [fix] Simlink scan for Test Run missing in RealESRGAN scripts
 - [fix] Improved error handling and reduced chances of run stop
-- [fix] reverted forward-warp to pytorch version as default for depcthcrafter step as i'm experiencing memory leaks with the cuda version, will re-enable once fixed.
+- [fix] reverted forward-warp to pytorch version for depthcrafter step as i'm experiencing memory leaks with the cuda version, will re-enable once fixed.
+
+2026-03-14 (Pipeline Master GUI fixes)
+- [fix] wrong progress feedback for merging script on errors/restarts
+- [fix] verifyscenes will also delete apparently good files but with wrong length

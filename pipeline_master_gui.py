@@ -23,7 +23,7 @@ try:
 except Exception:
     ThemedTk = None
 
-GUI_VERSION = "2026-03-13"
+GUI_VERSION = "2026-03-14"
 
 
 class PipelineMasterGUI:
@@ -2979,49 +2979,46 @@ class PipelineMasterGUI:
             self._log_queue.put(
                 ("inpaint_line", f"[QUICK] checking output files={len(out_files)} and reference files={len(ref_files)} with {max_workers} workers")
             )
+            out_stats = self._quick_verify_probe_group(
+                out_files,
+                max_workers,
+                "inpaint_line",
+                "output",
+                "[QUICK]",
+            )
+            ref_stats = self._quick_verify_probe_group(
+                ref_files,
+                max_workers,
+                "inpaint_line",
+                "reference",
+                "[QUICK]",
+            )
 
-            def _probe_group(file_list: list[str], label: str) -> dict:
-                broken: list[str] = []
-                total_duration = 0.0
-                duration_available = True
-                total_frames = 0
-                frames_available = True
+            pair_stats = self._quick_verify_collect_packet_mismatch_targets(
+                out_files,
+                ref_files,
+                out_stats.get("meta_by_path", {}),
+                ref_stats.get("meta_by_path", {}),
+                frame_tol=1,
+            )
+            packet_mismatch_output = pair_stats.get("mismatch_targets") or []
+            unmatched_output = pair_stats.get("unmatched_targets") or []
+            missing_reference = pair_stats.get("missing_reference") or []
+            broken_output = sorted(set((out_stats.get("broken") or []) + packet_mismatch_output))
 
-                def _probe_one(fp: str) -> tuple[str, dict]:
-                    return fp, self._probe_video_basic(fp)
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    futures = [ex.submit(_probe_one, fp) for fp in file_list]
-                    done = 0
-                    for fut in concurrent.futures.as_completed(futures):
-                        fp, meta = fut.result()
-                        done += 1
-                        if not meta.get("ok"):
-                            broken.append(fp)
-                            self._log_queue.put(("inpaint_line", f"[QUICK][{label.upper()}][BROKEN] {fp} :: {meta.get('error')}"))
-                        else:
-                            dur = meta.get("duration")
-                            frm = meta.get("frames")
-                            if dur is None:
-                                duration_available = False
-                            else:
-                                total_duration += float(dur)
-                            if frm is None:
-                                frames_available = False
-                            else:
-                                total_frames += int(frm)
-                        if done % 25 == 0 or done == len(file_list):
-                            self._log_queue.put(("inpaint_line", f"[QUICK][{label.upper()}] progress {done}/{len(file_list)}"))
-                return {
-                    "broken": broken,
-                    "total_duration": total_duration,
-                    "duration_available": duration_available,
-                    "total_frames": total_frames,
-                    "frames_available": frames_available,
-                }
-
-            out_stats = _probe_group(out_files, "output")
-            ref_stats = _probe_group(ref_files, "reference")
+            self._log_queue.put(
+                (
+                    "inpaint_line",
+                    (
+                        "[QUICK] packet pair check: "
+                        f"compared={int(pair_stats.get('pairs_compared', 0))}, "
+                        f"n.d.={int(pair_stats.get('pairs_packet_nd', 0))}, "
+                        f"mismatch={len(packet_mismatch_output)}, "
+                        f"unmatched_output={len(unmatched_output)}, "
+                        f"missing_reference={len(missing_reference)}"
+                    ),
+                )
+            )
 
             count_ok = len(out_files) == len(ref_files)
             count_msg = f"output={len(out_files)} vs reference={len(ref_files)}"
@@ -3051,14 +3048,19 @@ class PipelineMasterGUI:
             self._log_queue.put(("inpaint_line", f"[QUICK] packet check: {frames_msg}"))
 
             ok_final = (
-                not out_stats["broken"]
+                not broken_output
                 and not ref_stats["broken"]
                 and count_ok
+                and not unmatched_output
+                and not missing_reference
                 and (frames_ok or frames_msg == "n.d.")
             )
             message = (
                 f"Inpainting quick verify completed.\n"
                 f"Broken output files: {len(out_stats['broken'])}\n"
+                f"Packet mismatch output files: {len(packet_mismatch_output)}\n"
+                f"Unmatched output files: {len(unmatched_output)}\n"
+                f"Missing reference files: {len(missing_reference)}\n"
                 f"Broken reference files: {len(ref_stats['broken'])}\n"
                 f"File count match: {'YES' if count_ok else 'NO'} ({count_msg})\n"
                 f"Duration match (informational only): {'YES' if duration_ok else ('N.D.' if duration_msg == 'n.d.' else 'NO')}\n"
@@ -3072,7 +3074,7 @@ class PipelineMasterGUI:
                     {
                         "ok": ok_final,
                         "message": message,
-                        "broken_output": out_stats["broken"],
+                        "broken_output": broken_output,
                         "broken_reference": ref_stats["broken"],
                     },
                 )
@@ -4440,49 +4442,46 @@ class PipelineMasterGUI:
             self._log_queue.put(
                 ("merge_line", f"[MASK-QUICK] checking mask files={len(out_files)} and reference files={len(ref_files)} with {max_workers} workers")
             )
+            out_stats = self._quick_verify_probe_group(
+                out_files,
+                max_workers,
+                "merge_line",
+                "mask",
+                "[MASK-QUICK]",
+            )
+            ref_stats = self._quick_verify_probe_group(
+                ref_files,
+                max_workers,
+                "merge_line",
+                "reference",
+                "[MASK-QUICK]",
+            )
 
-            def _probe_group(file_list: list[str], label: str) -> dict:
-                broken: list[str] = []
-                total_duration = 0.0
-                duration_available = True
-                total_frames = 0
-                frames_available = True
+            pair_stats = self._quick_verify_collect_packet_mismatch_targets(
+                out_files,
+                ref_files,
+                out_stats.get("meta_by_path", {}),
+                ref_stats.get("meta_by_path", {}),
+                frame_tol=1,
+            )
+            packet_mismatch_output = pair_stats.get("mismatch_targets") or []
+            unmatched_output = pair_stats.get("unmatched_targets") or []
+            missing_reference = pair_stats.get("missing_reference") or []
+            broken_output = sorted(set((out_stats.get("broken") or []) + packet_mismatch_output))
 
-                def _probe_one(fp: str) -> tuple[str, dict]:
-                    return fp, self._probe_video_basic(fp)
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    futures = [ex.submit(_probe_one, fp) for fp in file_list]
-                    done = 0
-                    for fut in concurrent.futures.as_completed(futures):
-                        fp, meta = fut.result()
-                        done += 1
-                        if not meta.get("ok"):
-                            broken.append(fp)
-                            self._log_queue.put(("merge_line", f"[MASK-QUICK][{label.upper()}][BROKEN] {fp} :: {meta.get('error')}"))
-                        else:
-                            dur = meta.get("duration")
-                            frm = meta.get("frames")
-                            if dur is None:
-                                duration_available = False
-                            else:
-                                total_duration += float(dur)
-                            if frm is None:
-                                frames_available = False
-                            else:
-                                total_frames += int(frm)
-                        if done % 25 == 0 or done == len(file_list):
-                            self._log_queue.put(("merge_line", f"[MASK-QUICK][{label.upper()}] progress {done}/{len(file_list)}"))
-                return {
-                    "broken": broken,
-                    "total_duration": total_duration,
-                    "duration_available": duration_available,
-                    "total_frames": total_frames,
-                    "frames_available": frames_available,
-                }
-
-            out_stats = _probe_group(out_files, "mask")
-            ref_stats = _probe_group(ref_files, "reference")
+            self._log_queue.put(
+                (
+                    "merge_line",
+                    (
+                        "[MASK-QUICK] packet pair check: "
+                        f"compared={int(pair_stats.get('pairs_compared', 0))}, "
+                        f"n.d.={int(pair_stats.get('pairs_packet_nd', 0))}, "
+                        f"mismatch={len(packet_mismatch_output)}, "
+                        f"unmatched_mask={len(unmatched_output)}, "
+                        f"missing_reference={len(missing_reference)}"
+                    ),
+                )
+            )
 
             count_ok = len(out_files) == len(ref_files)
             count_msg = f"mask={len(out_files)} vs reference={len(ref_files)}"
@@ -4512,14 +4511,19 @@ class PipelineMasterGUI:
             self._log_queue.put(("merge_line", f"[MASK-QUICK] packet check: {frames_msg}"))
 
             ok_final = (
-                not out_stats["broken"]
+                not broken_output
                 and not ref_stats["broken"]
                 and count_ok
+                and not unmatched_output
+                and not missing_reference
                 and (frames_ok or frames_msg == "n.d.")
             )
             message = (
                 f"Mask quick verify completed.\n"
                 f"Broken mask files: {len(out_stats['broken'])}\n"
+                f"Packet mismatch mask files: {len(packet_mismatch_output)}\n"
+                f"Unmatched mask files: {len(unmatched_output)}\n"
+                f"Missing reference files: {len(missing_reference)}\n"
                 f"Broken reference files: {len(ref_stats['broken'])}\n"
                 f"File count match: {'YES' if count_ok else 'NO'} ({count_msg})\n"
                 f"Duration match (informational only): {'YES' if duration_ok else ('N.D.' if duration_msg == 'n.d.' else 'NO')}\n"
@@ -4533,7 +4537,7 @@ class PipelineMasterGUI:
                     {
                         "ok": ok_final,
                         "message": message,
-                        "broken_output": out_stats["broken"],
+                        "broken_output": broken_output,
                         "broken_reference": ref_stats["broken"],
                     },
                 )
@@ -4701,49 +4705,46 @@ class PipelineMasterGUI:
             self._log_queue.put(
                 ("merge_line", f"[QUICK] checking merged files={len(out_files)} and reference files={len(ref_files)} with {max_workers} workers")
             )
+            out_stats = self._quick_verify_probe_group(
+                out_files,
+                max_workers,
+                "merge_line",
+                "merged",
+                "[QUICK]",
+            )
+            ref_stats = self._quick_verify_probe_group(
+                ref_files,
+                max_workers,
+                "merge_line",
+                "reference",
+                "[QUICK]",
+            )
 
-            def _probe_group(file_list: list[str], label: str) -> dict:
-                broken: list[str] = []
-                total_duration = 0.0
-                duration_available = True
-                total_frames = 0
-                frames_available = True
+            pair_stats = self._quick_verify_collect_packet_mismatch_targets(
+                out_files,
+                ref_files,
+                out_stats.get("meta_by_path", {}),
+                ref_stats.get("meta_by_path", {}),
+                frame_tol=1,
+            )
+            packet_mismatch_output = pair_stats.get("mismatch_targets") or []
+            unmatched_output = pair_stats.get("unmatched_targets") or []
+            missing_reference = pair_stats.get("missing_reference") or []
+            broken_output = sorted(set((out_stats.get("broken") or []) + packet_mismatch_output))
 
-                def _probe_one(fp: str) -> tuple[str, dict]:
-                    return fp, self._probe_video_basic(fp)
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    futures = [ex.submit(_probe_one, fp) for fp in file_list]
-                    done = 0
-                    for fut in concurrent.futures.as_completed(futures):
-                        fp, meta = fut.result()
-                        done += 1
-                        if not meta.get("ok"):
-                            broken.append(fp)
-                            self._log_queue.put(("merge_line", f"[QUICK][{label.upper()}][BROKEN] {fp} :: {meta.get('error')}"))
-                        else:
-                            dur = meta.get("duration")
-                            frm = meta.get("frames")
-                            if dur is None:
-                                duration_available = False
-                            else:
-                                total_duration += float(dur)
-                            if frm is None:
-                                frames_available = False
-                            else:
-                                total_frames += int(frm)
-                        if done % 25 == 0 or done == len(file_list):
-                            self._log_queue.put(("merge_line", f"[QUICK][{label.upper()}] progress {done}/{len(file_list)}"))
-                return {
-                    "broken": broken,
-                    "total_duration": total_duration,
-                    "duration_available": duration_available,
-                    "total_frames": total_frames,
-                    "frames_available": frames_available,
-                }
-
-            out_stats = _probe_group(out_files, "merged")
-            ref_stats = _probe_group(ref_files, "reference")
+            self._log_queue.put(
+                (
+                    "merge_line",
+                    (
+                        "[QUICK] packet pair check: "
+                        f"compared={int(pair_stats.get('pairs_compared', 0))}, "
+                        f"n.d.={int(pair_stats.get('pairs_packet_nd', 0))}, "
+                        f"mismatch={len(packet_mismatch_output)}, "
+                        f"unmatched_output={len(unmatched_output)}, "
+                        f"missing_reference={len(missing_reference)}"
+                    ),
+                )
+            )
 
             count_ok = len(out_files) == len(ref_files)
             count_msg = f"merged={len(out_files)} vs reference={len(ref_files)}"
@@ -4773,14 +4774,19 @@ class PipelineMasterGUI:
             self._log_queue.put(("merge_line", f"[QUICK] packet check: {frames_msg}"))
 
             ok_final = (
-                not out_stats["broken"]
+                not broken_output
                 and not ref_stats["broken"]
                 and count_ok
+                and not unmatched_output
+                and not missing_reference
                 and (frames_ok or frames_msg == "n.d.")
             )
             message = (
                 f"Merging quick verify completed.\n"
                 f"Broken output files: {len(out_stats['broken'])}\n"
+                f"Packet mismatch output files: {len(packet_mismatch_output)}\n"
+                f"Unmatched output files: {len(unmatched_output)}\n"
+                f"Missing reference files: {len(missing_reference)}\n"
                 f"Broken reference files: {len(ref_stats['broken'])}\n"
                 f"File count match: {'YES' if count_ok else 'NO'} ({count_msg})\n"
                 f"Duration match (informational only): {'YES' if duration_ok else ('N.D.' if duration_msg == 'n.d.' else 'NO')}\n"
@@ -4794,7 +4800,7 @@ class PipelineMasterGUI:
                     {
                         "ok": ok_final,
                         "message": message,
-                        "broken_output": out_stats["broken"],
+                        "broken_output": broken_output,
                         "broken_reference": ref_stats["broken"],
                     },
                 )
@@ -10151,6 +10157,141 @@ class PipelineMasterGUI:
                     found[str(p.resolve())] = str(p.resolve())
         return sorted(found.values())
 
+    @staticmethod
+    def _quick_verify_normalize_stem(stem: str) -> str:
+        s = str(stem or "").strip().lower()
+        if not s:
+            return s
+        patterns = [
+            r"_(\d+_)?splatted[124](?:_replace_mask)?$",
+            r"_(\d+_)?merged_full_sbs$",
+            r"_(\d+_)?inpainted_(right_eye|sbs)$",
+            r"_replace_mask$",
+            r"_depth$",
+        ]
+        changed = True
+        while changed and s:
+            changed = False
+            for pat in patterns:
+                ns = re.sub(pat, "", s, flags=re.IGNORECASE)
+                if ns != s:
+                    s = ns
+                    changed = True
+        return s
+
+    @staticmethod
+    def _quick_verify_build_name_indexes(
+        files: list[str],
+    ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        exact_idx: dict[str, list[str]] = {}
+        norm_idx: dict[str, list[str]] = {}
+        for fp in files:
+            p = Path(str(fp))
+            exact_key = p.stem.lower()
+            norm_key = PipelineMasterGUI._quick_verify_normalize_stem(p.stem)
+            exact_idx.setdefault(exact_key, []).append(str(fp))
+            norm_idx.setdefault(norm_key, []).append(str(fp))
+        return exact_idx, norm_idx
+
+    @staticmethod
+    def _quick_verify_pick_single_candidate(
+        candidates: list[str], target_suffix: str
+    ) -> tuple[str | None, str]:
+        if not candidates:
+            return None, "no candidates"
+        if len(candidates) == 1:
+            return str(candidates[0]), ""
+        same_ext = [
+            str(p)
+            for p in candidates
+            if Path(str(p)).suffix.lower() == str(target_suffix or "").lower()
+        ]
+        if len(same_ext) == 1:
+            return same_ext[0], ""
+        return None, "ambiguous"
+
+    def _quick_verify_match_reference_path(
+        self,
+        target_path: str,
+        exact_idx: dict[str, list[str]],
+        norm_idx: dict[str, list[str]],
+    ) -> tuple[str | None, str]:
+        target = Path(str(target_path))
+        exact_key = target.stem.lower()
+        ref_path, err = self._quick_verify_pick_single_candidate(
+            exact_idx.get(exact_key, []), target.suffix
+        )
+        if ref_path:
+            return ref_path, "exact"
+        if err == "ambiguous":
+            return None, "ambiguous exact match"
+
+        norm_key = self._quick_verify_normalize_stem(target.stem)
+        ref_path, err = self._quick_verify_pick_single_candidate(
+            norm_idx.get(norm_key, []), target.suffix
+        )
+        if ref_path:
+            return ref_path, f"normalized:{norm_key}"
+        if err == "ambiguous":
+            return None, "ambiguous normalized match"
+        return None, "reference not found"
+
+    def _quick_verify_collect_packet_mismatch_targets(
+        self,
+        target_files: list[str],
+        ref_files: list[str],
+        target_meta_by_path: dict[str, dict],
+        ref_meta_by_path: dict[str, dict],
+        frame_tol: int = 1,
+    ) -> dict:
+        target_norm = sorted({str(x) for x in (target_files or []) if str(x).strip()})
+        ref_norm = sorted({str(x) for x in (ref_files or []) if str(x).strip()})
+        exact_idx, norm_idx = self._quick_verify_build_name_indexes(ref_norm)
+
+        mismatch_targets: list[str] = []
+        unmatched_targets: list[str] = []
+        matched_refs: set[str] = set()
+        pairs_compared = 0
+        pairs_packet_nd = 0
+        tol = max(0, int(frame_tol))
+
+        for target_path in target_norm:
+            ref_path, _match_info = self._quick_verify_match_reference_path(
+                target_path, exact_idx, norm_idx
+            )
+            if not ref_path:
+                unmatched_targets.append(target_path)
+                continue
+            matched_refs.add(ref_path)
+
+            t_meta = target_meta_by_path.get(target_path) or {}
+            r_meta = ref_meta_by_path.get(ref_path) or {}
+            if not bool(t_meta.get("ok")) or not bool(r_meta.get("ok")):
+                continue
+
+            t_frames = t_meta.get("frames")
+            r_frames = r_meta.get("frames")
+            if t_frames is None or r_frames is None:
+                pairs_packet_nd += 1
+                continue
+            try:
+                delta = abs(int(t_frames) - int(r_frames))
+            except Exception:
+                pairs_packet_nd += 1
+                continue
+            pairs_compared += 1
+            if delta > tol:
+                mismatch_targets.append(target_path)
+
+        missing_reference = [ref for ref in ref_norm if ref not in matched_refs]
+        return {
+            "mismatch_targets": sorted(set(mismatch_targets)),
+            "unmatched_targets": sorted(set(unmatched_targets)),
+            "missing_reference": missing_reference,
+            "pairs_compared": pairs_compared,
+            "pairs_packet_nd": pairs_packet_nd,
+        }
+
     def _pipeline_filter_files_to_test_subset(self, files: list[str]) -> list[str]:
         normalized = sorted({str(x) for x in (files or []) if str(x).strip()})
         if not self._pipeline_test_active:
@@ -10359,56 +10500,6 @@ class PipelineMasterGUI:
                 )
                 return
 
-            def _probe_group(file_list: list[str], label: str) -> dict:
-                broken: list[str] = []
-                total_duration = 0.0
-                duration_available = True
-                total_frames = 0
-                frames_available = True
-
-                def _probe_one(fp: str) -> tuple[str, dict]:
-                    return fp, self._probe_video_basic(fp)
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    futures = [ex.submit(_probe_one, fp) for fp in file_list]
-                    done = 0
-                    for fut in concurrent.futures.as_completed(futures):
-                        fp, meta = fut.result()
-                        done += 1
-                        if not meta.get("ok"):
-                            broken.append(fp)
-                            self._log_queue.put(
-                                (
-                                    "splat_line",
-                                    f"[QUICK][{label.upper()}][BROKEN] {fp} :: {meta.get('error')}",
-                                )
-                            )
-                        else:
-                            dur = meta.get("duration")
-                            frm = meta.get("frames")
-                            if dur is None:
-                                duration_available = False
-                            else:
-                                total_duration += float(dur)
-                            if frm is None:
-                                frames_available = False
-                            else:
-                                total_frames += int(frm)
-                        if done % 25 == 0 or done == len(file_list):
-                            self._log_queue.put(
-                                (
-                                    "splat_line",
-                                    f"[QUICK][{label.upper()}] progress {done}/{len(file_list)}",
-                                )
-                            )
-                return {
-                    "broken": broken,
-                    "total_duration": total_duration,
-                    "duration_available": duration_available,
-                    "total_frames": total_frames,
-                    "frames_available": frames_available,
-                }
-
             def _run_quick_check(
                 target_dir: str, target_patterns: list[str], target_label: str
             ) -> tuple[bool, str, list[str]]:
@@ -10425,8 +10516,48 @@ class PipelineMasterGUI:
                     )
                 )
 
-                target_stats = _probe_group(target_files, target_label)
-                ref_stats = _probe_group(ref_files, "reference")
+                target_stats = self._quick_verify_probe_group(
+                    target_files,
+                    max_workers,
+                    "splat_line",
+                    target_label,
+                    "[QUICK]",
+                )
+                ref_stats = self._quick_verify_probe_group(
+                    ref_files,
+                    max_workers,
+                    "splat_line",
+                    "reference",
+                    "[QUICK]",
+                )
+
+                pair_stats = self._quick_verify_collect_packet_mismatch_targets(
+                    target_files,
+                    ref_files,
+                    target_stats.get("meta_by_path", {}),
+                    ref_stats.get("meta_by_path", {}),
+                    frame_tol=1,
+                )
+                packet_mismatch_targets = pair_stats.get("mismatch_targets") or []
+                unmatched_targets = pair_stats.get("unmatched_targets") or []
+                missing_reference = pair_stats.get("missing_reference") or []
+                broken_targets = sorted(
+                    set((target_stats.get("broken") or []) + packet_mismatch_targets)
+                )
+
+                self._log_queue.put(
+                    (
+                        "splat_line",
+                        (
+                            f"[QUICK] {target_label} packet pair check: "
+                            f"compared={int(pair_stats.get('pairs_compared', 0))}, "
+                            f"n.d.={int(pair_stats.get('pairs_packet_nd', 0))}, "
+                            f"mismatch={len(packet_mismatch_targets)}, "
+                            f"unmatched_target={len(unmatched_targets)}, "
+                            f"missing_reference={len(missing_reference)}"
+                        ),
+                    )
+                )
 
                 count_ok = len(target_files) == len(ref_files)
                 count_msg = f"{target_label}={len(target_files)} vs reference={len(ref_files)}"
@@ -10464,19 +10595,24 @@ class PipelineMasterGUI:
                 )
 
                 ok_final = (
-                    not target_stats["broken"]
+                    not broken_targets
                     and not ref_stats["broken"]
                     and count_ok
+                    and not unmatched_targets
+                    and not missing_reference
                     and (frames_ok or frames_msg == "n.d.")
                 )
                 msg = (
                     f"[{target_label}] Broken target files: {len(target_stats['broken'])}; "
+                    f"Packet mismatch target files: {len(packet_mismatch_targets)}; "
+                    f"Unmatched target files: {len(unmatched_targets)}; "
+                    f"Missing reference files: {len(missing_reference)}; "
                     f"Broken reference files: {len(ref_stats['broken'])}; "
                     f"File count: {'YES' if count_ok else 'NO'} ({count_msg}); "
                     f"Duration (informational only): {'YES' if duration_ok else ('N.D.' if duration_msg == 'n.d.' else 'NO')} ({duration_msg}); "
                     f"Frames: {'YES' if frames_ok else ('N.D.' if frames_msg == 'n.d.' else 'NO')} ({frames_msg})"
                 )
-                return ok_final, msg, target_stats["broken"]
+                return ok_final, msg, broken_targets
 
             messages: list[str] = []
             broken_targets: list[str] = []
@@ -10812,49 +10948,46 @@ class PipelineMasterGUI:
             self._log_queue.put(
                 ("depth_line", f"[QUICK] checking depth files={len(depth_files)} and reference files={len(ref_files)} with {max_workers} workers")
             )
+            depth_stats = self._quick_verify_probe_group(
+                depth_files,
+                max_workers,
+                "depth_line",
+                "depth",
+                "[QUICK]",
+            )
+            ref_stats = self._quick_verify_probe_group(
+                ref_files,
+                max_workers,
+                "depth_line",
+                "reference",
+                "[QUICK]",
+            )
 
-            def _probe_group(file_list: list[str], label: str) -> dict:
-                broken: list[str] = []
-                total_duration = 0.0
-                duration_available = True
-                total_frames = 0
-                frames_available = True
+            pair_stats = self._quick_verify_collect_packet_mismatch_targets(
+                depth_files,
+                ref_files,
+                depth_stats.get("meta_by_path", {}),
+                ref_stats.get("meta_by_path", {}),
+                frame_tol=1,
+            )
+            packet_mismatch_depth = pair_stats.get("mismatch_targets") or []
+            unmatched_depth = pair_stats.get("unmatched_targets") or []
+            missing_reference = pair_stats.get("missing_reference") or []
+            broken_depth = sorted(set((depth_stats.get("broken") or []) + packet_mismatch_depth))
 
-                def _probe_one(fp: str) -> tuple[str, dict]:
-                    return fp, self._probe_video_basic(fp)
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    futures = [ex.submit(_probe_one, fp) for fp in file_list]
-                    done = 0
-                    for fut in concurrent.futures.as_completed(futures):
-                        fp, meta = fut.result()
-                        done += 1
-                        if not meta.get("ok"):
-                            broken.append(fp)
-                            self._log_queue.put(("depth_line", f"[QUICK][{label.upper()}][BROKEN] {fp} :: {meta.get('error')}"))
-                        else:
-                            dur = meta.get("duration")
-                            frm = meta.get("frames")
-                            if dur is None:
-                                duration_available = False
-                            else:
-                                total_duration += float(dur)
-                            if frm is None:
-                                frames_available = False
-                            else:
-                                total_frames += int(frm)
-                        if done % 25 == 0 or done == len(file_list):
-                            self._log_queue.put(("depth_line", f"[QUICK][{label.upper()}] progress {done}/{len(file_list)}"))
-                return {
-                    "broken": broken,
-                    "total_duration": total_duration,
-                    "duration_available": duration_available,
-                    "total_frames": total_frames,
-                    "frames_available": frames_available,
-                }
-
-            depth_stats = _probe_group(depth_files, "depth")
-            ref_stats = _probe_group(ref_files, "reference")
+            self._log_queue.put(
+                (
+                    "depth_line",
+                    (
+                        "[QUICK] packet pair check: "
+                        f"compared={int(pair_stats.get('pairs_compared', 0))}, "
+                        f"n.d.={int(pair_stats.get('pairs_packet_nd', 0))}, "
+                        f"mismatch={len(packet_mismatch_depth)}, "
+                        f"unmatched_depth={len(unmatched_depth)}, "
+                        f"missing_reference={len(missing_reference)}"
+                    ),
+                )
+            )
 
             count_ok = len(depth_files) == len(ref_files)
             count_msg = f"depth={len(depth_files)} vs reference={len(ref_files)}"
@@ -10884,14 +11017,19 @@ class PipelineMasterGUI:
             self._log_queue.put(("depth_line", f"[QUICK] packet check: {frames_msg}"))
 
             ok_final = (
-                not depth_stats["broken"]
+                not broken_depth
                 and not ref_stats["broken"]
                 and count_ok
+                and not unmatched_depth
+                and not missing_reference
                 and (frames_ok or frames_msg == "n.d.")
             )
             message = (
                 f"Depth quick verify completed.\n"
                 f"Broken depth files: {len(depth_stats['broken'])}\n"
+                f"Packet mismatch depth files: {len(packet_mismatch_depth)}\n"
+                f"Unmatched depth files: {len(unmatched_depth)}\n"
+                f"Missing reference files: {len(missing_reference)}\n"
                 f"Broken reference files: {len(ref_stats['broken'])}\n"
                 f"File count match: {'YES' if count_ok else 'NO'} ({count_msg})\n"
                 f"Duration match (informational only): {'YES' if duration_ok else ('N.D.' if duration_msg == 'n.d.' else 'NO')}\n"
@@ -10905,7 +11043,7 @@ class PipelineMasterGUI:
                     {
                         "ok": ok_final,
                         "message": message,
-                        "broken_depth": depth_stats["broken"],
+                        "broken_depth": broken_depth,
                         "broken_reference": ref_stats["broken"],
                     },
                 )
@@ -11074,49 +11212,48 @@ class PipelineMasterGUI:
             self._log_queue.put(
                 ("depth_line", f"[UPSCALE-QUICK] checking upscaled files={len(upscaled_files)} and reference files={len(ref_files)} with {max_workers} workers")
             )
+            upscaled_stats = self._quick_verify_probe_group(
+                upscaled_files,
+                max_workers,
+                "depth_line",
+                "upscaled",
+                "[UPSCALE-QUICK]",
+            )
+            ref_stats = self._quick_verify_probe_group(
+                ref_files,
+                max_workers,
+                "depth_line",
+                "reference",
+                "[UPSCALE-QUICK]",
+            )
 
-            def _probe_group(file_list: list[str], label: str) -> dict:
-                broken: list[str] = []
-                total_duration = 0.0
-                duration_available = True
-                total_frames = 0
-                frames_available = True
+            pair_stats = self._quick_verify_collect_packet_mismatch_targets(
+                upscaled_files,
+                ref_files,
+                upscaled_stats.get("meta_by_path", {}),
+                ref_stats.get("meta_by_path", {}),
+                frame_tol=1,
+            )
+            packet_mismatch_upscaled = pair_stats.get("mismatch_targets") or []
+            unmatched_upscaled = pair_stats.get("unmatched_targets") or []
+            missing_reference = pair_stats.get("missing_reference") or []
+            broken_upscaled = sorted(
+                set((upscaled_stats.get("broken") or []) + packet_mismatch_upscaled)
+            )
 
-                def _probe_one(fp: str) -> tuple[str, dict]:
-                    return fp, self._probe_video_basic(fp)
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    futures = [ex.submit(_probe_one, fp) for fp in file_list]
-                    done = 0
-                    for fut in concurrent.futures.as_completed(futures):
-                        fp, meta = fut.result()
-                        done += 1
-                        if not meta.get("ok"):
-                            broken.append(fp)
-                            self._log_queue.put(("depth_line", f"[UPSCALE-QUICK][{label.upper()}][BROKEN] {fp} :: {meta.get('error')}"))
-                        else:
-                            dur = meta.get("duration")
-                            frm = meta.get("frames")
-                            if dur is None:
-                                duration_available = False
-                            else:
-                                total_duration += float(dur)
-                            if frm is None:
-                                frames_available = False
-                            else:
-                                total_frames += int(frm)
-                        if done % 25 == 0 or done == len(file_list):
-                            self._log_queue.put(("depth_line", f"[UPSCALE-QUICK][{label.upper()}] progress {done}/{len(file_list)}"))
-                return {
-                    "broken": broken,
-                    "total_duration": total_duration,
-                    "duration_available": duration_available,
-                    "total_frames": total_frames,
-                    "frames_available": frames_available,
-                }
-
-            upscaled_stats = _probe_group(upscaled_files, "upscaled")
-            ref_stats = _probe_group(ref_files, "reference")
+            self._log_queue.put(
+                (
+                    "depth_line",
+                    (
+                        "[UPSCALE-QUICK] packet pair check: "
+                        f"compared={int(pair_stats.get('pairs_compared', 0))}, "
+                        f"n.d.={int(pair_stats.get('pairs_packet_nd', 0))}, "
+                        f"mismatch={len(packet_mismatch_upscaled)}, "
+                        f"unmatched_upscaled={len(unmatched_upscaled)}, "
+                        f"missing_reference={len(missing_reference)}"
+                    ),
+                )
+            )
 
             count_ok = len(upscaled_files) == len(ref_files)
             count_msg = f"upscaled={len(upscaled_files)} vs reference={len(ref_files)}"
@@ -11146,14 +11283,19 @@ class PipelineMasterGUI:
             self._log_queue.put(("depth_line", f"[UPSCALE-QUICK] packet check: {frames_msg}"))
 
             ok_final = (
-                not upscaled_stats["broken"]
+                not broken_upscaled
                 and not ref_stats["broken"]
                 and count_ok
+                and not unmatched_upscaled
+                and not missing_reference
                 and (frames_ok or frames_msg == "n.d.")
             )
             message = (
                 f"Upscale quick verify completed.\n"
                 f"Broken upscaled files: {len(upscaled_stats['broken'])}\n"
+                f"Packet mismatch upscaled files: {len(packet_mismatch_upscaled)}\n"
+                f"Unmatched upscaled files: {len(unmatched_upscaled)}\n"
+                f"Missing reference files: {len(missing_reference)}\n"
                 f"Broken reference files: {len(ref_stats['broken'])}\n"
                 f"File count match: {'YES' if count_ok else 'NO'} ({count_msg})\n"
                 f"Duration match (informational only): {'YES' if duration_ok else ('N.D.' if duration_msg == 'n.d.' else 'NO')}\n"
@@ -11167,7 +11309,7 @@ class PipelineMasterGUI:
                     {
                         "ok": ok_final,
                         "message": message,
-                        "broken_upscaled": upscaled_stats["broken"],
+                        "broken_upscaled": broken_upscaled,
                         "broken_reference": ref_stats["broken"],
                     },
                 )
@@ -12427,6 +12569,67 @@ class PipelineMasterGUI:
                 "pix_fmt": "",
             }
 
+    def _quick_verify_probe_group(
+        self,
+        file_list: list[str],
+        max_workers: int,
+        log_kind: str,
+        label: str,
+        prefix: str = "[QUICK]",
+    ) -> dict:
+        files = sorted({str(x) for x in (file_list or []) if str(x).strip()})
+        broken: list[str] = []
+        meta_by_path: dict[str, dict] = {}
+        total_duration = 0.0
+        duration_available = True
+        total_frames = 0
+        frames_available = True
+
+        def _probe_one(fp: str) -> tuple[str, dict]:
+            return fp, self._probe_video_basic(fp)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+            futures = [ex.submit(_probe_one, fp) for fp in files]
+            done = 0
+            for fut in concurrent.futures.as_completed(futures):
+                fp, meta = fut.result()
+                meta_by_path[fp] = dict(meta or {})
+                done += 1
+                if not meta.get("ok"):
+                    broken.append(fp)
+                    self._log_queue.put(
+                        (
+                            log_kind,
+                            f"{prefix}[{label.upper()}][BROKEN] {fp} :: {meta.get('error')}",
+                        )
+                    )
+                else:
+                    dur = meta.get("duration")
+                    frm = meta.get("frames")
+                    if dur is None:
+                        duration_available = False
+                    else:
+                        total_duration += float(dur)
+                    if frm is None:
+                        frames_available = False
+                    else:
+                        total_frames += int(frm)
+                if done % 25 == 0 or done == len(files):
+                    self._log_queue.put(
+                        (
+                            log_kind,
+                            f"{prefix}[{label.upper()}] progress {done}/{len(files)}",
+                        )
+                    )
+        return {
+            "broken": sorted(set(broken)),
+            "meta_by_path": meta_by_path,
+            "total_duration": total_duration,
+            "duration_available": duration_available,
+            "total_frames": total_frames,
+            "frames_available": frames_available,
+        }
+
     def _start_verify_quick(self) -> None:
         if self._scene_thread and self._scene_thread.is_alive():
             messagebox.showinfo(
@@ -12826,6 +13029,39 @@ class PipelineMasterGUI:
             for err in errors[:10]:
                 logger(f"[VERIFY][AUTO-CLEANUP][ERR] {err}")
         return deleted, len(errors)
+
+    def _cleanup_broken_files_with_confirmation(
+        self,
+        paths: list[str],
+        logger,
+        label: str,
+        dialog_title: str,
+    ) -> tuple[int, int, bool, int]:
+        uniq = sorted({str(p) for p in (paths or []) if str(p).strip()})
+        if not uniq:
+            return 0, 0, False, 0
+
+        flagged = len(uniq)
+        if not self._pipeline_autorun:
+            confirm_msg = (
+                f"Verify found {flagged} corrupted/incomplete file(s) in {label}.\n\n"
+                "Delete them now so the next run can regenerate them?\n"
+                "Check the folder selection before confirming."
+            )
+            confirm_msg += self._format_corrupted_files_block(
+                uniq,
+                "Files marked for deletion",
+                max_items=20,
+            )
+            if not messagebox.askyesno(dialog_title, confirm_msg):
+                logger(
+                    f"[VERIFY][AUTO-CLEANUP] {label}: skipped by user, "
+                    f"flagged={flagged}"
+                )
+                return 0, 0, True, flagged
+
+        deleted, errors = self._auto_cleanup_broken_files(uniq, logger, label)
+        return deleted, errors, False, flagged
 
     @staticmethod
     def _extract_verifyscenes_bad_relpath(line: str) -> str | None:
@@ -13745,11 +13981,23 @@ class PipelineMasterGUI:
                         self.scene_status_var.set("Verify (Quick) failed")
                         deleted = 0
                         cleanup_err = 0
+                        cleanup_skipped = False
+                        cleanup_total = 0
                         if broken_files:
-                            deleted, cleanup_err = self._auto_cleanup_broken_files(
-                                broken_files, self._append_scene_log, "seg/seg-mono"
+                            deleted, cleanup_err, cleanup_skipped, cleanup_total = (
+                                self._cleanup_broken_files_with_confirmation(
+                                    broken_files,
+                                    self._append_scene_log,
+                                    "seg/seg-mono",
+                                    "Verify Scenes (Quick)",
+                                )
                             )
-                        if deleted or cleanup_err:
+                        if cleanup_skipped:
+                            msg = (
+                                f"{msg}\n\n"
+                                f"Cleanup skipped by user: {cleanup_total} file(s) flagged for deletion."
+                            )
+                        elif deleted or cleanup_err:
                             msg = (
                                 f"{msg}\n\n"
                                 f"Auto-cleanup: deleted {deleted} broken file(s), "
@@ -13819,11 +14067,23 @@ class PipelineMasterGUI:
                         self.depth_status_var.set("Verify (Quick) failed")
                         deleted = 0
                         cleanup_err = 0
+                        cleanup_skipped = False
+                        cleanup_total = 0
                         if broken_depth:
-                            deleted, cleanup_err = self._auto_cleanup_broken_files(
-                                broken_depth, self._append_depth_log, "depthmap"
+                            deleted, cleanup_err, cleanup_skipped, cleanup_total = (
+                                self._cleanup_broken_files_with_confirmation(
+                                    broken_depth,
+                                    self._append_depth_log,
+                                    "depthmap",
+                                    "Verify Depth (Quick)",
+                                )
                             )
-                        if deleted or cleanup_err:
+                        if cleanup_skipped:
+                            msg = (
+                                f"{msg}\n\n"
+                                f"Cleanup skipped by user: {cleanup_total} file(s) flagged for deletion."
+                            )
+                        elif deleted or cleanup_err:
                             msg = (
                                 f"{msg}\n\n"
                                 f"Auto-cleanup: deleted {deleted} broken file(s), "
@@ -13880,11 +14140,23 @@ class PipelineMasterGUI:
                         self.depth_status_var.set("Verify Upscale (Quick) failed")
                         deleted = 0
                         cleanup_err = 0
+                        cleanup_skipped = False
+                        cleanup_total = 0
                         if broken_upscaled:
-                            deleted, cleanup_err = self._auto_cleanup_broken_files(
-                                broken_upscaled, self._append_depth_log, "depth upscaled"
+                            deleted, cleanup_err, cleanup_skipped, cleanup_total = (
+                                self._cleanup_broken_files_with_confirmation(
+                                    broken_upscaled,
+                                    self._append_depth_log,
+                                    "depth upscaled",
+                                    "Verify Upscale (Quick)",
+                                )
                             )
-                        if deleted or cleanup_err:
+                        if cleanup_skipped:
+                            msg = (
+                                f"{msg}\n\n"
+                                f"Cleanup skipped by user: {cleanup_total} file(s) flagged for deletion."
+                            )
+                        elif deleted or cleanup_err:
                             msg = (
                                 f"{msg}\n\n"
                                 f"Auto-cleanup: deleted {deleted} broken file(s), "
@@ -13938,11 +14210,23 @@ class PipelineMasterGUI:
                         self.splat_status_var.set("Verify (Quick) failed")
                         deleted = 0
                         cleanup_err = 0
+                        cleanup_skipped = False
+                        cleanup_total = 0
                         if broken_targets:
-                            deleted, cleanup_err = self._auto_cleanup_broken_files(
-                                broken_targets, self._append_splat_log, "splat targets"
+                            deleted, cleanup_err, cleanup_skipped, cleanup_total = (
+                                self._cleanup_broken_files_with_confirmation(
+                                    broken_targets,
+                                    self._append_splat_log,
+                                    "splat targets",
+                                    "Verify Splatting (Quick)",
+                                )
                             )
-                        if deleted or cleanup_err:
+                        if cleanup_skipped:
+                            msg = (
+                                f"{msg}\n\n"
+                                f"Cleanup skipped by user: {cleanup_total} file(s) flagged for deletion."
+                            )
+                        elif deleted or cleanup_err:
                             msg = (
                                 f"{msg}\n\n"
                                 f"Auto-cleanup: deleted {deleted} broken file(s), "
@@ -14000,11 +14284,23 @@ class PipelineMasterGUI:
                         self.inpaint_status_var.set("Verify (Quick) failed")
                         deleted = 0
                         cleanup_err = 0
+                        cleanup_skipped = False
+                        cleanup_total = 0
                         if broken_output:
-                            deleted, cleanup_err = self._auto_cleanup_broken_files(
-                                broken_output, self._append_inpaint_log, "inpaint output"
+                            deleted, cleanup_err, cleanup_skipped, cleanup_total = (
+                                self._cleanup_broken_files_with_confirmation(
+                                    broken_output,
+                                    self._append_inpaint_log,
+                                    "inpaint output",
+                                    "Verify Inpainting (Quick)",
+                                )
                             )
-                        if deleted or cleanup_err:
+                        if cleanup_skipped:
+                            msg = (
+                                f"{msg}\n\n"
+                                f"Cleanup skipped by user: {cleanup_total} file(s) flagged for deletion."
+                            )
+                        elif deleted or cleanup_err:
                             msg = (
                                 f"{msg}\n\n"
                                 f"Auto-cleanup: deleted {deleted} broken file(s), "
@@ -14061,11 +14357,23 @@ class PipelineMasterGUI:
                         self.merge_status_var.set("Verify Mask (Quick) failed")
                         deleted = 0
                         cleanup_err = 0
+                        cleanup_skipped = False
+                        cleanup_total = 0
                         if broken_output:
-                            deleted, cleanup_err = self._auto_cleanup_broken_files(
-                                broken_output, self._append_merge_log, "mask_for_merge output"
+                            deleted, cleanup_err, cleanup_skipped, cleanup_total = (
+                                self._cleanup_broken_files_with_confirmation(
+                                    broken_output,
+                                    self._append_merge_log,
+                                    "mask_for_merge output",
+                                    "Verify Mask (Quick)",
+                                )
                             )
-                        if deleted or cleanup_err:
+                        if cleanup_skipped:
+                            msg = (
+                                f"{msg}\n\n"
+                                f"Cleanup skipped by user: {cleanup_total} file(s) flagged for deletion."
+                            )
+                        elif deleted or cleanup_err:
                             msg = (
                                 f"{msg}\n\n"
                                 f"Auto-cleanup: deleted {deleted} broken file(s), "
@@ -14122,11 +14430,23 @@ class PipelineMasterGUI:
                         self.merge_status_var.set("Verify (Quick) failed")
                         deleted = 0
                         cleanup_err = 0
+                        cleanup_skipped = False
+                        cleanup_total = 0
                         if broken_output:
-                            deleted, cleanup_err = self._auto_cleanup_broken_files(
-                                broken_output, self._append_merge_log, "merged output"
+                            deleted, cleanup_err, cleanup_skipped, cleanup_total = (
+                                self._cleanup_broken_files_with_confirmation(
+                                    broken_output,
+                                    self._append_merge_log,
+                                    "merged output",
+                                    "Verify Merging (Quick)",
+                                )
                             )
-                        if deleted or cleanup_err:
+                        if cleanup_skipped:
+                            msg = (
+                                f"{msg}\n\n"
+                                f"Cleanup skipped by user: {cleanup_total} file(s) flagged for deletion."
+                            )
+                        elif deleted or cleanup_err:
                             msg = (
                                 f"{msg}\n\n"
                                 f"Auto-cleanup: deleted {deleted} broken file(s), "
@@ -14202,11 +14522,23 @@ class PipelineMasterGUI:
                         )
                         deleted = 0
                         cleanup_err = 0
+                        cleanup_skipped = False
+                        cleanup_total = 0
                         if broken_output:
-                            deleted, cleanup_err = self._auto_cleanup_broken_files(
-                                broken_output, self._append_join_log, "mono_to_sbs output"
+                            deleted, cleanup_err, cleanup_skipped, cleanup_total = (
+                                self._cleanup_broken_files_with_confirmation(
+                                    broken_output,
+                                    self._append_join_log,
+                                    "mono_to_sbs output",
+                                    "Verify Mono->SBS",
+                                )
                             )
-                        if deleted or cleanup_err:
+                        if cleanup_skipped:
+                            msg = (
+                                f"{msg}\n\n"
+                                f"Cleanup skipped by user: {cleanup_total} file(s) flagged for deletion."
+                            )
+                        elif deleted or cleanup_err:
                             msg = (
                                 f"{msg}\n\n"
                                 f"Auto-cleanup: deleted {deleted} broken file(s), "

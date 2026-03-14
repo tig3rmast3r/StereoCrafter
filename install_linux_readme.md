@@ -4,6 +4,11 @@ Linux only for this fork. Windows may still work, but it is not supported here.<
 <br>
 Preset values in this fork are tuned for this reference machine: Intel 265K, 48 GB RAM, RTX 4090. On different hardware, expect to adjust settings.
 
+```bash
+git clone https://github.com/tig3rmast3r/StereoCrafter --recursive
+cd StereoCrafter
+```
+
 ## 1) Make Scripts Executable
 
 Run from repo root:
@@ -40,10 +45,15 @@ Recommended target stack for this fork:
 
 ## 3) Mini Guide for Vast.ai
 
+Tested only inpaint job with docker vastai/pytorch:2.9.1-cuda-12.8.1-py310-24.04
+
 From repo root:
 
 ```bash
-chmod +x setup_vast_stage1.sh setup_vast_stage2_weights.sh
+git clone https://github.com/tig3rmast3r/StereoCrafter --recursive
+cd StereoCrafter
+find . -maxdepth 1 -type f -name "*.sh" -print0 | xargs -0 chmod +x
+find ./Utilities -type f -name "*.sh" -print0 | xargs -0 chmod +x
 ./setup_vast_stage1.sh
 ./setup_vast_stage2_weights.sh
 ```

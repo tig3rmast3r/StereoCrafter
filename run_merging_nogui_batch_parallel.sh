@@ -56,6 +56,7 @@ worker_done_counts=()
 worker_total_counts=()
 worker_exit_reported=()
 worker_exit_codes=()
+declare -A worker_seen_jobs=()
 
 last_progress_done=-1
 last_progress_total=-1
@@ -232,6 +233,40 @@ increment_worker_done() {
   worker_done_counts[$wid]="$cur"
 }
 
+extract_worker_progress_key() {
+  local line="$1"
+  if [[ "$line" == *"DONE:"* ]]; then
+    printf '%s' "${line##*: }"
+    return
+  fi
+  if [[ "$line" == *"SKIP (exists"*":"* ]]; then
+    printf '%s' "${line##*: }"
+    return
+  fi
+  if [[ "$line" == *"GIVING UP:"* ]]; then
+    printf '%s' "${line##*: }"
+    return
+  fi
+  printf ''
+}
+
+mark_worker_job_done_once() {
+  local wid="$1"
+  local line="$2"
+  local key
+  key="$(extract_worker_progress_key "$line")"
+  if [ -z "$key" ]; then
+    increment_worker_done "$wid"
+    return
+  fi
+  local seen_key="${wid}::${key}"
+  if [ -n "${worker_seen_jobs[$seen_key]:-}" ]; then
+    return
+  fi
+  worker_seen_jobs[$seen_key]=1
+  increment_worker_done "$wid"
+}
+
 emit_progress_snapshot() {
   local sum_done=0
   local sum_total=0
@@ -271,15 +306,15 @@ parse_worker_log_line() {
   fi
 
   if [[ "$line" == *"DONE:"* ]]; then
-    increment_worker_done "$wid"
+    mark_worker_job_done_once "$wid" "$line"
     return
   fi
   if [[ "$line" == *"SKIP (exists"* ]]; then
-    increment_worker_done "$wid"
+    mark_worker_job_done_once "$wid" "$line"
     return
   fi
   if [[ "$line" == *"GIVING UP:"* ]]; then
-    increment_worker_done "$wid"
+    mark_worker_job_done_once "$wid" "$line"
     echo "[ERR ] worker $wid ${line}"
     return
   fi
