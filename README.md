@@ -11,14 +11,48 @@ All the extra scripts are made multithreading/parallel when possible, helping re
 
 [Install Linux guide](install_linux_readme.md)
 
-## Usage
+## Usage (auto with GUI)
 
 ```bash
 python pipeline_master_gui.py
 ```
-just run scenedetect TAB manually and Verify(quick) then try a test run on the last tab, it will pick the first 10 unfinished clips and do all the steps, if everything went well press the run/resume button and go on vacation, when you are back it should have finished :)<br>
+just run scenedetect TAB manually and Verify(quick) then try a test run on the last tab, it will pick the first 5 unfinished clips and do all the steps, if everything went well press the run/resume button and go on vacation, when you are back it should have finished :)<br>
 <br>
-VERY IMPORTANT: most of the crashes/errors i'm getting are because of unstable ffmpeg, in my case h264_nvenc is much more stable, i switch to x264 only for the inpainting job to keep vram usage as low as possible.
+VERY IMPORTANT: most of the crashes/errors i'm getting are because of unstable ffmpeg, in my case h264_nvenc is much more stable, i switch to x264 only for the inpainting job to keep vram usage as low as possible.<br>
+
+NOTE about PYTORCH_ALLOC_CONF max_split_size_mb:xx, while this command can save from VRAM OOM be warned that a low value such as 64 can increase inference times by up to 200%, i have implemented those exports to be enabled only when there are fails. <br>
+garbage_collection_threshold:0.8 and expandable_segments:True are very light so i kept them on as default for depthcrafting and inpainting steps.
+
+## Usage (manual with or without GUI)
+
+All the scripts can be launched as stand-alone, or you can run the gui versions like the originating fork where i've started, only a warning with merging_gui, it leads to crashes very often so use at your own risk. Use preprocessed motion/shadowed mask to reduce crashes (mask_for_merge script)<br>
+Below the full manual pipeline (using all features)<br>
+
+As a general rule:<br>
+1) open the gui version and check values you want to use
+2) open the corresponding sh runner and change values (they are all available at the top) and eventually paths
+3) run
+4) next step
+
+Scenedetect CSV is NOT available as stand alone, is a single line command btw. Use just csv creation, then go on as below<br>
+
+```bash
+python Utilities/split_scenes_from_csv.py
+# manually move mono files to seg-mono folder
+./run_depthcrafter_nogui_batch.sh
+./Utilities/upscale_esrgan_x264.sh #or nvenc variant
+./run_splatting_runner_parallel.sh
+python Utilities/analyze_inpaint_sharpness.py
+./run_inpainting_runner.sh
+./run_mask_formerge_nogui.sh
+python Utilities/analyze_auto_ct_csv.py
+./run_merging_nogui_batch_parallel.sh #or run_merging_nogui_batch.sh for single thread
+python Utilities/prepare_seg_mono_to_sbs.py # if you have mono files on seg-mono
+./Utilities/Rejoin_HEVC_NVENC.sh
+./Utilities/remux_replace_video_mkvtoolnix.sh
+```
+
+
 
 ## More info and fork changelog
 
