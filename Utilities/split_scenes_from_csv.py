@@ -9,6 +9,7 @@ import json
 import shlex
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from fractions import Fraction
@@ -22,6 +23,18 @@ class SceneRow:
     frame_count: int | None
     start_sec: float | None
     end_sec: float | None
+
+
+RETRYABLE_ENCODER_MARKERS = (
+    "OpenEncodeSessionEx failed",
+    "No capable devices found",
+    "Error while opening encoder",
+    "Could not open encoder before EOF",
+    "Nothing was written into output file",
+    "incompatible client key",
+)
+
+MAX_RETRY_ROUNDS = 4
 
 
 def parse_ratio(value: str) -> Fraction | None:
@@ -245,6 +258,31 @@ def format_seconds(value: float) -> str:
     return txt if txt else "0"
 
 
+def uses_nvenc(ffmpeg_tokens: list[str]) -> bool:
+    joined = " ".join(str(tok or "").strip().lower() for tok in ffmpeg_tokens)
+    return "nvenc" in joined
+
+
+def is_retryable_encoder_failure(err_text: str) -> bool:
+    err_lower = str(err_text or "").strip().lower()
+    if not err_lower:
+        return False
+    return any(marker.lower() in err_lower for marker in RETRYABLE_ENCODER_MARKERS)
+
+
+def retry_workers_for_round(initial_workers: int, round_idx: int, nvenc_active: bool) -> int:
+    workers = max(1, int(initial_workers))
+    if not nvenc_active:
+        return workers
+    if round_idx <= 1:
+        return workers
+    if round_idx == 2:
+        return max(1, min(workers, 4))
+    if round_idx == 3:
+        return max(1, min(workers, 2))
+    return 1
+
+
 def run_one_job(
     source_path: str,
     output_path: Path,
@@ -361,11 +399,14 @@ def main() -> int:
         jobs.append((output_dir / out_name, scene_row))
 
     workers = max(1, int(args.threads))
+    nvenc_active = uses_nvenc(ffmpeg_tokens)
     print(
         f"[SPLIT] jobs={len(jobs)} workers={workers} "
         f"skip_existing={args.skip_existing} delete_failed={args.delete_failed}",
         flush=True,
     )
+    if nvenc_active:
+        print("[SPLIT] encoder path detected: nvenc", flush=True)
 
     done = 0
     skipped = 0
@@ -373,33 +414,90 @@ def main() -> int:
     total = len(jobs)
     failures: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [
-            ex.submit(
-                run_one_job,
-                source_path,
-                out_path,
-                scene_row,
-                ffmpeg_tokens,
-                source_fps,
-                args.skip_existing == "yes",
-                args.delete_failed == "yes",
+    pending_jobs = list(jobs)
+    round_idx = 0
+    resolved = 0
+    while pending_jobs:
+        round_idx += 1
+        round_workers = retry_workers_for_round(workers, round_idx, nvenc_active)
+        round_total = len(pending_jobs)
+        round_done = 0
+        round_skipped = 0
+        round_failed_retryable: list[tuple[Path, SceneRow, str]] = []
+        round_failed_hard: list[str] = []
+        print(
+            f"[SPLIT] round {round_idx}/{MAX_RETRY_ROUNDS} jobs={round_total} workers={round_workers}",
+            flush=True,
+        )
+        with ThreadPoolExecutor(max_workers=round_workers) as ex:
+            future_to_job = {
+                ex.submit(
+                    run_one_job,
+                    source_path,
+                    out_path,
+                    scene_row,
+                    ffmpeg_tokens,
+                    source_fps,
+                    args.skip_existing == "yes",
+                    args.delete_failed == "yes",
+                ): (out_path, scene_row)
+                for out_path, scene_row in pending_jobs
+            }
+            completed_in_round = 0
+            retry_waiting = 0
+            for fut in as_completed(future_to_job):
+                out_path, scene_row = future_to_job[fut]
+                status, payload = fut.result()
+                completed_in_round += 1
+                if status == "done":
+                    done += 1
+                    round_done += 1
+                    resolved += 1
+                elif status == "skipped":
+                    skipped += 1
+                    round_skipped += 1
+                    resolved += 1
+                else:
+                    if (
+                        round_idx < MAX_RETRY_ROUNDS
+                        and is_retryable_encoder_failure(payload)
+                    ):
+                        round_failed_retryable.append((out_path, scene_row, payload))
+                        retry_waiting += 1
+                    else:
+                        failed += 1
+                        round_failed_hard.append(payload)
+                        failures.append(payload)
+                        resolved += 1
+                remaining_current = round_total - completed_in_round
+                pending_total = remaining_current + retry_waiting
+                progress_done = total - pending_total
+                pct = (float(progress_done) / float(total)) * 100.0 if total > 0 else 100.0
+                print(f"[SPLIT] progress {progress_done}/{total} ({pct:.1f}%)", flush=True)
+
+        print(
+            (
+                f"[SPLIT] round {round_idx} summary: "
+                f"done={round_done} skipped={round_skipped} "
+                f"retry={len(round_failed_retryable)} failed={len(round_failed_hard)}"
+            ),
+            flush=True,
+        )
+        if round_failed_retryable:
+            pending_jobs = [(out_path, scene_row) for out_path, scene_row, _err in round_failed_retryable]
+            sleep_sec = min(6, 2 * round_idx)
+            print(
+                (
+                    f"[SPLIT][RETRY] round {round_idx}: retrying {len(pending_jobs)} "
+                    f"encoder-open failure(s) after {sleep_sec}s"
+                ),
+                flush=True,
             )
-            for out_path, scene_row in jobs
-        ]
-        completed = 0
-        for fut in as_completed(futures):
-            status, payload = fut.result()
-            completed += 1
-            if status == "done":
-                done += 1
-            elif status == "skipped":
-                skipped += 1
-            else:
-                failed += 1
-                failures.append(payload)
-            pct = (float(completed) / float(total)) * 100.0 if total > 0 else 100.0
-            print(f"[SPLIT] progress {completed}/{total} ({pct:.1f}%)", flush=True)
+            for _out_path, _scene_row, err in round_failed_retryable[:20]:
+                print(f"[SPLIT][RETRYABLE] {err}", flush=True)
+            time.sleep(float(sleep_sec))
+        else:
+            pending_jobs = []
 
     print(
         f"[SPLIT] summary: done={done} skipped={skipped} failed={failed} total={total}",
