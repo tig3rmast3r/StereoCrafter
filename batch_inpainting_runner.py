@@ -18,6 +18,7 @@ import gc
 import subprocess
 import json
 import math
+import time
 
 import torch
 
@@ -125,6 +126,63 @@ def _safe_release_cuda():
     gc.collect()
 
 
+def _load_retry_resume_state(path: str):
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        pass
+    return None
+
+
+def _save_retry_resume_state(path: str, input_name: str, next_attempt: int, total_attempts: int) -> None:
+    payload = {
+        "input_name": str(input_name),
+        "next_attempt": int(next_attempt),
+        "total_attempts": int(total_attempts),
+        "updated_at": int(time.time()),
+    }
+    try:
+        _save_resume_state(path, payload)
+    except Exception as e:
+        print(f"[WARN] failed writing retry resume state: {e}")
+
+
+def _clear_retry_resume_state(path: str) -> None:
+    _clear_resume_state(path)
+
+
+def _load_retry_skip_manifest(path: str) -> set[str]:
+    try:
+        if not os.path.exists(path):
+            return set()
+        out: set[str] = set()
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                name = str(line).strip()
+                if name:
+                    out.add(name)
+        return out
+    except Exception:
+        return set()
+
+
+def _save_retry_skip_manifest(path: str, names: set[str]) -> None:
+    try:
+        ordered = sorted({str(x).strip() for x in names if str(x).strip()})
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for name in ordered:
+                f.write(name + "\n")
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[WARN] failed writing retry skip manifest: {e}")
+
+
 def _run_cmd(cmd):
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
@@ -194,6 +252,14 @@ def _resume_state_path(output_dir: str) -> str:
 
 def _current_job_state_path(output_dir: str) -> str:
     return os.path.join(output_dir, ".current_job.json")
+
+
+def _retry_resume_state_path(output_dir: str) -> str:
+    return os.path.join(output_dir, ".inpaint_retry_resume_state.json")
+
+
+def _retry_skip_manifest_path(output_dir: str) -> str:
+    return os.path.join(output_dir, ".inpaint_retry_skipped.txt")
 
 
 def _load_resume_state(path: str):
@@ -668,6 +734,8 @@ def run_batch(args):
 
     resume_path = _resume_state_path(args.output_dir)
     current_job_path = _current_job_state_path(args.output_dir)
+    retry_resume_state_file = _retry_resume_state_path(args.output_dir)
+    retry_skip_manifest_file = _retry_skip_manifest_path(args.output_dir)
     stop_marker_path = (
         os.path.abspath(args.stop_marker)
         if args.stop_marker
@@ -684,6 +752,17 @@ def run_batch(args):
             _clear_resume_state(resume_path)
     elif resume:
         _clear_resume_state(resume_path)
+
+    retry_resume_state = _load_retry_resume_state(retry_resume_state_file)
+    retry_skip_persisted = _load_retry_skip_manifest(retry_skip_manifest_file)
+    if retry_resume_state and str(retry_resume_state.get("input_name") or "").strip():
+        print(
+            "[INFO] retry resume state found: "
+            f"input={retry_resume_state.get('input_name')} "
+            f"next_attempt={retry_resume_state.get('next_attempt')}"
+        )
+    if retry_skip_persisted:
+        print(f"[INFO] persisted retry-skip files loaded: {len(retry_skip_persisted)}")
 
     # Recover interrupted per-file work from a previous crash/restart.
     _recover_interrupted_current_job(current_job_path)
@@ -731,6 +810,10 @@ def run_batch(args):
         base = os.path.basename(video_path)
         print(f"\n[{idx}/{len(videos)}] {base}")
 
+        if base in retry_skip_persisted:
+            print(f"[SKIP] {idx}/{len(videos)} {base} (retry-skip persisted)")
+            continue
+
         out_path = ""
         hi_res_input_path = None
         current_job_marked = False
@@ -767,6 +850,9 @@ def run_batch(args):
                     replace_mask_path=validation_ref_path if validation_ref_kind == "replace_mask" else "",
                 ):
                     print(f"[SKIP] exists+valid ({validation_ref_kind}): {out_path}")
+                    if retry_resume_state and str(retry_resume_state.get("input_name") or "") == base:
+                        _clear_retry_resume_state(retry_resume_state_file)
+                        retry_resume_state = None
                     if fast_resume_start is not None and i >= fast_resume_start:
                         fast_resume_start = None
                         _clear_resume_state(resume_path)
@@ -842,9 +928,29 @@ def run_batch(args):
             current_job_marked = True
 
             run_ok = False
-            for attempt_idx, prof in enumerate(retry_profiles, start=1):
+            start_attempt_idx = 1
+            if retry_resume_state and str(retry_resume_state.get("input_name") or "") == base:
+                try:
+                    start_attempt_idx = int(retry_resume_state.get("next_attempt") or 1)
+                except Exception:
+                    start_attempt_idx = 1
+                start_attempt_idx = max(1, min(len(retry_profiles), start_attempt_idx))
+                if start_attempt_idx > 1:
+                    print(
+                        f"[RETRY] resuming {idx}/{len(videos)} from attempt "
+                        f"{start_attempt_idx}/{len(retry_profiles)} after process restart"
+                    )
+
+            for attempt_idx in range(start_attempt_idx, len(retry_profiles) + 1):
+                prof = retry_profiles[attempt_idx - 1]
                 alloc_conf = _allocator_conf_from_profile(prof)
                 offload_mode = str(prof["cpu_offload_mode"])
+                _save_retry_resume_state(
+                    retry_resume_state_file,
+                    base,
+                    attempt_idx,
+                    len(retry_profiles),
+                )
                 print(
                     f"[RETRY] {idx}/{len(videos)} attempt {attempt_idx}/{len(retry_profiles)} "
                     f"profile={prof['name']} offload={offload_mode} "
@@ -891,6 +997,11 @@ def run_batch(args):
                     replace_mask_path=validation_ref_path if validation_ref_kind == "replace_mask" else "",
                 ):
                     run_ok = True
+                    if base in retry_skip_persisted:
+                        retry_skip_persisted.discard(base)
+                        _save_retry_skip_manifest(retry_skip_manifest_file, retry_skip_persisted)
+                    _clear_retry_resume_state(retry_resume_state_file)
+                    retry_resume_state = None
                     break
 
                 if completed:
@@ -934,7 +1045,11 @@ def run_batch(args):
                     f"{len(retry_profiles)} retry profiles"
                 )
                 retry_skipped.append(base)
+                retry_skip_persisted.add(base)
+                _save_retry_skip_manifest(retry_skip_manifest_file, retry_skip_persisted)
                 _cleanup_outputs(out_path)
+                _clear_retry_resume_state(retry_resume_state_file)
+                retry_resume_state = None
                 if current_job_marked:
                     _clear_current_job_state(current_job_path)
                     current_job_marked = False

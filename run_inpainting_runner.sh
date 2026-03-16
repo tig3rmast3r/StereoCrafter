@@ -111,6 +111,7 @@ echo "[CMD] ${CMD[*]}"
 # Set MAX_RETRIES=0 for infinite restarts.
 MAX_RETRIES="${MAX_RETRIES:-0}"
 RETRY_SLEEP_SEC="${RETRY_SLEEP_SEC:-2}"
+WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-False}"
 WATCHDOG_POLL_SEC="${WATCHDOG_POLL_SEC:-20}"
 WATCHDOG_IDLE_SEC="${WATCHDOG_IDLE_SEC:-600}"
 WATCHDOG_TERM_GRACE_SEC="${WATCHDOG_TERM_GRACE_SEC:-15}"
@@ -126,9 +127,20 @@ fi
 
 _latest_mp4_in_output() {
   find "$OUTPUT_DIR" -type f -name "*.mp4" -printf '%T@|%p\n' 2>/dev/null \
-    | sort -t'|' -nr -k1,1 \
-    | head -n1 \
-    | cut -d'|' -f2-
+    | awk -F'|' '
+      BEGIN { max_ts = -1; latest = "" }
+      {
+        ts = $1 + 0
+        if (ts > max_ts) {
+          max_ts = ts
+          latest = $2
+        }
+      }
+      END {
+        if (latest != "") print latest
+      }
+    ' || true
+  return 0
 }
 
 _ffprobe_quick_ok() {
@@ -161,8 +173,20 @@ _cleanup_unreadable_latest_output() {
 
 _latest_output_token() {
   find "$OUTPUT_DIR" -type f -printf '%T@|%s|%p\n' 2>/dev/null \
-    | sort -t'|' -nr -k1,1 \
-    | head -n1
+    | awk -F'|' '
+      BEGIN { max_ts = -1; latest = "" }
+      {
+        ts = $1 + 0
+        if (ts > max_ts) {
+          max_ts = ts
+          latest = $0
+        }
+      }
+      END {
+        if (latest != "") print latest
+      }
+    ' || true
+  return 0
 }
 
 _pgid_has_members() {
@@ -210,6 +234,14 @@ _request_stop_signal() {
 
 trap _request_stop_signal INT TERM
 
+_is_true() {
+  local v="${1:-}"
+  case "${v,,}" in
+    1|true|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 _run_once_with_watchdog() {
   local child_pid child_pgid self_pgid
   local last_token current_token
@@ -229,6 +261,18 @@ _run_once_with_watchdog() {
   fi
   CURRENT_CHILD_PID="$child_pid"
   CURRENT_CHILD_PGID="$child_pgid"
+
+  if ! _is_true "$WATCHDOG_ENABLED"; then
+    local rc=0
+    if wait "$child_pid"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    CURRENT_CHILD_PID=""
+    CURRENT_CHILD_PGID=""
+    return "$rc"
+  fi
 
   last_token="$(_latest_output_token)"
   last_activity_ts=$(date +%s)
@@ -255,11 +299,15 @@ _run_once_with_watchdog() {
     fi
   done
 
-  wait "$child_pid"
-  local rc=$?
+  local rc=0
+  if wait "$child_pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
   CURRENT_CHILD_PID=""
   CURRENT_CHILD_PGID=""
-  return $rc
+  return "$rc"
 }
 
 attempt=1

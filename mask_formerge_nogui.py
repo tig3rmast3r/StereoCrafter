@@ -52,6 +52,26 @@ MOTION_DEFAULTS_FILENAME = "config_mask_formerge_nogui_motion_defaults.json"
 MOTION_DEFAULTS_ENV = "MASK_FORMERGE_MOTION_DEFAULTS_JSON"
 
 
+def _limit_native_threads() -> None:
+    # Keep each worker process single-threaded at the native level; the shell
+    # launcher already runs multiple worker processes in parallel.
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+
+_limit_native_threads()
+
+
 def _coerce_bool(value: Any, fallback: bool) -> bool:
     if isinstance(value, bool):
         return value

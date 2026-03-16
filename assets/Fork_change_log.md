@@ -113,3 +113,14 @@ Long live to 3D!!
 2026-03-14 (Pipeline Master GUI fixes)
 - [fix] wrong progress feedback for merging script on errors/restarts
 - [fix] verifyscenes will also delete apparently good files but with wrong length
+
+2026-04-16 (New Scenes requeue utility, better "Stop" and fixes)
+- [new] New Utility that will automatically move/delete selected scenes from the project in order to re-process them again. It accepts annotations csv from Utilities/run_sbs_left_click_logger_player.sh or manual names on the specified TextBox (file name in this case will automatically set the step)
+- [new] Start/resume will now become "Stop" when running, in order to stop the run even during verifyscenes
+- [new] Verifyscenes buttons will become "Stop" when is running, allowing to stop it
+- [fix] VerifyScenes clips deletion was not working during Test Runs
+- [fix] Unstable Mask_for_merge workers near run end
+- [fix] run suddenly stops after AutoCT step in some cases
+- [fix] Verifyscenes on merge tab will exclude files coming from seg-mono during the process
+- [fix] latest fixes about Depthcrafter run stability was not implemented on the Inpainting step
+- [fix] split scene from csv was using length time instead of length frame

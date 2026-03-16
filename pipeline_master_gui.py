@@ -23,7 +23,11 @@ try:
 except Exception:
     ThemedTk = None
 
-GUI_VERSION = "2026-03-14"
+GUI_VERSION = "2026-03-16"
+
+
+class VerifyStopRequested(Exception):
+    """Raised when an active verification job is explicitly stopped."""
 
 
 class PipelineMasterGUI:
@@ -263,6 +267,10 @@ class PipelineMasterGUI:
         self._verify_thread: threading.Thread | None = None
         self._verify_running = False
         self._verify_mode: str = ""
+        self._verify_stop_requested = False
+        self._verify_stop_clicks = 0
+        self._verify_processes: set[subprocess.Popen] = set()
+        self._verify_processes_lock = threading.Lock()
         self._scene_verify_result_applied = False
 
         self._analysis_thread: threading.Thread | None = None
@@ -285,6 +293,9 @@ class PipelineMasterGUI:
         self._inpaint_resume_after_sharpness = False
         self._merge_thread: threading.Thread | None = None
         self._merge_process: subprocess.Popen | None = None
+        self._merge_process_group_id: int | None = None
+        self._merge_stop_marker_path: str = ""
+        self._merge_resume_after_autoct = False
         self._merge_stop_requested = False
         self._merge_stop_clicks = 0
         self._join_thread: threading.Thread | None = None
@@ -297,6 +308,7 @@ class PipelineMasterGUI:
         self._pipeline_step_state = self._default_pipeline_step_state()
         self._pipeline_step_widgets: dict[str, dict[str, tk.Widget]] = {}
         self._pipeline_autorun = False
+        self._pipeline_stop_requested = False
         self._pipeline_pending_action: tuple[str, str, str] | None = None
         self._pipeline_check_files_done = False
         self._pipeline_file_scan: dict[str, object] = {}
@@ -2838,6 +2850,7 @@ class PipelineMasterGUI:
         self._send_inpaint_signal(signal.SIGINT)
         if self._inpaint_stop_clicks >= 2:
             self.root.after(1000, self._force_kill_inpaint)
+        self._refresh_pipeline_run_button()
 
     def _send_inpaint_signal(self, sig: int) -> None:
         proc = self._inpaint_process
@@ -2882,6 +2895,7 @@ class PipelineMasterGUI:
             self._inpaint_stop_clicks = 0
             self._inpaint_stop_requested = False
         self._update_replace_mask_dependent_controls()
+        self._refresh_pipeline_run_button()
 
     def _try_parse_inpaint_progress(self, line: str) -> None:
         m = re.search(r"^\[(\d+)\s*/\s*(\d+)\]", line)
@@ -3141,25 +3155,33 @@ class PipelineMasterGUI:
         bad_files: list[str] = []
         seen_bad: set[str] = set()
         try:
-            proc = subprocess.Popen(
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
+            proc = self._verify_popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
                 universal_newlines=True,
-                preexec_fn=(os.setsid if hasattr(os, "setsid") else None),
             )
             assert proc.stdout is not None
-            for raw in proc.stdout:
-                line = raw.rstrip("\n")
-                if line:
-                    self._log_queue.put(("inpaint_line", f"[DEEP] {line}"))
-                    bad_path = self._resolve_verifyscenes_bad_path(line, out_dir)
-                    if bad_path and bad_path not in seen_bad:
-                        seen_bad.add(bad_path)
-                        bad_files.append(bad_path)
-            rc = proc.wait()
+            try:
+                for raw in proc.stdout:
+                    if self._verify_stop_requested:
+                        raise VerifyStopRequested()
+                    line = raw.rstrip("\n")
+                    if line:
+                        self._log_queue.put(("inpaint_line", f"[DEEP] {line}"))
+                        bad_path = self._resolve_verifyscenes_bad_path(line, out_dir)
+                        if bad_path and bad_path not in seen_bad:
+                            seen_bad.add(bad_path)
+                            bad_files.append(bad_path)
+                rc = proc.wait()
+            finally:
+                self._unregister_verify_process(proc)
+        except VerifyStopRequested:
+            rc = 1
         except Exception as e:
             self._log_queue.put(("inpaint_line", f"[DEEP][ERROR] {type(e).__name__}: {e}"))
             rc = 1
@@ -3167,7 +3189,12 @@ class PipelineMasterGUI:
             self._log_queue.put(
                 (
                     "inpaint_verify_deep_result",
-                    {"rc": rc, "out_dir": out_dir, "bad_files": bad_files},
+                    {
+                        "rc": rc,
+                        "stopped": bool(self._verify_stop_requested),
+                        "out_dir": out_dir,
+                        "bad_files": bad_files,
+                    },
                 )
             )
             self._log_queue.put(("verify_done", "inpaint_deep"))
@@ -3865,6 +3892,8 @@ class PipelineMasterGUI:
         self._append_merge_log(
             "ENV: " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
         )
+        self._merge_process_group_id = None
+        self._merge_stop_marker_path = ""
         self._merge_thread = threading.Thread(
             target=self._run_merge_mask_worker,
             args=(cmd, env_updates),
@@ -3890,6 +3919,7 @@ class PipelineMasterGUI:
                 preexec_fn=preexec,
             )
             self._merge_process = proc
+            self._merge_process_group_id = os.getpgid(proc.pid) if hasattr(os, "getpgid") else None
             assert proc.stdout is not None
             for raw_line in proc.stdout:
                 line = raw_line.rstrip("\n")
@@ -4017,7 +4047,7 @@ class PipelineMasterGUI:
                     ),
                 )
                 self.merge_status_var.set("AutoCT CSV missing, rebuilding...")
-                self._start_merge_autoct_csv()
+                self._start_merge_autoct_csv(resume_merge_after=True)
                 return
             try:
                 autoct_ok, autoct_msg, incomplete_scenes = self._verify_autoct_csv_packet_coverage(
@@ -4058,7 +4088,7 @@ class PipelineMasterGUI:
                     ),
                 )
                 self.merge_status_var.set("AutoCT CSV incomplete, rebuilding...")
-                self._start_merge_autoct_csv()
+                self._start_merge_autoct_csv(resume_merge_after=True)
                 return
             if not self._pipeline_test_active:
                 self._pipeline_set_completed("autoct_csv", True)
@@ -4066,6 +4096,7 @@ class PipelineMasterGUI:
                 self._refresh_pipeline_status_panel()
                 self._save_pipeline_state()
 
+        self._merge_resume_after_autoct = False
         self._merge_stop_requested = False
         self._merge_stop_clicks = 0
         self.merge_status_var.set("Starting...")
@@ -4078,6 +4109,8 @@ class PipelineMasterGUI:
         self._append_merge_log(
             "ENV: " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
         )
+        self._merge_process_group_id = None
+        self._merge_stop_marker_path = env_updates.get("STOP_MARKER", "").strip()
         self._merge_thread = threading.Thread(
             target=self._run_merge_worker,
             args=(cmd, env_updates),
@@ -4103,6 +4136,7 @@ class PipelineMasterGUI:
                 preexec_fn=preexec,
             )
             self._merge_process = proc
+            self._merge_process_group_id = os.getpgid(proc.pid) if hasattr(os, "getpgid") else None
             assert proc.stdout is not None
             for raw_line in proc.stdout:
                 line = raw_line.rstrip("\n")
@@ -4132,7 +4166,9 @@ class PipelineMasterGUI:
                     pass
             self._log_queue.put(("merge_done", {"step": "merging", "success": step_success}))
 
-    def _start_merge_autoct_csv(self) -> None:
+    def _start_merge_autoct_csv(self, resume_merge_after: bool = False) -> None:
+        # Enable auto-resume only when AutoCT CSV is launched as Merging preflight.
+        self._merge_resume_after_autoct = False
         if self._merge_thread and self._merge_thread.is_alive():
             messagebox.showinfo("Merging", "Another merging task is running.")
             return
@@ -4230,6 +4266,9 @@ class PipelineMasterGUI:
             self._pipeline_invalidate_from("autoct_csv")
         self._append_merge_log("=== AutoCT CSV creation started ===")
         self._append_merge_log("CMD: " + " ".join(shlex.quote(x) for x in cmd))
+        self._merge_process_group_id = None
+        self._merge_stop_marker_path = ""
+        self._merge_resume_after_autoct = bool(resume_merge_after)
         self._merge_thread = threading.Thread(
             target=self._run_merge_autoct_worker,
             args=(cmd, str(out_csv_path)),
@@ -4252,6 +4291,7 @@ class PipelineMasterGUI:
                 preexec_fn=preexec,
             )
             self._merge_process = proc
+            self._merge_process_group_id = os.getpgid(proc.pid) if hasattr(os, "getpgid") else None
             assert proc.stdout is not None
             for raw_line in proc.stdout:
                 line = raw_line.rstrip("\n")
@@ -4280,7 +4320,11 @@ class PipelineMasterGUI:
             self._log_queue.put(("merge_done", {"step": "autoct_csv", "success": step_success}))
 
     def _stop_merge_placeholder(self, prompt_user: bool = True) -> None:
-        running = bool(self._merge_thread and self._merge_thread.is_alive())
+        running = bool(
+            (self._merge_thread and self._merge_thread.is_alive())
+            or (self._merge_process and self._merge_process.poll() is None)
+            or self._merge_group_alive()
+        )
         if not running:
             return
         if self._merge_stop_clicks == 0 and prompt_user:
@@ -4299,6 +4343,9 @@ class PipelineMasterGUI:
                 "[STOP] graceful stop requested (click Stop again for immediate force stop)."
             )
             self.merge_stop_btn.configure(text="Force Stop")
+            marker_path = self._ensure_merge_stop_marker()
+            if marker_path:
+                self._append_merge_log(f"[STOP] stop marker created: {marker_path}")
         else:
             self.merge_status_var.set("Force stop requested...")
             self._append_merge_log("[STOP] force stop requested.")
@@ -4306,34 +4353,72 @@ class PipelineMasterGUI:
         self._send_merge_signal(signal.SIGINT)
         if self._merge_stop_clicks >= 2:
             self.root.after(1000, self._force_kill_merge)
+        self._refresh_pipeline_run_button()
+
+    def _merge_group_alive(self) -> bool:
+        pgid = self._merge_process_group_id
+        if not pgid or not hasattr(os, "killpg"):
+            return False
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+        return True
+
+    def _ensure_merge_stop_marker(self) -> str:
+        marker_path = str(self._merge_stop_marker_path or "").strip()
+        if not marker_path:
+            output_dir = self.merge_output_var.get().strip() or "./work/sbs"
+            marker_path = os.path.join(output_dir, ".stop_after_current")
+            self._merge_stop_marker_path = marker_path
+        try:
+            os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+            Path(marker_path).touch()
+        except Exception as exc:
+            self._append_merge_log(f"[STOP] failed to create stop marker {marker_path}: {exc}")
+            return ""
+        return marker_path
 
     def _send_merge_signal(self, sig: int) -> None:
         proc = self._merge_process
-        if proc is None or proc.poll() is not None:
-            return
+        sent = False
         try:
-            if hasattr(os, "killpg"):
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, sig)
-            else:
-                proc.send_signal(sig)
+            if proc is not None and proc.poll() is None:
+                if hasattr(os, "killpg"):
+                    pgid = os.getpgid(proc.pid)
+                    self._merge_process_group_id = pgid
+                    os.killpg(pgid, sig)
+                else:
+                    proc.send_signal(sig)
+                sent = True
+            elif self._merge_group_alive():
+                os.killpg(self._merge_process_group_id, sig)
+                sent = True
         except Exception as exc:
             self._append_merge_log(f"Signal send failed: {exc}")
+        if not sent:
+            self._append_merge_log("[STOP] no active merge parent process found; relying on stop marker.")
 
     def _force_kill_merge(self) -> None:
         proc = self._merge_process
-        if proc is None:
-            return
-        if proc.poll() is None:
-            try:
+        try:
+            if proc is not None and proc.poll() is None:
                 if hasattr(os, "killpg"):
                     pgid = os.getpgid(proc.pid)
+                    self._merge_process_group_id = pgid
                     os.killpg(pgid, signal.SIGKILL)
                 else:
                     proc.kill()
                 self._append_merge_log("Merging process force-killed.")
-            except Exception as exc:
-                self._append_merge_log(f"Merging kill failed: {exc}")
+            elif self._merge_group_alive():
+                os.killpg(self._merge_process_group_id, signal.SIGKILL)
+                self._append_merge_log("Merging worker process group force-killed.")
+        except Exception as exc:
+            self._append_merge_log(f"Merging kill failed: {exc}")
 
     def _set_merge_running(self, is_running: bool) -> None:
         self.merge_preview_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
@@ -4353,6 +4438,81 @@ class PipelineMasterGUI:
             self._merge_stop_clicks = 0
             self._merge_stop_requested = False
         self._update_replace_mask_dependent_controls()
+        self._refresh_pipeline_run_button()
+
+    def _handle_merge_done_event(self, payload: object) -> None:
+        # AutoCT, mask-for-merge, and merge reuse the same thread slot.
+        # Wait until the worker thread is actually dead before autorun starts the next step.
+        if self._merge_thread and self._merge_thread.is_alive():
+            self.root.after(50, lambda payload=payload: self._handle_merge_done_event(payload))
+            return
+        if self._merge_group_alive():
+            self.root.after(100, lambda payload=payload: self._handle_merge_done_event(payload))
+            return
+
+        self._merge_thread = None
+        self._merge_process = None
+        self._merge_process_group_id = None
+        self._merge_stop_marker_path = ""
+        stop_requested = bool(self._merge_stop_requested)
+        step_name = ""
+        success = False
+        pending_before = self._pipeline_pending_action
+        pending_merge_run = (
+            isinstance(pending_before, tuple)
+            and len(pending_before) >= 2
+            and str(pending_before[0]).strip().lower() == "merging"
+            and str(pending_before[1]).strip().lower() == "run"
+        )
+        should_resume_merge = False
+        if isinstance(payload, dict):
+            step_name = str(payload.get("step", "")).strip().lower()
+            success = bool(payload.get("success", False))
+            if (
+                step_name == "autoct_csv"
+                and bool(self._merge_resume_after_autoct)
+                and success
+                and not stop_requested
+            ):
+                should_resume_merge = True
+        self._set_merge_running(False)
+        if step_name in {"autoct_csv", "mask_for_merge", "merging"}:
+            self._pipeline_on_run_finished(step_name, success)
+        else:
+            status_txt = self.merge_status_var.get().strip().lower()
+            if "autoct csv created" in status_txt:
+                self._pipeline_on_run_finished("autoct_csv", True)
+                step_name = "autoct_csv"
+            elif "mask-for-merge completed" in status_txt:
+                self._pipeline_on_run_finished("mask_for_merge", True)
+                step_name = "mask_for_merge"
+            elif "completed" in status_txt:
+                self._pipeline_on_run_finished("merging", True)
+                step_name = "merging"
+            else:
+                pending = self._pipeline_pending_action
+                if pending and pending[1] == "run" and pending[0] in {"autoct_csv", "mask_for_merge", "merging"}:
+                    self._pipeline_on_run_finished(pending[0], False)
+                    step_name = pending[0]
+        if step_name == "autoct_csv" and bool(self._merge_resume_after_autoct):
+            self._merge_resume_after_autoct = False
+            if should_resume_merge:
+                self._append_merge_log(
+                    "[AUTOCT] CSV rebuilt. Resuming Merging automatically..."
+                )
+                self.root.after(10, self._run_merge_placeholder)
+            elif pending_merge_run and not success:
+                # AutoCT preflight failed while Merging run was pending.
+                self._pipeline_on_run_finished("merging", False)
+        if stop_requested:
+            label_map = {
+                "autoct_csv": "AutoCT CSV",
+                "mask_for_merge": "Mask-for-merge",
+                "merging": "Merging",
+            }
+            stop_label = label_map.get(step_name, "Merging")
+            self._append_merge_log(f"[STOP] {stop_label} stopped.")
+            self._finalize_pipeline_stop(stop_label)
 
     def _try_parse_merge_progress(self, line: str) -> None:
         m = re.search(r"^\[(?:RUN|OK|SKIP|ERR)\s*\]\s*(\d+)\s*/\s*(\d+)", line)
@@ -4604,25 +4764,33 @@ class PipelineMasterGUI:
         bad_files: list[str] = []
         seen_bad: set[str] = set()
         try:
-            proc = subprocess.Popen(
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
+            proc = self._verify_popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
                 universal_newlines=True,
-                preexec_fn=(os.setsid if hasattr(os, "setsid") else None),
             )
             assert proc.stdout is not None
-            for raw in proc.stdout:
-                line = raw.rstrip("\n")
-                if line:
-                    self._log_queue.put(("merge_line", f"[MASK-DEEP] {line}"))
-                    bad_path = self._resolve_verifyscenes_bad_path(line, mask_dir)
-                    if bad_path and bad_path not in seen_bad:
-                        seen_bad.add(bad_path)
-                        bad_files.append(bad_path)
-            rc = proc.wait()
+            try:
+                for raw in proc.stdout:
+                    if self._verify_stop_requested:
+                        raise VerifyStopRequested()
+                    line = raw.rstrip("\n")
+                    if line:
+                        self._log_queue.put(("merge_line", f"[MASK-DEEP] {line}"))
+                        bad_path = self._resolve_verifyscenes_bad_path(line, mask_dir)
+                        if bad_path and bad_path not in seen_bad:
+                            seen_bad.add(bad_path)
+                            bad_files.append(bad_path)
+                rc = proc.wait()
+            finally:
+                self._unregister_verify_process(proc)
+        except VerifyStopRequested:
+            rc = 1
         except Exception as e:
             self._log_queue.put(("merge_line", f"[MASK-DEEP][ERROR] {type(e).__name__}: {e}"))
             rc = 1
@@ -4630,7 +4798,12 @@ class PipelineMasterGUI:
             self._log_queue.put(
                 (
                     "merge_mask_verify_deep_result",
-                    {"rc": rc, "mask_dir": mask_dir, "bad_files": bad_files},
+                    {
+                        "rc": rc,
+                        "stopped": bool(self._verify_stop_requested),
+                        "mask_dir": mask_dir,
+                        "bad_files": bad_files,
+                    },
                 )
             )
             self._log_queue.put(("verify_done", "merge_mask_deep"))
@@ -4653,6 +4826,56 @@ class PipelineMasterGUI:
         )
         self._append_merge_log(f"[VERIFY-MERGE] reference source: {ref_kind} ({ref_dir})")
         return True, merged_dir, ref_dir, ref_patterns
+
+    def _collect_merge_verify_seg_mono_stems(self) -> set[str]:
+        stems: set[str] = set()
+        candidate_dirs = [
+            self.join_seg_mono_var.get().strip(),
+            os.path.join(self.work_folder_var.get().strip(), "seg-mono"),
+        ]
+        seen_dirs: set[str] = set()
+        for raw_dir in candidate_dirs:
+            dir_txt = str(raw_dir or "").strip()
+            if not dir_txt:
+                continue
+            try:
+                resolved = str(Path(dir_txt).resolve())
+            except Exception:
+                resolved = dir_txt
+            if not resolved or resolved in seen_dirs or not os.path.isdir(resolved):
+                continue
+            seen_dirs.add(resolved)
+            root = Path(resolved)
+            for pat in ("*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"):
+                for path in root.glob(pat):
+                    if path.is_file():
+                        stems.add(self._quick_verify_normalize_stem(path.stem))
+        return stems
+
+    def _collect_merge_verify_outputs(
+        self, merged_dir: str, ref_files: list[str]
+    ) -> tuple[list[str], list[str], list[str]]:
+        all_outputs = sorted([str(p) for p in Path(merged_dir).glob("*.mp4") if p.is_file()])
+        if not ref_files:
+            return all_outputs, [], []
+        exact_idx, norm_idx = self._quick_verify_build_name_indexes(ref_files)
+        seg_mono_stems = self._collect_merge_verify_seg_mono_stems()
+        matched_outputs: list[str] = []
+        ignored_seg_mono: list[str] = []
+        unmatched_outputs: list[str] = []
+        for out_path in all_outputs:
+            ref_path, _match_info = self._quick_verify_match_reference_path(
+                out_path, exact_idx, norm_idx
+            )
+            if ref_path:
+                matched_outputs.append(out_path)
+                continue
+            norm_key = self._quick_verify_normalize_stem(Path(out_path).stem)
+            if norm_key in seg_mono_stems:
+                ignored_seg_mono.append(out_path)
+            else:
+                unmatched_outputs.append(out_path)
+        return matched_outputs, ignored_seg_mono, unmatched_outputs
 
     def _start_merge_verify_quick(self) -> None:
         if self._merge_thread and self._merge_thread.is_alive():
@@ -4682,12 +4905,14 @@ class PipelineMasterGUI:
         self, merged_dir: str, ref_dir: str, ref_patterns: list[str]
     ) -> None:
         try:
-            out_files = sorted([str(p) for p in Path(merged_dir).glob("*.mp4") if p.is_file()])
             ref_files = self._collect_files_for_patterns(ref_dir, ref_patterns)
-            if not out_files:
+            matched_outputs, ignored_seg_mono, unmatched_output = self._collect_merge_verify_outputs(
+                merged_dir, ref_files
+            )
+            if not matched_outputs:
                 self._log_queue.put(("merge_verify_quick_result", {
                     "ok": False,
-                    "message": "No .mp4 files found in merging output folder.",
+                    "message": "No merge output files matched the selected reference set.",
                     "broken_output": [],
                     "broken_reference": [],
                 }))
@@ -4703,10 +4928,17 @@ class PipelineMasterGUI:
 
             max_workers = self._get_verify_scenes_workers()
             self._log_queue.put(
-                ("merge_line", f"[QUICK] checking merged files={len(out_files)} and reference files={len(ref_files)} with {max_workers} workers")
+                (
+                    "merge_line",
+                    (
+                        f"[QUICK] checking merged files={len(matched_outputs)} "
+                        f"(ignored seg-mono SBS={len(ignored_seg_mono)}, extra-unmatched={len(unmatched_output)}) "
+                        f"and reference files={len(ref_files)} with {max_workers} workers"
+                    ),
+                )
             )
             out_stats = self._quick_verify_probe_group(
-                out_files,
+                matched_outputs,
                 max_workers,
                 "merge_line",
                 "merged",
@@ -4721,14 +4953,13 @@ class PipelineMasterGUI:
             )
 
             pair_stats = self._quick_verify_collect_packet_mismatch_targets(
-                out_files,
+                matched_outputs,
                 ref_files,
                 out_stats.get("meta_by_path", {}),
                 ref_stats.get("meta_by_path", {}),
                 frame_tol=1,
             )
             packet_mismatch_output = pair_stats.get("mismatch_targets") or []
-            unmatched_output = pair_stats.get("unmatched_targets") or []
             missing_reference = pair_stats.get("missing_reference") or []
             broken_output = sorted(set((out_stats.get("broken") or []) + packet_mismatch_output))
 
@@ -4746,8 +4977,16 @@ class PipelineMasterGUI:
                 )
             )
 
-            count_ok = len(out_files) == len(ref_files)
-            count_msg = f"merged={len(out_files)} vs reference={len(ref_files)}"
+            if ignored_seg_mono:
+                self._log_queue.put(
+                    (
+                        "merge_line",
+                        f"[QUICK] ignored {len(ignored_seg_mono)} Mono->SBS file(s) from seg-mono during merge verify",
+                    )
+                )
+
+            count_ok = len(matched_outputs) == len(ref_files)
+            count_msg = f"merged={len(matched_outputs)} vs reference={len(ref_files)}"
 
             duration_ok = False
             duration_msg = "n.d."
@@ -4785,6 +5024,7 @@ class PipelineMasterGUI:
                 f"Merging quick verify completed.\n"
                 f"Broken output files: {len(out_stats['broken'])}\n"
                 f"Packet mismatch output files: {len(packet_mismatch_output)}\n"
+                f"Ignored seg-mono SBS files: {len(ignored_seg_mono)}\n"
                 f"Unmatched output files: {len(unmatched_output)}\n"
                 f"Missing reference files: {len(missing_reference)}\n"
                 f"Broken reference files: {len(ref_stats['broken'])}\n"
@@ -4822,7 +5062,7 @@ class PipelineMasterGUI:
         if self._verify_running:
             messagebox.showinfo("Verify Merging", "Another verification is already running.")
             return
-        ok, merged_dir, ref_dir, _ref_patterns = self._validate_merge_verify_inputs()
+        ok, merged_dir, ref_dir, ref_patterns = self._validate_merge_verify_inputs()
         if not ok:
             return
 
@@ -4853,38 +5093,138 @@ class PipelineMasterGUI:
         self._set_verify_running(True, mode="merge_deep")
         self.merge_status_var.set("Verify Merge (Deep) running...")
         self._append_merge_log("=== Verify Merge (Deep) started ===")
-        self._append_merge_log("CMD: " + " ".join(shlex.quote(x) for x in cmd))
+        self._append_merge_log(
+            "CMD: merge deep verify will stage only merge-matched outputs into a temp subset, "
+            "ignore Mono->SBS files coming from seg-mono, and run verifyscenes with manual cleanup on real outputs."
+        )
 
         self._verify_thread = threading.Thread(
             target=self._run_merge_verify_deep_worker,
-            args=(cmd, str(Path(merged_dir).resolve())),
+            args=(
+                str(script_path),
+                str(Path(merged_dir).resolve()),
+                str(Path(ref_dir).resolve()),
+                list(ref_patterns),
+                workers,
+            ),
             daemon=True,
         )
         self._verify_thread.start()
 
-    def _run_merge_verify_deep_worker(self, cmd: list[str], merged_dir: str) -> None:
+    def _run_merge_verify_deep_worker(
+        self,
+        script_path: str,
+        merged_dir: str,
+        ref_dir: str,
+        ref_patterns: list[str],
+        workers: int,
+    ) -> None:
         rc = 1
         bad_files: list[str] = []
         seen_bad: set[str] = set()
+        ignored_seg_mono: list[str] = []
+        unmatched_output: list[str] = []
+        deleted = 0
+        cleanup_errors: list[str] = []
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
-            assert proc.stdout is not None
-            for raw in proc.stdout:
-                line = raw.rstrip("\n")
-                if line:
-                    self._log_queue.put(("merge_line", f"[DEEP] {line}"))
-                    bad_path = self._resolve_verifyscenes_bad_path(line, merged_dir)
-                    if bad_path and bad_path not in seen_bad:
-                        seen_bad.add(bad_path)
-                        bad_files.append(bad_path)
-            rc = proc.wait()
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
+            ref_files = self._collect_files_for_patterns(ref_dir, ref_patterns)
+            if not ref_files:
+                self._log_queue.put(("merge_line", "[DEEP][ERROR] no reference files found"))
+                rc = 1
+            else:
+                matched_outputs, ignored_seg_mono, unmatched_output = (
+                    self._collect_merge_verify_outputs(merged_dir, ref_files)
+                )
+                if ignored_seg_mono:
+                    self._log_queue.put(
+                        (
+                            "merge_line",
+                            (
+                                f"[DEEP][IGNORE] excluded {len(ignored_seg_mono)} Mono->SBS "
+                                "file(s) from seg-mono during merge verify"
+                            ),
+                        )
+                    )
+                for extra_path in unmatched_output[:20]:
+                    self._log_queue.put(
+                        (
+                            "merge_line",
+                            f"[DEEP][UNMATCHED] unexpected merged output not in reference set: {Path(extra_path).name}",
+                        )
+                    )
+                if not matched_outputs:
+                    self._log_queue.put(
+                        ("merge_line", "[DEEP][ERROR] no merge output files matched the reference set")
+                    )
+                    rc = 1
+                else:
+                    with tempfile.TemporaryDirectory(prefix="verify_merge_") as tmpdir:
+                        tmp_root = Path(tmpdir)
+                        target_dir = tmp_root / "targets"
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        link_map: dict[str, str] = {}
+                        for out_path in matched_outputs:
+                            src = Path(out_path)
+                            tmp_target = target_dir / src.name
+                            if self._pipeline_link_or_copy_file(src, tmp_target):
+                                link_map[str(tmp_target.resolve())] = str(src)
+                        cmd = [
+                            sys.executable,
+                            script_path,
+                            str(target_dir),
+                            str(Path(ref_dir).resolve()),
+                            "--extensions",
+                            self.VERIFY_ALL_VIDEO_EXTENSIONS,
+                            "--workers",
+                            str(max(1, int(workers))),
+                            "--probe-timeout-sec",
+                            str(self.VERIFY_DEEP_FFPROBE_TIMEOUT_SEC),
+                            "--probe-timeout-retries",
+                            str(self.VERIFY_DEEP_FFPROBE_TIMEOUT_RETRIES),
+                            "--delete",
+                            "no",
+                            "--no-single-line-progress",
+                        ]
+                        self._log_queue.put(
+                            (
+                                "merge_line",
+                                "[DEEP] cmd: " + " ".join(shlex.quote(x) for x in cmd),
+                            )
+                        )
+                        proc = self._verify_popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
+                            universal_newlines=True,
+                        )
+                        assert proc.stdout is not None
+                        try:
+                            for raw in proc.stdout:
+                                if self._verify_stop_requested:
+                                    raise VerifyStopRequested()
+                                line = raw.rstrip("\n")
+                                if line:
+                                    self._log_queue.put(("merge_line", f"[DEEP] {line}"))
+                                    bad_path = self._resolve_verifyscenes_bad_path(line, str(target_dir))
+                                    if bad_path:
+                                        real_bad = link_map.get(bad_path, "")
+                                        if real_bad and real_bad not in seen_bad:
+                                            seen_bad.add(real_bad)
+                                            bad_files.append(real_bad)
+                            rc = int(proc.wait() or 0)
+                        finally:
+                            self._unregister_verify_process(proc)
+
+                    if bad_files:
+                        deleted, cleanup_errors = self._delete_file_paths(bad_files)
+                    if unmatched_output:
+                        rc = rc or 1
+        except VerifyStopRequested:
+            rc = 1
         except Exception as e:
             self._log_queue.put(("merge_line", f"[DEEP][ERROR] {type(e).__name__}: {e}"))
             rc = 1
@@ -4892,7 +5232,16 @@ class PipelineMasterGUI:
             self._log_queue.put(
                 (
                     "merge_verify_deep_result",
-                    {"rc": rc, "merged_dir": merged_dir, "bad_files": bad_files},
+                    {
+                        "rc": rc,
+                        "stopped": bool(self._verify_stop_requested),
+                        "merged_dir": merged_dir,
+                        "bad_files": bad_files,
+                        "deleted": deleted,
+                        "cleanup_errors": cleanup_errors,
+                        "ignored_seg_mono": ignored_seg_mono,
+                        "unmatched_output": unmatched_output,
+                    },
                 )
             )
             self._log_queue.put(("verify_done", "merge_deep"))
@@ -5638,6 +5987,7 @@ class PipelineMasterGUI:
         self._append_join_log("[STOP] immediate force stop requested.")
         self._force_kill_join()
         self._cleanup_join_output_after_stop()
+        self._refresh_pipeline_run_button()
 
     def _send_join_signal(self, sig: int) -> None:
         proc = self._join_process
@@ -5694,6 +6044,7 @@ class PipelineMasterGUI:
         else:
             self.join_stop_btn.configure(text="Stop")
             self._join_stop_requested = False
+        self._refresh_pipeline_run_button()
 
     def _try_parse_join_progress(self, line: str) -> None:
         t = self._parse_ffmpeg_time_seconds(line)
@@ -5788,6 +6139,20 @@ class PipelineMasterGUI:
                     },
                 )
             )
+        except VerifyStopRequested:
+            self._log_queue.put(
+                (
+                    "join_mono_verify_result",
+                    {
+                        "ok": False,
+                        "stopped": True,
+                        "message": "Mono->SBS quick verify stopped.",
+                        "mode": "quick",
+                        "broken_output": [],
+                        "broken_reference": [],
+                    },
+                )
+            )
         except Exception as e:
             self._log_queue.put(
                 (
@@ -5860,7 +6225,7 @@ class PipelineMasterGUI:
                             "[MONO][DEEP] cmd: " + " ".join(shlex.quote(x) for x in cmd),
                         )
                     )
-                    proc = subprocess.Popen(
+                    proc = self._verify_popen(
                         cmd,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
@@ -5869,22 +6234,30 @@ class PipelineMasterGUI:
                         universal_newlines=True,
                     )
                     assert proc.stdout is not None
-                    for raw in proc.stdout:
-                        line = raw.rstrip("\n")
-                        if line:
-                            self._log_queue.put(("join_line", f"[MONO][DEEP] {line}"))
-                            bad_path = self._resolve_verifyscenes_bad_path(line, str(target_dir))
-                            if bad_path:
-                                real_bad = link_map.get(bad_path)
-                                if real_bad and real_bad not in bad_targets:
-                                    bad_targets.append(real_bad)
-                    rc = int(proc.wait() or 0)
+                    try:
+                        for raw in proc.stdout:
+                            if self._verify_stop_requested:
+                                raise VerifyStopRequested()
+                            line = raw.rstrip("\n")
+                            if line:
+                                self._log_queue.put(("join_line", f"[MONO][DEEP] {line}"))
+                                bad_path = self._resolve_verifyscenes_bad_path(line, str(target_dir))
+                                if bad_path:
+                                    real_bad = link_map.get(bad_path)
+                                    if real_bad and real_bad not in bad_targets:
+                                        bad_targets.append(real_bad)
+                        rc = int(proc.wait() or 0)
+                    finally:
+                        self._unregister_verify_process(proc)
                     overall_ok = rc == 0
                     message = (
                         "Mono->SBS deep verify completed successfully."
                         if overall_ok
                         else "Mono->SBS deep verify failed."
                     )
+        except VerifyStopRequested:
+            overall_ok = False
+            message = "Mono->SBS deep verify stopped."
         except Exception as e:
             overall_ok = False
             message = f"Mono->SBS deep verify failed: {type(e).__name__}: {e}"
@@ -5894,6 +6267,7 @@ class PipelineMasterGUI:
                     "join_mono_verify_result",
                     {
                         "ok": overall_ok,
+                        "stopped": bool(self._verify_stop_requested),
                         "message": message,
                         "mode": "deep",
                         "broken_output": bad_targets,
@@ -5946,8 +6320,14 @@ class PipelineMasterGUI:
 
     def _run_join_verify_worker(self, source_path: str, joined_path: str) -> None:
         try:
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
             src = self._probe_video_basic(source_path)
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
             out = self._probe_video_basic(joined_path)
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
             if not src.get("ok"):
                 self._log_queue.put(
                     (
@@ -5999,6 +6379,13 @@ class PipelineMasterGUI:
                 f"Packet details: {frames_msg}"
             )
             self._log_queue.put(("join_verify_result", {"ok": ok_final, "message": msg}))
+        except VerifyStopRequested:
+            self._log_queue.put(
+                (
+                    "join_verify_result",
+                    {"ok": False, "stopped": True, "message": "Join verify stopped."},
+                )
+            )
         except Exception as e:
             self._log_queue.put(
                 (
@@ -6941,6 +7328,7 @@ class PipelineMasterGUI:
             return
 
         self._pipeline_autorun = False
+        self._pipeline_stop_requested = False
         self._pipeline_pending_action = None
         self._pipeline_pause_after_split_scenes = False
         self._pipeline_step_state = self._default_pipeline_step_state()
@@ -7286,6 +7674,27 @@ class PipelineMasterGUI:
                         scene_num = int(float(scene_raw)) if scene_raw else idx
                     except Exception:
                         scene_num = idx
+                    start_frame_raw = norm.get("start frame") or ""
+                    end_frame_raw = norm.get("end frame") or ""
+                    length_frames_raw = (
+                        norm.get("length (frames)")
+                        or norm.get("length frames")
+                        or ""
+                    )
+                    start_frame = self._parse_scene_intish(start_frame_raw)
+                    end_frame = self._parse_scene_intish(end_frame_raw)
+                    frame_count = self._parse_scene_intish(length_frames_raw)
+                    if start_frame is not None and start_frame <= 0:
+                        start_frame = None
+                    if frame_count is not None and frame_count <= 0:
+                        frame_count = None
+                    if (
+                        start_frame is not None
+                        and frame_count is None
+                        and end_frame is not None
+                        and end_frame >= start_frame
+                    ):
+                        frame_count = (end_frame - start_frame) + 1
                     start_raw = (
                         norm.get("start time (seconds)")
                         or norm.get("start seconds")
@@ -7307,6 +7716,9 @@ class PipelineMasterGUI:
                     rows.append(
                         {
                             "scene_number": int(scene_num),
+                            "start_frame": int(start_frame) if start_frame is not None else 0,
+                            "end_frame": int(end_frame) if end_frame is not None else 0,
+                            "frame_count": int(frame_count) if frame_count is not None else 0,
                             "start_sec": float(start_sec),
                             "end_sec": float(end_sec),
                         }
@@ -7316,6 +7728,41 @@ class PipelineMasterGUI:
         if not rows:
             return [], f"No valid scene rows found in CSV: {csv_path}"
         return rows, ""
+
+    @staticmethod
+    def _parse_scene_intish(value) -> int | None:
+        try:
+            txt = str(value or "").strip()
+        except Exception:
+            txt = ""
+        if not txt:
+            return None
+        try:
+            return int(txt)
+        except Exception:
+            pass
+        try:
+            return int(float(txt))
+        except Exception:
+            return None
+
+    def _scene_csv_expected_by_name(
+        self,
+        source_path: str,
+        scene_csv_path: str | None = None,
+    ) -> tuple[dict[str, dict[str, int]], str]:
+        entries, err = self._load_scene_csv_entries(scene_csv_path)
+        if err:
+            return {}, err
+        out: dict[str, dict[str, int]] = {}
+        for idx, entry in enumerate(entries, start=1):
+            scene_num = int(entry.get("scene_number", idx))
+            out_name = self._scene_output_filename(source_path, scene_num)
+            out[out_name] = {
+                "scene_number": scene_num,
+                "frame_count": int(entry.get("frame_count", 0) or 0),
+            }
+        return out, ""
 
     def _collect_expected_split_scene_outputs(
         self,
@@ -7361,13 +7808,24 @@ class PipelineMasterGUI:
             count += len([p for p in root.glob(ext) if p.is_file()])
         return count
 
+    @staticmethod
+    def _scene_csv_exists(scene_csv_path: str) -> bool:
+        csv_path = str(scene_csv_path or "").strip()
+        if not csv_path:
+            return False
+        try:
+            return Path(csv_path).is_file() and Path(csv_path).stat().st_size > 0
+        except Exception:
+            return False
+
     def _pipeline_check_files(self, show_popup: bool = True) -> bool:
         seg_dir = self.scene_output_var.get().strip()
         out_dir = self.merge_output_var.get().strip()
         seg_files = sorted([p for p in Path(seg_dir).glob("*.mp4") if p.is_file()]) if os.path.isdir(seg_dir) else []
         scene_csv_path = self._scene_csv_path()
+        scene_csv_present = self._scene_csv_exists(scene_csv_path)
         scene_entries, scene_csv_err = self._load_scene_csv_entries(scene_csv_path)
-        scene_csv_ok = bool(scene_entries) and not scene_csv_err
+        split_csv_ok = bool(scene_entries) and not scene_csv_err
 
         expected_outputs, missing_split_outputs, split_cov_err = self._collect_expected_split_scene_outputs(
             seg_dir
@@ -7375,7 +7833,7 @@ class PipelineMasterGUI:
         split_expected_count = len(expected_outputs)
         split_missing_count = len(missing_split_outputs)
 
-        if (not seg_files) and (not scene_csv_ok):
+        if (not seg_files) and (not scene_csv_present):
             self.pipeline_checked_files_var.set("Check Files: missing scene CSV and split files")
             if show_popup:
                 messagebox.showwarning(
@@ -7414,10 +7872,10 @@ class PipelineMasterGUI:
         remux_done = Path(self._default_remux_output_path()).is_file()
         sharp_done = Path(self.inpaint_sharpness_csv_var.get().strip()).is_file()
         autoct_done = Path(self.merge_autoct_csv_var.get().strip()).is_file()
-        split_ok = bool(scene_csv_ok and split_expected_count > 0 and split_missing_count == 0 and not split_cov_err)
+        split_ok = bool(split_csv_ok and split_expected_count > 0 and split_missing_count == 0 and not split_cov_err)
         split_ref_count = split_expected_count if split_expected_count > 0 else seg_count
 
-        self._pipeline_set_completed("scenedetect", bool(scene_csv_ok))
+        self._pipeline_set_completed("scenedetect", bool(scene_csv_present))
         self._pipeline_set_completed("split_scenes", split_ok)
         self._pipeline_set_completed(
             "depthcrafter", split_ok and split_ref_count > 0 and depth_count >= split_ref_count
@@ -7453,7 +7911,7 @@ class PipelineMasterGUI:
         self._pipeline_check_files_done = True
         self.pipeline_checked_files_var.set(
             (
-                f"Check Files: csv={'ok' if scene_csv_ok else 'missing'}, "
+                f"Check Files: csv={'present' if scene_csv_present else 'missing'}, "
                 f"split={seg_count}/{split_ref_count}, "
                 f"final done={len(completed)}, incomplete={len(incomplete)}"
             )
@@ -7463,15 +7921,19 @@ class PipelineMasterGUI:
 
         if show_popup:
             csv_details = ""
-            if scene_csv_err:
-                csv_details = f"\nScene CSV details: {scene_csv_err}"
+            if scene_csv_present and scene_csv_err:
+                csv_details = (
+                    "\nSplit reference details "
+                    "(SceneDetect CSV present, but unusable for split verification): "
+                    f"{scene_csv_err}"
+                )
             elif split_cov_err:
                 csv_details = f"\nSplit CSV details: {split_cov_err}"
             messagebox.showinfo(
                 "Check Files",
                 (
                     f"Scan completed.\n\n"
-                    f"Scene CSV: {'OK' if scene_csv_ok else 'MISSING'}\n"
+                    f"Scene CSV: {'PRESENT' if scene_csv_present else 'MISSING'}\n"
                     f"Split files: {seg_count}/{split_ref_count}\n"
                     f"Missing split files: {split_missing_count}\n"
                     f"Final completed: {len(completed)}\n"
@@ -7542,6 +8004,7 @@ class PipelineMasterGUI:
         )
         self.pipeline_run_status_var.set("Test run active (isolated subset)")
         self._pipeline_autorun = True
+        self._pipeline_stop_requested = False
         self._pipeline_pending_action = None
         self._pipeline_trigger_next_action()
 
@@ -8243,7 +8706,7 @@ class PipelineMasterGUI:
                 bool(self._depth_thread and self._depth_thread.is_alive()),
                 bool(self._splat_thread and self._splat_thread.is_alive()),
                 bool(self._inpaint_thread and self._inpaint_thread.is_alive()),
-                bool(self._merge_thread and self._merge_thread.is_alive()),
+                bool(self._merge_thread and self._merge_thread.is_alive()) or self._merge_group_alive(),
                 bool(self._join_thread and self._join_thread.is_alive()),
                 bool(self._verify_running),
             ]
@@ -8292,7 +8755,13 @@ class PipelineMasterGUI:
                     return
             self._pipeline_trigger_next_action()
 
-    def _pipeline_on_verify_finished(self, step: str, success: bool, mode: str) -> None:
+    def _pipeline_on_verify_finished(
+        self,
+        step: str,
+        success: bool,
+        mode: str,
+        retry_on_failure: bool = True,
+    ) -> None:
         pending = self._pipeline_pending_action
         state = (
             self._pipeline_test_step_state
@@ -8311,6 +8780,15 @@ class PipelineMasterGUI:
             self._pipeline_pending_action = None
             if not success:
                 if self._pipeline_autorun:
+                    if not retry_on_failure:
+                        self._pipeline_autorun = False
+                        if self._pipeline_test_active:
+                            self._restore_test_scene_subset()
+                        self.pipeline_run_status_var.set(
+                            f"Pipeline stopped: verify failed ({step}), manual fix required."
+                        )
+                        self._pipeline_sync_noninteractive_mode()
+                        return
                     self.pipeline_run_status_var.set(
                         f"Verify failed on {step}: re-running previous step output."
                     )
@@ -9166,6 +9644,7 @@ class PipelineMasterGUI:
         self._send_depth_signal(signal.SIGINT)
         if self._depth_stop_clicks >= 2:
             self.root.after(1000, self._force_kill_depth)
+        self._refresh_pipeline_run_button()
 
     def _send_depth_signal(self, sig: int) -> None:
         proc = self._depth_process
@@ -9267,6 +9746,7 @@ class PipelineMasterGUI:
             self.depth_stop_btn.configure(text="Stop")
             self._depth_stop_clicks = 0
             self._depth_stop_requested = False
+        self._refresh_pipeline_run_button()
 
     def _open_splat_input_clips_folder(self) -> None:
         folder = self.splat_input_clips_var.get().strip()
@@ -9777,6 +10257,8 @@ class PipelineMasterGUI:
         seen_reference: set[str] = set()
 
         for pair in pairs:
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
             source_path = Path(pair["source_path"])
             source_meta = dict(pair["source_meta"])
             expected_output = Path(pair["expected_output"])
@@ -9817,6 +10299,8 @@ class PipelineMasterGUI:
                 continue
 
             target_meta = self._probe_video_basic(str(expected_output))
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
             if not bool(target_meta.get("ok", False)):
                 out_s = str(expected_output)
                 if out_s not in seen_output:
@@ -10709,6 +11193,8 @@ class PipelineMasterGUI:
         seen_bad: set[str] = set()
         try:
             for label, target_dir, ref_dir, exts in steps:
+                if self._verify_stop_requested:
+                    raise VerifyStopRequested()
                 cmd = [
                     sys.executable,
                     script_path,
@@ -10732,7 +11218,7 @@ class PipelineMasterGUI:
                 rc = 1
                 proc = None
                 try:
-                    proc = subprocess.Popen(
+                    proc = self._verify_popen(
                         cmd,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
@@ -10741,24 +11227,25 @@ class PipelineMasterGUI:
                         universal_newlines=True,
                     )
                     assert proc.stdout is not None
-                    for raw_line in proc.stdout:
-                        line = raw_line.rstrip("\n")
-                        if line:
-                            self._log_queue.put(("splat_line", f"[DEEP][{label}] {line}"))
-                            bad_path = self._resolve_verifyscenes_bad_path(line, target_dir)
-                            if bad_path and bad_path not in seen_bad:
-                                seen_bad.add(bad_path)
-                                bad_files.append(bad_path)
-                    rc = int(proc.wait() or 0)
+                    try:
+                        for raw_line in proc.stdout:
+                            if self._verify_stop_requested:
+                                raise VerifyStopRequested()
+                            line = raw_line.rstrip("\n")
+                            if line:
+                                self._log_queue.put(("splat_line", f"[DEEP][{label}] {line}"))
+                                bad_path = self._resolve_verifyscenes_bad_path(line, target_dir)
+                                if bad_path and bad_path not in seen_bad:
+                                    seen_bad.add(bad_path)
+                                    bad_files.append(bad_path)
+                        rc = int(proc.wait() or 0)
+                    finally:
+                        self._unregister_verify_process(proc)
+                except VerifyStopRequested:
+                    raise
                 except Exception as e:
                     self._log_queue.put(("splat_line", f"[DEEP][{label}][ERROR] {e}"))
                     rc = 1
-                finally:
-                    if proc and proc.stdout:
-                        try:
-                            proc.stdout.close()
-                        except Exception:
-                            pass
 
                 if rc != 0:
                     overall_rc = rc if overall_rc == 0 else overall_rc
@@ -10766,11 +11253,18 @@ class PipelineMasterGUI:
                     self._log_queue.put(("splat_line", f"[DEEP][{label}] failed with rc={rc}"))
                 else:
                     self._log_queue.put(("splat_line", f"[DEEP][{label}] completed successfully"))
+        except VerifyStopRequested:
+            overall_rc = overall_rc or 1
         finally:
             self._log_queue.put(
                 (
                     "splat_verify_deep_result",
-                    {"rc": overall_rc, "failed_dirs": failed_dirs, "bad_files": bad_files},
+                    {
+                        "rc": overall_rc,
+                        "stopped": bool(self._verify_stop_requested),
+                        "failed_dirs": failed_dirs,
+                        "bad_files": bad_files,
+                    },
                 )
             )
             self._log_queue.put(("verify_done", "splat_deep"))
@@ -10802,6 +11296,7 @@ class PipelineMasterGUI:
         self._send_splat_signal(signal.SIGINT)
         if self._splat_stop_clicks >= 2:
             self.root.after(1000, self._force_kill_splat)
+        self._refresh_pipeline_run_button()
 
     def _send_splat_signal(self, sig: int) -> None:
         proc = self._splat_process
@@ -10845,6 +11340,7 @@ class PipelineMasterGUI:
             self._splat_stop_clicks = 0
             self._splat_stop_requested = False
         self._update_replace_mask_dependent_controls()
+        self._refresh_pipeline_run_button()
 
     def _try_parse_splat_progress(self, line: str) -> None:
         m = re.search(r"^\[(?:RUN|OK|SKIP|ERR)\s*\]\s*(\d+)\s*/\s*(\d+)", line)
@@ -11110,7 +11606,9 @@ class PipelineMasterGUI:
         bad_files: list[str] = []
         seen_bad: set[str] = set()
         try:
-            proc = subprocess.Popen(
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
+            proc = self._verify_popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -11119,15 +11617,22 @@ class PipelineMasterGUI:
                 universal_newlines=True,
             )
             assert proc.stdout is not None
-            for raw in proc.stdout:
-                line = raw.rstrip("\n")
-                if line:
-                    self._log_queue.put(("depth_line", f"[DEEP] {line}"))
-                    bad_path = self._resolve_verifyscenes_bad_path(line, depth_dir)
-                    if bad_path and bad_path not in seen_bad:
-                        seen_bad.add(bad_path)
-                        bad_files.append(bad_path)
-            rc = proc.wait()
+            try:
+                for raw in proc.stdout:
+                    if self._verify_stop_requested:
+                        raise VerifyStopRequested()
+                    line = raw.rstrip("\n")
+                    if line:
+                        self._log_queue.put(("depth_line", f"[DEEP] {line}"))
+                        bad_path = self._resolve_verifyscenes_bad_path(line, depth_dir)
+                        if bad_path and bad_path not in seen_bad:
+                            seen_bad.add(bad_path)
+                            bad_files.append(bad_path)
+                rc = proc.wait()
+            finally:
+                self._unregister_verify_process(proc)
+        except VerifyStopRequested:
+            rc = 1
         except Exception as e:
             self._log_queue.put(("depth_line", f"[DEEP][ERROR] {type(e).__name__}: {e}"))
             rc = 1
@@ -11135,7 +11640,12 @@ class PipelineMasterGUI:
             self._log_queue.put(
                 (
                     "depth_verify_deep_result",
-                    {"rc": rc, "depth_dir": depth_dir, "bad_files": bad_files},
+                    {
+                        "rc": rc,
+                        "stopped": bool(self._verify_stop_requested),
+                        "depth_dir": depth_dir,
+                        "bad_files": bad_files,
+                    },
                 )
             )
             self._log_queue.put(("verify_done", "depth_deep"))
@@ -11376,7 +11886,9 @@ class PipelineMasterGUI:
         bad_files: list[str] = []
         seen_bad: set[str] = set()
         try:
-            proc = subprocess.Popen(
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
+            proc = self._verify_popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -11385,15 +11897,22 @@ class PipelineMasterGUI:
                 universal_newlines=True,
             )
             assert proc.stdout is not None
-            for raw in proc.stdout:
-                line = raw.rstrip("\n")
-                if line:
-                    self._log_queue.put(("depth_line", f"[UPSCALE-DEEP] {line}"))
-                    bad_path = self._resolve_verifyscenes_bad_path(line, upscaled_dir)
-                    if bad_path and bad_path not in seen_bad:
-                        seen_bad.add(bad_path)
-                        bad_files.append(bad_path)
-            rc = proc.wait()
+            try:
+                for raw in proc.stdout:
+                    if self._verify_stop_requested:
+                        raise VerifyStopRequested()
+                    line = raw.rstrip("\n")
+                    if line:
+                        self._log_queue.put(("depth_line", f"[UPSCALE-DEEP] {line}"))
+                        bad_path = self._resolve_verifyscenes_bad_path(line, upscaled_dir)
+                        if bad_path and bad_path not in seen_bad:
+                            seen_bad.add(bad_path)
+                            bad_files.append(bad_path)
+                rc = proc.wait()
+            finally:
+                self._unregister_verify_process(proc)
+        except VerifyStopRequested:
+            rc = 1
         except Exception as e:
             self._log_queue.put(("depth_line", f"[UPSCALE-DEEP][ERROR] {type(e).__name__}: {e}"))
             rc = 1
@@ -11401,7 +11920,12 @@ class PipelineMasterGUI:
             self._log_queue.put(
                 (
                     "depth_upscaled_verify_deep_result",
-                    {"rc": rc, "upscaled_dir": upscaled_dir, "bad_files": bad_files},
+                    {
+                        "rc": rc,
+                        "stopped": bool(self._verify_stop_requested),
+                        "upscaled_dir": upscaled_dir,
+                        "bad_files": bad_files,
+                    },
                 )
             )
             self._log_queue.put(("verify_done", "depth_upscaled_deep"))
@@ -12211,6 +12735,7 @@ class PipelineMasterGUI:
         elif not self._verify_running and not self._analysis_running:
             self.scene_verify_quick_btn.configure(state=tk.NORMAL)
             self.scene_verify_deep_btn.configure(state=tk.NORMAL)
+        self._refresh_pipeline_run_button()
 
     def _set_analysis_running(self, is_running: bool) -> None:
         self._analysis_running = is_running
@@ -12223,10 +12748,325 @@ class PipelineMasterGUI:
         elif (not scene_is_running) and (not self._verify_running):
             self.scene_verify_quick_btn.configure(state=tk.NORMAL)
             self.scene_verify_deep_btn.configure(state=tk.NORMAL)
+        self._refresh_pipeline_run_button()
+
+    def _verify_button_specs(self) -> list[tuple[str, str, object]]:
+        return [
+            ("scene_verify_quick_btn", "Verify Scenes (Quick)", self._start_verify_quick),
+            ("scene_verify_deep_btn", "Verify Scenes (Deep)", self._start_verify_deep),
+            ("depth_verify_quick_btn", "Verify Depth (Quick)", self._start_depth_verify_quick),
+            ("depth_verify_deep_btn", "Verify Depth (Deep)", self._start_depth_verify_deep),
+            (
+                "depth_upscaled_verify_quick_btn",
+                "Verify Upscale (Quick)",
+                self._start_depth_upscaled_verify_quick,
+            ),
+            (
+                "depth_upscaled_verify_deep_btn",
+                "Verify Upscale (Deep)",
+                self._start_depth_upscaled_verify_deep,
+            ),
+            ("splat_verify_quick_btn", "Verify Scenes (Quick)", self._start_splat_verify_quick),
+            ("splat_verify_deep_btn", "Verify Scenes (Deep)", self._start_splat_verify_deep),
+            ("inpaint_verify_quick_btn", "Verify Scenes (Quick)", self._start_inpaint_verify_quick),
+            ("inpaint_verify_deep_btn", "Verify Scenes (Deep)", self._start_inpaint_verify_deep),
+            (
+                "merge_mask_verify_quick_btn",
+                "Verify Mask (Quick)",
+                self._start_merge_mask_verify_quick,
+            ),
+            (
+                "merge_mask_verify_deep_btn",
+                "Verify Mask (Deep)",
+                self._start_merge_mask_verify_deep,
+            ),
+            ("merge_verify_quick_btn", "Verify Merge (Quick)", self._start_merge_verify_quick),
+            ("merge_verify_deep_btn", "Verify Merge (Deep)", self._start_merge_verify_deep),
+            ("join_mono_verify_btn", "Verify Mono->SBS", self._start_join_mono_verify),
+            ("join_verify_btn", "Verify Join", self._start_join_verify),
+        ]
+
+    def _active_verify_button_attr(self) -> str:
+        mode = str(self._verify_mode or "").strip().lower()
+        return {
+            "quick": "scene_verify_quick_btn",
+            "deep": "scene_verify_deep_btn",
+            "depth_quick": "depth_verify_quick_btn",
+            "depth_deep": "depth_verify_deep_btn",
+            "depth_upscaled_quick": "depth_upscaled_verify_quick_btn",
+            "depth_upscaled_deep": "depth_upscaled_verify_deep_btn",
+            "splat_quick": "splat_verify_quick_btn",
+            "splat_deep": "splat_verify_deep_btn",
+            "inpaint_quick": "inpaint_verify_quick_btn",
+            "inpaint_deep": "inpaint_verify_deep_btn",
+            "merge_mask_quick": "merge_mask_verify_quick_btn",
+            "merge_mask_deep": "merge_mask_verify_deep_btn",
+            "merge_quick": "merge_verify_quick_btn",
+            "merge_deep": "merge_verify_deep_btn",
+            "join_mono_quick": "join_mono_verify_btn",
+            "join_mono_deep": "join_mono_verify_btn",
+            "join_quick": "join_verify_btn",
+        }.get(mode, "")
+
+    def _refresh_verify_buttons(self) -> None:
+        for attr_name, text, command in self._verify_button_specs():
+            btn = getattr(self, attr_name, None)
+            if btn is None:
+                continue
+            btn.configure(text=text, command=command)
+        if not self._verify_running:
+            return
+        active_attr = self._active_verify_button_attr()
+        if not active_attr:
+            return
+        active_btn = getattr(self, active_attr, None)
+        if active_btn is None:
+            return
+        active_btn.configure(
+            text="Force Stop" if self._verify_stop_clicks > 0 else "Stop",
+            command=self._stop_active_verify,
+            state=tk.NORMAL,
+        )
+
+    def _current_pipeline_stop_button_text(self) -> str:
+        if self._verify_running:
+            return "Force Stop" if self._verify_stop_clicks > 0 else "Stop"
+        if (self._merge_thread and self._merge_thread.is_alive()) or self._merge_group_alive():
+            return "Force Stop" if self._merge_stop_clicks > 0 else "Stop"
+        if self._inpaint_thread and self._inpaint_thread.is_alive():
+            return "Force Stop" if self._inpaint_stop_clicks > 0 else "Stop"
+        if self._depth_thread and self._depth_thread.is_alive():
+            return "Force Stop" if self._depth_stop_clicks > 0 else "Stop"
+        if self._splat_thread and self._splat_thread.is_alive():
+            return "Force Stop" if self._splat_stop_clicks > 0 else "Stop"
+        if self._join_thread and self._join_thread.is_alive():
+            return "Force Stop" if self._join_stop_requested else "Stop"
+        if (self._scene_thread and self._scene_thread.is_alive()) or self._analysis_running:
+            return "Stop"
+        return "Start/Resume"
+
+    def _refresh_pipeline_run_button(self) -> None:
+        btn = getattr(self, "pipeline_start_resume_btn", None)
+        if btn is None:
+            return
+        if self._any_pipeline_activity():
+            btn.configure(
+                text=self._current_pipeline_stop_button_text(),
+                command=self._pipeline_stop_active,
+            )
+        else:
+            btn.configure(text="Start/Resume", command=self._pipeline_start_resume)
+
+    def _pipeline_stop_active(self) -> None:
+        if not self._any_pipeline_activity():
+            self._refresh_pipeline_run_button()
+            return
+        pipeline_owned = bool(
+            self._pipeline_autorun or self._pipeline_pending_action is not None or self._pipeline_test_active
+        )
+        if pipeline_owned:
+            self._pipeline_autorun = False
+            self._pipeline_stop_requested = True
+        if self._verify_running:
+            if pipeline_owned:
+                self.pipeline_run_status_var.set("Pipeline stopping: active verification...")
+            self._stop_active_verify(prompt_user=False)
+            self._refresh_pipeline_run_button()
+            return
+        if (self._scene_thread and self._scene_thread.is_alive()) or self._analysis_running:
+            if pipeline_owned:
+                self.pipeline_run_status_var.set("Pipeline stopping: scene step...")
+            self._stop_scene_detect(prompt_user=False)
+        elif self._depth_thread and self._depth_thread.is_alive():
+            if pipeline_owned:
+                self.pipeline_run_status_var.set("Pipeline stopping: depth step...")
+            self._stop_depth_placeholder(prompt_user=False)
+        elif self._splat_thread and self._splat_thread.is_alive():
+            if pipeline_owned:
+                self.pipeline_run_status_var.set("Pipeline stopping: splatting step...")
+            self._stop_splat_placeholder(prompt_user=False)
+        elif self._inpaint_thread and self._inpaint_thread.is_alive():
+            if pipeline_owned:
+                self.pipeline_run_status_var.set("Pipeline stopping: inpaint step...")
+            self._stop_inpaint_placeholder(prompt_user=False)
+        elif (self._merge_thread and self._merge_thread.is_alive()) or self._merge_group_alive():
+            if pipeline_owned:
+                self.pipeline_run_status_var.set("Pipeline stopping: merge step...")
+            self._stop_merge_placeholder(prompt_user=False)
+        elif self._join_thread and self._join_thread.is_alive():
+            if pipeline_owned:
+                self.pipeline_run_status_var.set("Pipeline stopping: join step...")
+            self._stop_join(prompt_user=False)
+        self._refresh_pipeline_run_button()
+
+    def _finalize_pipeline_stop(self, label: str) -> None:
+        if not self._pipeline_stop_requested:
+            return
+        self._pipeline_autorun = False
+        self._pipeline_pending_action = None
+        if self._pipeline_test_active:
+            self._restore_test_scene_subset()
+        self.pipeline_run_status_var.set(f"Pipeline stopped during {label}.")
+        self._pipeline_stop_requested = False
+        self._pipeline_sync_noninteractive_mode()
+
+    def _verify_mode_ui_bundle(
+        self,
+        mode: str | None = None,
+    ) -> tuple[tk.StringVar | None, object | None, str]:
+        cur = str(mode or self._verify_mode or "").strip().lower()
+        if cur in {"quick", "deep"}:
+            return self.scene_status_var, self._append_scene_log, "Verify Scenes"
+        if cur.startswith("depth_upscaled"):
+            return self.depth_status_var, self._append_depth_log, "Verify Upscale"
+        if cur.startswith("depth_"):
+            return self.depth_status_var, self._append_depth_log, "Verify Depth"
+        if cur.startswith("splat_"):
+            return self.splat_status_var, self._append_splat_log, "Verify Splatting"
+        if cur.startswith("inpaint_"):
+            return self.inpaint_status_var, self._append_inpaint_log, "Verify Inpainting"
+        if cur.startswith("merge_mask_"):
+            return self.merge_status_var, self._append_merge_log, "Verify Mask"
+        if cur.startswith("merge_"):
+            return self.merge_status_var, self._append_merge_log, "Verify Merging"
+        if cur.startswith("join_mono_"):
+            return self.join_status_var, self._append_join_log, "Verify Mono->SBS"
+        if cur.startswith("join_"):
+            return self.join_status_var, self._append_join_log, "Verify Join"
+        return None, None, "Verify"
+
+    @staticmethod
+    def _is_verify_result_kind(kind: str) -> bool:
+        return str(kind or "").strip() in {
+            "verify_quick_result",
+            "verify_deep_result",
+            "depth_verify_quick_result",
+            "depth_verify_deep_result",
+            "depth_upscaled_verify_quick_result",
+            "depth_upscaled_verify_deep_result",
+            "splat_verify_quick_result",
+            "splat_verify_deep_result",
+            "inpaint_verify_quick_result",
+            "inpaint_verify_deep_result",
+            "merge_mask_verify_quick_result",
+            "merge_mask_verify_deep_result",
+            "merge_verify_quick_result",
+            "merge_verify_deep_result",
+            "join_verify_result",
+            "join_mono_verify_result",
+        }
+
+    def _handle_stopped_verify_result(self, kind: str, payload: dict) -> None:
+        kind_txt = str(kind or "").strip()
+        status_map: dict[str, tuple[tk.StringVar, str]] = {
+            "verify_quick_result": (self.scene_status_var, "Verify Scenes (Quick) stopped"),
+            "verify_deep_result": (self.scene_status_var, "Verify Scenes (Deep) stopped"),
+            "depth_verify_quick_result": (self.depth_status_var, "Verify Depth (Quick) stopped"),
+            "depth_verify_deep_result": (self.depth_status_var, "Verify Depth (Deep) stopped"),
+            "depth_upscaled_verify_quick_result": (
+                self.depth_status_var,
+                "Verify Upscale (Quick) stopped",
+            ),
+            "depth_upscaled_verify_deep_result": (
+                self.depth_status_var,
+                "Verify Upscale (Deep) stopped",
+            ),
+            "splat_verify_quick_result": (
+                self.splat_status_var,
+                "Verify Splatting (Quick) stopped",
+            ),
+            "splat_verify_deep_result": (
+                self.splat_status_var,
+                "Verify Splatting (Deep) stopped",
+            ),
+            "inpaint_verify_quick_result": (
+                self.inpaint_status_var,
+                "Verify Inpainting (Quick) stopped",
+            ),
+            "inpaint_verify_deep_result": (
+                self.inpaint_status_var,
+                "Verify Inpainting (Deep) stopped",
+            ),
+            "merge_mask_verify_quick_result": (
+                self.merge_status_var,
+                "Verify Mask (Quick) stopped",
+            ),
+            "merge_mask_verify_deep_result": (
+                self.merge_status_var,
+                "Verify Mask (Deep) stopped",
+            ),
+            "merge_verify_quick_result": (
+                self.merge_status_var,
+                "Verify Merging (Quick) stopped",
+            ),
+            "merge_verify_deep_result": (
+                self.merge_status_var,
+                "Verify Merging (Deep) stopped",
+            ),
+            "join_verify_result": (self.join_status_var, "Verify Join stopped"),
+            "join_mono_verify_result": (
+                self.join_status_var,
+                (
+                    "Mono->SBS Verify (Deep) stopped"
+                    if str(payload.get("mode", "")).strip().lower() == "deep"
+                    else "Mono->SBS Verify (Quick) stopped"
+                ),
+            ),
+        }
+        status_entry = status_map.get(kind_txt)
+        if status_entry:
+            status_var, text = status_entry
+            status_var.set(text)
+        if kind_txt in {"verify_quick_result", "verify_deep_result"}:
+            self._scene_verify_result_applied = True
+        if self._pipeline_stop_requested:
+            self.pipeline_run_status_var.set("Pipeline stopped during verification.")
+
+    def _stop_active_verify(self, prompt_user: bool = True) -> None:
+        if not self._verify_running:
+            return
+        status_var, logger, title = self._verify_mode_ui_bundle()
+        pipeline_owned = bool(
+            self._pipeline_autorun or self._pipeline_pending_action is not None or self._pipeline_test_active
+        )
+        if pipeline_owned:
+            self._pipeline_autorun = False
+            self._pipeline_stop_requested = True
+            self.pipeline_run_status_var.set("Pipeline stopping: active verification...")
+        if self._verify_stop_clicks == 0 and prompt_user:
+            messagebox.showwarning(
+                title,
+                (
+                    "Stop requested.\n\n"
+                    "Verification workers and ffprobe subprocesses will be interrupted.\n"
+                    "Click Stop again to force-kill any remaining verify process immediately."
+                ),
+            )
+        self._verify_stop_requested = True
+        self._verify_stop_clicks += 1
+        if self._verify_mode in {"quick", "deep"}:
+            self._scene_verify_result_applied = True
+        if status_var is not None:
+            status_var.set("Force stop requested..." if self._verify_stop_clicks > 1 else "Stop requested...")
+        if callable(logger):
+            if self._verify_stop_clicks > 1:
+                logger("[STOP] verification force stop requested.")
+            else:
+                logger("[STOP] verification stop requested (click Stop again for immediate force stop).")
+        self._signal_verify_processes(signal.SIGINT)
+        if self._verify_stop_clicks >= 2:
+            self.root.after(50, self._force_kill_verify)
+        else:
+            self.root.after(1000, self._force_kill_verify)
+        self._refresh_verify_buttons()
+        self._refresh_pipeline_run_button()
 
     def _set_verify_running(self, is_running: bool, mode: str = "") -> None:
         self._verify_running = is_running
         self._verify_mode = mode if is_running else ""
+        if is_running:
+            self._verify_stop_requested = False
+            self._verify_stop_clicks = 0
         if is_running:
             self.scene_verify_quick_btn.configure(state=tk.DISABLED)
             self.scene_verify_deep_btn.configure(state=tk.DISABLED)
@@ -12299,6 +13139,10 @@ class PipelineMasterGUI:
             else:
                 self.join_mono_verify_btn.configure(state=tk.NORMAL)
                 self.join_verify_btn.configure(state=tk.NORMAL)
+            self._verify_stop_requested = False
+            self._verify_stop_clicks = 0
+        self._refresh_verify_buttons()
+        self._refresh_pipeline_run_button()
 
     def _validate_verify_inputs(self) -> tuple[bool, str, str]:
         source_path = self.scene_input_var.get().strip()
@@ -12364,7 +13208,65 @@ class PipelineMasterGUI:
         return patterns
 
     @staticmethod
-    def _run_ffprobe_watchdog(cmd: list[str], timeout_sec: float) -> tuple[int, str, str, bool]:
+    def _verify_popen_kwargs() -> dict[str, object]:
+        if os.name == "nt":
+            flags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0)
+            return {"creationflags": flags} if flags else {}
+        return {"start_new_session": True}
+
+    def _register_verify_process(self, proc: subprocess.Popen | None) -> None:
+        if proc is None:
+            return
+        with self._verify_processes_lock:
+            self._verify_processes.add(proc)
+
+    def _unregister_verify_process(self, proc: subprocess.Popen | None) -> None:
+        if proc is None:
+            return
+        with self._verify_processes_lock:
+            self._verify_processes.discard(proc)
+
+    def _signal_verify_process(self, proc: subprocess.Popen | None, sig: int) -> None:
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            if os.name != "nt" and hasattr(os, "killpg"):
+                os.killpg(os.getpgid(proc.pid), sig)
+            elif sig == signal.SIGKILL:
+                proc.kill()
+            else:
+                proc.terminate()
+        except Exception:
+            try:
+                if sig == signal.SIGKILL:
+                    proc.kill()
+                else:
+                    proc.terminate()
+            except Exception:
+                pass
+
+    def _signal_verify_processes(self, sig: int) -> None:
+        with self._verify_processes_lock:
+            processes = list(self._verify_processes)
+        for proc in processes:
+            self._signal_verify_process(proc, sig)
+
+    def _verify_popen(self, cmd: list[str], **kwargs) -> subprocess.Popen:
+        popen_kwargs = dict(kwargs)
+        for key, value in self._verify_popen_kwargs().items():
+            popen_kwargs.setdefault(key, value)
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        self._register_verify_process(proc)
+        if self._verify_stop_requested:
+            self._signal_verify_process(proc, signal.SIGINT)
+        return proc
+
+    def _force_kill_verify(self) -> None:
+        if not self._verify_running:
+            return
+        self._signal_verify_processes(signal.SIGKILL)
+
+    def _run_ffprobe_watchdog(self, cmd: list[str], timeout_sec: float) -> tuple[int, str, str, bool]:
         proc: subprocess.Popen | None = None
         try:
             proc = subprocess.Popen(
@@ -12372,7 +13274,11 @@ class PipelineMasterGUI:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                **self._verify_popen_kwargs(),
             )
+            self._register_verify_process(proc)
+            if self._verify_stop_requested:
+                self._signal_verify_process(proc, signal.SIGINT)
             try:
                 out_txt, err_txt = proc.communicate(
                     timeout=(float(timeout_sec) if timeout_sec and float(timeout_sec) > 0 else None)
@@ -12382,7 +13288,7 @@ class PipelineMasterGUI:
             except subprocess.TimeoutExpired:
                 if proc.poll() is None:
                     try:
-                        proc.kill()
+                        self._signal_verify_process(proc, signal.SIGKILL)
                     except Exception:
                         pass
                 try:
@@ -12395,20 +13301,22 @@ class PipelineMasterGUI:
         except Exception as e:
             if proc is not None and proc.poll() is None:
                 try:
-                    proc.kill()
+                    self._signal_verify_process(proc, signal.SIGKILL)
                 except Exception:
                     pass
             return 126, "", str(e), False
+        finally:
+            self._unregister_verify_process(proc)
 
-    @staticmethod
-    def _probe_video_basic(path: str) -> dict:
+    def _probe_video_basic(self, path: str, count_mode: str = "packets") -> dict:
+        use_frames = str(count_mode or "").strip().lower() == "frames"
         cmd = [
             "ffprobe",
             "-v",
             "error",
             "-select_streams",
             "v:0",
-            "-count_packets",
+            "-count_frames" if use_frames else "-count_packets",
             "-show_entries",
             "stream=codec_name,pix_fmt,width,height,avg_frame_rate,nb_read_packets,nb_read_frames,duration",
             "-show_entries",
@@ -12446,7 +13354,18 @@ class PipelineMasterGUI:
         last_err = ""
         timeout_hits = 0
         for attempt in range(1, total_attempts + 1):
-            rc, out_txt, err_txt, timed_out = PipelineMasterGUI._run_ffprobe_watchdog(cmd, watchdog_sec)
+            if self._verify_stop_requested:
+                return {
+                    "ok": False,
+                    "error": "verify stop requested",
+                    "duration": None,
+                    "frames": None,
+                    "width": None,
+                    "height": None,
+                    "codec_name": "",
+                    "pix_fmt": "",
+                }
+            rc, out_txt, err_txt, timed_out = self._run_ffprobe_watchdog(cmd, watchdog_sec)
             last_rc, last_out, last_err = rc, out_txt, err_txt
             if timed_out:
                 timeout_hits += 1
@@ -12525,11 +13444,9 @@ class PipelineMasterGUI:
                     except Exception:
                         dur = None
             frames = None
-            # Quick verify uses packet counting for speed. Keep the return key name
-            # as "frames" so existing quick-verify comparisons remain unchanged.
-            nbf = st.get("nb_read_packets")
+            nbf = st.get("nb_read_frames" if use_frames else "nb_read_packets")
             if nbf in (None, "", "N/A"):
-                nbf = st.get("nb_read_frames")
+                nbf = st.get("nb_read_packets" if use_frames else "nb_read_frames")
             if nbf not in (None, "", "N/A"):
                 try:
                     frames = int(float(nbf))
@@ -12576,6 +13493,7 @@ class PipelineMasterGUI:
         log_kind: str,
         label: str,
         prefix: str = "[QUICK]",
+        count_mode: str = "packets",
     ) -> dict:
         files = sorted({str(x) for x in (file_list or []) if str(x).strip()})
         broken: list[str] = []
@@ -12586,12 +13504,16 @@ class PipelineMasterGUI:
         frames_available = True
 
         def _probe_one(fp: str) -> tuple[str, dict]:
-            return fp, self._probe_video_basic(fp)
+            return fp, self._probe_video_basic(fp, count_mode=count_mode)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(max_workers)))
+        futures: list[concurrent.futures.Future] = []
+        try:
             futures = [ex.submit(_probe_one, fp) for fp in files]
             done = 0
             for fut in concurrent.futures.as_completed(futures):
+                if self._verify_stop_requested:
+                    raise VerifyStopRequested()
                 fp, meta = fut.result()
                 meta_by_path[fp] = dict(meta or {})
                 done += 1
@@ -12621,6 +13543,12 @@ class PipelineMasterGUI:
                             f"{prefix}[{label.upper()}] progress {done}/{len(files)}",
                         )
                     )
+        except VerifyStopRequested:
+            for fut in futures:
+                fut.cancel()
+            raise
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
         return {
             "broken": sorted(set(broken)),
             "meta_by_path": meta_by_path,
@@ -12667,13 +13595,6 @@ class PipelineMasterGUI:
             files: list[str] = []
             seg_count = 0
             seg_mono_count = 0
-            expected_split_outputs: list[str] = []
-            missing_split_outputs: list[str] = []
-            split_cov_err = ""
-            if target_dirs:
-                expected_split_outputs, missing_split_outputs, split_cov_err = (
-                    self._collect_expected_split_scene_outputs(target_dirs[0])
-                )
             verify_patterns = self._scene_quick_verify_patterns()
             for idx, d in enumerate(target_dirs):
                 cur = self._collect_files_for_patterns(d, verify_patterns)
@@ -12683,15 +13604,44 @@ class PipelineMasterGUI:
                 else:
                     seg_mono_count += len(cur)
             files = sorted(set(files))
+
+            expected_by_name, csv_ref_err = self._scene_csv_expected_by_name(source_path)
+            files_by_name: dict[str, list[str]] = {}
+            for fp in files:
+                files_by_name.setdefault(Path(fp).name, []).append(fp)
+            missing_split_outputs: list[str] = []
+            if target_dirs and expected_by_name:
+                seg_root = Path(target_dirs[0]).resolve()
+                for out_name in expected_by_name:
+                    if not files_by_name.get(out_name):
+                        missing_split_outputs.append(str((seg_root / out_name).resolve()))
+            duplicate_files: list[str] = []
+            duplicate_names: list[str] = []
+            for out_name, paths in sorted(files_by_name.items()):
+                if out_name in expected_by_name and len(paths) > 1:
+                    duplicate_names.append(out_name)
+                    duplicate_files.extend(sorted({str(p) for p in paths if str(p).strip()}))
+                    self._log_queue.put(
+                        (
+                            "line",
+                            (
+                                f"[QUICK][DUPLICATE] {out_name} :: "
+                                + " | ".join(sorted(paths))
+                            ),
+                        )
+                    )
+
             if not files:
                 self._log_queue.put(("verify_quick_result", {
                     "ok": False,
                     "message": "No scene video files found in seg/seg-mono folders.",
                     "broken": [],
                     "missing_split": missing_split_outputs,
-                    "split_cov_err": split_cov_err,
+                    "duplicate_split": duplicate_files,
+                    "csv_ref_err": csv_ref_err,
                     "duration_ok": False,
                     "frames_ok": False,
+                    "retryable_failure": (not csv_ref_err) and (len(duplicate_files) == 0),
                 }))
                 return
 
@@ -12710,51 +13660,65 @@ class PipelineMasterGUI:
             else:
                 self._log_queue.put(("line", f"[QUICK] checking {len(files)} scene files with {max_workers} workers"))
 
-            broken: list[str] = []
-            total_duration = 0.0
-            duration_available = True
-            total_frames = 0
-            frames_available = True
+            probe = self._quick_verify_probe_group(
+                files,
+                max_workers,
+                "line",
+                "scene",
+                prefix="[QUICK]",
+                count_mode="frames",
+            )
+            broken = [str(p) for p in (probe.get("broken") or []) if str(p).strip()]
+            total_duration = float(probe.get("total_duration") or 0.0)
+            duration_available = bool(probe.get("duration_available", False))
+            meta_by_path = {
+                str(k): dict(v or {})
+                for k, v in (probe.get("meta_by_path") or {}).items()
+                if str(k).strip()
+            }
 
-            def _probe_one(fp: str) -> tuple[str, dict]:
-                return fp, self._probe_video_basic(fp)
+            frame_mismatch_files: list[str] = []
+            matched_scene_count = 0
+            for fp, meta in sorted(meta_by_path.items()):
+                if not meta.get("ok"):
+                    continue
+                out_name = Path(fp).name
+                expected_info = expected_by_name.get(out_name)
+                if not expected_info:
+                    continue
+                expected_frames = int(expected_info.get("frame_count", 0) or 0)
+                actual_frames = meta.get("frames")
+                if expected_frames <= 0:
+                    matched_scene_count += 1
+                    continue
+                if actual_frames is None:
+                    frame_mismatch_files.append(fp)
+                    self._log_queue.put(
+                        (
+                            "line",
+                            f"[QUICK][FRAME-MISMATCH] {fp} :: expected={expected_frames}, actual=n.d.",
+                        )
+                    )
+                    continue
+                actual_frames_int = int(actual_frames)
+                if actual_frames_int != expected_frames:
+                    frame_mismatch_files.append(fp)
+                    self._log_queue.put(
+                        (
+                            "line",
+                            (
+                                f"[QUICK][FRAME-MISMATCH] {fp} :: "
+                                f"expected={expected_frames}, actual={actual_frames_int}"
+                            ),
+                        )
+                    )
+                    continue
+                matched_scene_count += 1
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futures = [ex.submit(_probe_one, fp) for fp in files]
-                done = 0
-                for fut in concurrent.futures.as_completed(futures):
-                    fp, meta = fut.result()
-                    done += 1
-                    if not meta.get("ok"):
-                        broken.append(fp)
-                        self._log_queue.put(("line", f"[QUICK][BROKEN] {fp} :: {meta.get('error')}"))
-                    else:
-                        dur = meta.get("duration")
-                        frm = meta.get("frames")
-                        if dur is None:
-                            duration_available = False
-                        else:
-                            total_duration += float(dur)
-                        if frm is None:
-                            frames_available = False
-                        else:
-                            total_frames += int(frm)
-                    if done % 25 == 0 or done == len(files):
-                        self._log_queue.put(("line", f"[QUICK] progress {done}/{len(files)}"))
-
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
             src_meta = self._probe_video_basic(source_path)
-            if not src_meta.get("ok"):
-                self._log_queue.put(("verify_quick_result", {
-                    "ok": False,
-                    "message": f"Source probe failed: {src_meta.get('error')}",
-                    "broken": broken,
-                    "duration_ok": False,
-                    "frames_ok": False,
-                }))
-                return
-
             src_duration = src_meta.get("duration")
-            src_frames = src_meta.get("frames")
             duration_ok = False
             duration_msg = "n.d."
             if duration_available and src_duration is not None:
@@ -12765,63 +13729,76 @@ class PipelineMasterGUI:
                     f"(delta={dd:.3f}s)"
                 )
             frames_ok = False
-            frames_msg = "n.d."
-            if frames_available and src_frames is not None:
-                df = abs(int(total_frames) - int(src_frames))
-                frames_ok = df <= 1
-                frames_msg = (
-                    f"segments={int(total_frames)} vs source={int(src_frames)} "
-                    f"(delta={df})"
-                )
+            frames_msg = (
+                f"expected={len(expected_by_name)}, "
+                f"matched={matched_scene_count}, "
+                f"mismatched={len(frame_mismatch_files)}, "
+                f"missing={len(missing_split_outputs)}, "
+                f"duplicates={len(duplicate_names)}"
+            )
+            frames_ok = (
+                (len(broken) == 0)
+                and (len(frame_mismatch_files) == 0)
+                and (len(missing_split_outputs) == 0)
+                and (len(duplicate_names) == 0)
+                and (not csv_ref_err)
+            )
 
             self._log_queue.put(("line", f"[QUICK] duration check: {duration_msg}"))
-            self._log_queue.put(("line", f"[QUICK] packet check: {frames_msg}"))
-            if split_cov_err:
-                self._log_queue.put(("line", f"[QUICK] split CSV check: ERROR: {split_cov_err}"))
-            else:
-                self._log_queue.put(
-                    (
-                        "line",
-                        (
-                            f"[QUICK] split CSV check: expected={len(expected_split_outputs)}, "
-                            f"missing={len(missing_split_outputs)}"
-                        ),
-                    )
-                )
-            ok_final = (
-                (len(broken) == 0)
-                and (frames_ok or frames_msg == "n.d.")
-                and (not split_cov_err)
-                and (len(missing_split_outputs) == 0)
-            )
+            self._log_queue.put(("line", f"[QUICK] csv frame check: {frames_msg}"))
+            if csv_ref_err:
+                self._log_queue.put(("line", f"[QUICK] csv reference error: {csv_ref_err}"))
+            ok_final = frames_ok
+            bad_files = sorted(set(broken + frame_mismatch_files))
             message = (
                 f"Quick verify completed.\n"
                 f"Broken files: {len(broken)}\n"
+                f"Wrong-length files: {len(frame_mismatch_files)}\n"
+                f"Duplicate scene files: {len(duplicate_names)}\n"
                 f"Duration match (informational only): {'YES' if duration_ok else ('N.D.' if duration_msg == 'n.d.' else 'NO')}\n"
                 f"Duration details: {duration_msg}\n"
-                f"Packet match (quick): {'YES' if frames_ok else ('N.D.' if frames_msg == 'n.d.' else 'NO')}\n"
-                f"Packet details: {frames_msg}\n"
-                f"Split CSV expected: {len(expected_split_outputs)}\n"
-                f"Split CSV missing: {len(missing_split_outputs)}"
+                f"CSV frame match: {'YES' if frames_ok else 'NO'}\n"
+                f"CSV frame details: {frames_msg}\n"
+                f"Missing split files: {len(missing_split_outputs)}"
             )
             self._log_queue.put(("verify_quick_result", {
                 "ok": ok_final,
                 "message": message,
-                "broken": broken,
+                "broken": bad_files,
+                "frame_mismatch": frame_mismatch_files,
                 "missing_split": missing_split_outputs,
-                "split_cov_err": split_cov_err,
+                "duplicate_split": duplicate_files,
+                "csv_ref_err": csv_ref_err,
                 "duration_ok": duration_ok,
                 "frames_ok": frames_ok,
+                "retryable_failure": (not csv_ref_err) and (len(duplicate_files) == 0),
+            }))
+        except VerifyStopRequested:
+            self._log_queue.put(("verify_quick_result", {
+                "ok": False,
+                "stopped": True,
+                "message": "Quick verify stopped.",
+                "broken": [],
+                "frame_mismatch": [],
+                "missing_split": [],
+                "duplicate_split": [],
+                "csv_ref_err": "",
+                "duration_ok": False,
+                "frames_ok": False,
+                "retryable_failure": True,
             }))
         except Exception as e:
             self._log_queue.put(("verify_quick_result", {
                 "ok": False,
                 "message": f"Quick verify failed: {type(e).__name__}: {e}",
                 "broken": [],
+                "frame_mismatch": [],
                 "missing_split": [],
-                "split_cov_err": "",
+                "duplicate_split": [],
+                "csv_ref_err": "",
                 "duration_ok": False,
                 "frames_ok": False,
+                "retryable_failure": False,
             }))
         finally:
             self._log_queue.put(("verify_done", "quick"))
@@ -12898,13 +13875,13 @@ class PipelineMasterGUI:
         bad_files: list[str] = []
         seen_bad: set[str] = set()
         missing_split_outputs: list[str] = []
-        split_cov_err = ""
-        if primary_target:
-            _expected, missing_split_outputs, split_cov_err = self._collect_expected_split_scene_outputs(
-                primary_target
-            )
+        csv_ref_err = ""
+        duplicate_files: list[str] = []
+        frame_mismatch_files: list[str] = []
         try:
             for label, target_dir in targets:
+                if self._verify_stop_requested:
+                    raise VerifyStopRequested()
                 cmd = [
                     sys.executable,
                     script_path,
@@ -12926,7 +13903,7 @@ class PipelineMasterGUI:
                     ("line", f"[DEEP][{label}] cmd: {' '.join(shlex.quote(x) for x in cmd)}")
                 )
                 rc = 1
-                proc = subprocess.Popen(
+                proc = self._verify_popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -12935,33 +13912,130 @@ class PipelineMasterGUI:
                     universal_newlines=True,
                 )
                 assert proc.stdout is not None
-                for raw in proc.stdout:
-                    line = raw.rstrip("\n")
-                    if line:
-                        self._log_queue.put(("line", f"[DEEP][{label}] {line}"))
-                        bad_path = self._resolve_verifyscenes_bad_path(line, target_dir)
-                        if bad_path and bad_path not in seen_bad:
-                            seen_bad.add(bad_path)
-                            bad_files.append(bad_path)
-                rc = int(proc.wait() or 0)
+                try:
+                    for raw in proc.stdout:
+                        if self._verify_stop_requested:
+                            raise VerifyStopRequested()
+                        line = raw.rstrip("\n")
+                        if line:
+                            self._log_queue.put(("line", f"[DEEP][{label}] {line}"))
+                            bad_path = self._resolve_verifyscenes_bad_path(line, target_dir)
+                            if bad_path and bad_path not in seen_bad:
+                                seen_bad.add(bad_path)
+                                bad_files.append(bad_path)
+                    rc = int(proc.wait() or 0)
+                finally:
+                    self._unregister_verify_process(proc)
                 if rc != 0:
                     overall_rc = rc if overall_rc == 0 else overall_rc
-            if split_cov_err:
-                self._log_queue.put(("line", f"[DEEP][split-csv] ERROR: {split_cov_err}"))
-                overall_rc = overall_rc or 1
-            elif missing_split_outputs:
+
+            all_files: list[str] = []
+            verify_patterns = self._scene_quick_verify_patterns()
+            for _label, target_dir in targets:
+                all_files.extend(self._collect_files_for_patterns(target_dir, verify_patterns))
+            all_files = sorted(set(all_files))
+
+            expected_by_name, csv_ref_err = self._scene_csv_expected_by_name(source_path)
+            files_by_name: dict[str, list[str]] = {}
+            for fp in all_files:
+                files_by_name.setdefault(Path(fp).name, []).append(fp)
+
+            if primary_target and expected_by_name:
+                seg_root = Path(primary_target).resolve()
+                for out_name in expected_by_name:
+                    if not files_by_name.get(out_name):
+                        missing_split_outputs.append(str((seg_root / out_name).resolve()))
+
+            for out_name, paths in sorted(files_by_name.items()):
+                if out_name in expected_by_name and len(paths) > 1:
+                    duplicate_files.extend(sorted({str(p) for p in paths if str(p).strip()}))
+                    self._log_queue.put(
+                        (
+                            "line",
+                            (
+                                f"[DEEP][DUPLICATE] {out_name} :: "
+                                + " | ".join(sorted(paths))
+                            ),
+                        )
+                    )
+
+            if all_files:
+                probe = self._quick_verify_probe_group(
+                    all_files,
+                    workers,
+                    "line",
+                    "scene",
+                    prefix="[DEEP-FRAME]",
+                    count_mode="frames",
+                )
+                for fp, meta in sorted((probe.get("meta_by_path") or {}).items()):
+                    fp_txt = str(fp).strip()
+                    if not fp_txt or not meta.get("ok"):
+                        continue
+                    out_name = Path(fp_txt).name
+                    expected_info = expected_by_name.get(out_name)
+                    if not expected_info:
+                        continue
+                    expected_frames = int(expected_info.get("frame_count", 0) or 0)
+                    actual_frames = meta.get("frames")
+                    if expected_frames <= 0:
+                        continue
+                    if actual_frames is None or int(actual_frames) != expected_frames:
+                        frame_mismatch_files.append(fp_txt)
+                        self._log_queue.put(
+                            (
+                                "line",
+                                (
+                                    f"[DEEP][FRAME-MISMATCH] {fp_txt} :: "
+                                    f"expected={expected_frames}, actual="
+                                    f"{'n.d.' if actual_frames is None else int(actual_frames)}"
+                                ),
+                            )
+                        )
+
+            if frame_mismatch_files:
+                deleted, errors = self._auto_cleanup_broken_files(
+                    frame_mismatch_files,
+                    lambda line: self._log_queue.put(("line", line)),
+                    "seg/seg-mono frame-mismatch",
+                )
                 self._log_queue.put(
                     (
                         "line",
                         (
-                            f"[DEEP][split-csv] missing split files: "
+                            f"[DEEP][FRAME-MISMATCH] auto-cleanup deleted={deleted}, "
+                            f"errors={errors}"
+                        ),
+                    )
+                )
+
+            for fp in sorted(set(frame_mismatch_files)):
+                if fp not in seen_bad:
+                    seen_bad.add(fp)
+                    bad_files.append(fp)
+
+            if csv_ref_err:
+                self._log_queue.put(("line", f"[DEEP][csv-ref] ERROR: {csv_ref_err}"))
+                overall_rc = overall_rc or 1
+            if duplicate_files:
+                overall_rc = overall_rc or 1
+            if frame_mismatch_files:
+                overall_rc = overall_rc or 1
+            if missing_split_outputs:
+                self._log_queue.put(
+                    (
+                        "line",
+                        (
+                            f"[DEEP][split-files] missing split files: "
                             f"{len(missing_split_outputs)}"
                         ),
                     )
                 )
                 for miss in missing_split_outputs[:20]:
-                    self._log_queue.put(("line", f"[DEEP][split-csv][MISSING] {miss}"))
+                    self._log_queue.put(("line", f"[DEEP][split-files][MISSING] {miss}"))
                 overall_rc = overall_rc or 1
+        except VerifyStopRequested:
+            overall_rc = 1
         except Exception as e:
             self._log_queue.put(("line", f"[DEEP][ERROR] {type(e).__name__}: {e}"))
             overall_rc = 1
@@ -12971,10 +14045,14 @@ class PipelineMasterGUI:
                     "verify_deep_result",
                     {
                         "rc": overall_rc,
+                        "stopped": bool(self._verify_stop_requested),
                         "seg_dir": primary_target,
                         "bad_files": bad_files,
+                        "frame_mismatch": frame_mismatch_files,
                         "missing_split": missing_split_outputs,
-                        "split_cov_err": split_cov_err,
+                        "duplicate_split": duplicate_files,
+                        "csv_ref_err": csv_ref_err,
+                        "retryable_failure": (not csv_ref_err) and (len(duplicate_files) == 0),
                     },
                 )
             )
@@ -13005,6 +14083,7 @@ class PipelineMasterGUI:
         deleted = 0
         errors: list[str] = []
         seen: set[str] = set()
+        deleted_real_targets: set[str] = set()
         for raw in paths or []:
             path_txt = str(raw or "").strip()
             if not path_txt or path_txt in seen:
@@ -13015,11 +14094,30 @@ class PipelineMasterGUI:
                 continue
             if not (fp.is_file() or fp.is_symlink()):
                 continue
+            counted_deleted = False
+            if fp.is_symlink():
+                try:
+                    real_target = fp.resolve(strict=True)
+                except Exception:
+                    real_target = None
+                if real_target is not None and real_target != fp and real_target.is_file():
+                    real_key = str(real_target)
+                    if real_key not in deleted_real_targets:
+                        try:
+                            real_target.unlink()
+                            deleted_real_targets.add(real_key)
+                            counted_deleted = True
+                        except Exception as e:
+                            errors.append(f"{real_target}: {e}")
             try:
                 fp.unlink()
-                deleted += 1
+                if not counted_deleted:
+                    deleted += 1
             except Exception as e:
                 errors.append(f"{fp}: {e}")
+                continue
+            if counted_deleted:
+                deleted += 1
         return deleted, errors
 
     def _auto_cleanup_broken_files(self, paths: list[str], logger, label: str) -> tuple[int, int]:
@@ -13700,6 +14798,7 @@ class PipelineMasterGUI:
                             )
             # Give ffmpeg/python splitter time to flush and close current output.
             self.root.after(6000, self._force_kill_scene_detect)
+        self._refresh_pipeline_run_button()
 
     def _force_kill_scene_detect(self) -> None:
         proc = self._scene_process
@@ -13815,6 +14914,7 @@ class PipelineMasterGUI:
                     if stop_requested:
                         stop_label = "Split Scenes" if step_name == "split_scenes" else "SceneDetect"
                         self._append_scene_log(f"[STOP] {stop_label} stopped.")
+                        self._finalize_pipeline_stop(stop_label)
                     self._scene_stop_requested = False
                 elif kind == "depth_done":
                     stop_requested = bool(self._depth_stop_requested)
@@ -13836,6 +14936,7 @@ class PipelineMasterGUI:
                     if stop_requested:
                         stop_label = "Depth Upscale" if step_name == "depth_upscale" else "DepthCrafter"
                         self._append_depth_log(f"[STOP] {stop_label} stopped.")
+                        self._finalize_pipeline_stop(stop_label)
                 elif kind == "splat_done":
                     stop_requested = bool(self._splat_stop_requested)
                     self._set_splat_running(False)
@@ -13843,6 +14944,7 @@ class PipelineMasterGUI:
                     self._pipeline_on_run_finished("splatting", "completed" in status_txt)
                     if stop_requested:
                         self._append_splat_log("[STOP] Splatting stopped.")
+                        self._finalize_pipeline_stop("Splatting")
                 elif kind == "inpaint_done":
                     stop_requested = bool(self._inpaint_stop_requested)
                     step_name = ""
@@ -13894,39 +14996,9 @@ class PipelineMasterGUI:
                     if stop_requested:
                         stop_label = "Sharpness CSV" if step_name == "sharpness_csv" else "Inpainting"
                         self._append_inpaint_log(f"[STOP] {stop_label} stopped.")
+                        self._finalize_pipeline_stop(stop_label)
                 elif kind == "merge_done":
-                    stop_requested = bool(self._merge_stop_requested)
-                    step_name = ""
-                    success = False
-                    if isinstance(payload, dict):
-                        step_name = str(payload.get("step", "")).strip().lower()
-                        success = bool(payload.get("success", False))
-                    self._set_merge_running(False)
-                    if step_name in {"autoct_csv", "mask_for_merge", "merging"}:
-                        self._pipeline_on_run_finished(step_name, success)
-                    else:
-                        status_txt = self.merge_status_var.get().strip().lower()
-                        if "autoct csv created" in status_txt:
-                            self._pipeline_on_run_finished("autoct_csv", True)
-                            step_name = "autoct_csv"
-                        elif "mask-for-merge completed" in status_txt:
-                            self._pipeline_on_run_finished("mask_for_merge", True)
-                            step_name = "mask_for_merge"
-                        elif "completed" in status_txt:
-                            self._pipeline_on_run_finished("merging", True)
-                            step_name = "merging"
-                        else:
-                            pending = self._pipeline_pending_action
-                            if pending and pending[1] == "run" and pending[0] in {"autoct_csv", "mask_for_merge", "merging"}:
-                                self._pipeline_on_run_finished(pending[0], False)
-                                step_name = pending[0]
-                    if stop_requested:
-                        label_map = {
-                            "autoct_csv": "AutoCT CSV",
-                            "mask_for_merge": "Mask-for-merge",
-                            "merging": "Merging",
-                        }
-                        self._append_merge_log(f"[STOP] {label_map.get(step_name, 'Merging')} stopped.")
+                    self._handle_merge_done_event(payload)
                 elif kind == "join_done":
                     stop_requested = bool(self._join_stop_requested)
                     self._set_join_running(False)
@@ -13951,7 +15023,9 @@ class PipelineMasterGUI:
                             "remux": "Remux",
                             "join": "Join",
                         }
-                        self._append_join_log(f"[STOP] {label_map.get(step_name, 'Join')} stopped.")
+                        stop_label = label_map.get(step_name, "Join")
+                        self._append_join_log(f"[STOP] {stop_label} stopped.")
+                        self._finalize_pipeline_stop(stop_label)
                 elif kind == "analysis_info" and isinstance(payload, dict):
                     self._source_video_info = payload
                     self._update_source_capabilities(payload)
@@ -13968,12 +15042,21 @@ class PipelineMasterGUI:
                     if analysis_stopped:
                         self._append_scene_log("[STOP] Source analysis stopped.")
                     self._analysis_stop_requested = False
+                elif (
+                    self._is_verify_result_kind(kind)
+                    and isinstance(payload, dict)
+                    and (bool(payload.get("stopped")) or self._verify_stop_requested)
+                ):
+                    self._handle_stopped_verify_result(kind, payload)
                 elif kind == "verify_quick_result" and isinstance(payload, dict):
                     ok = bool(payload.get("ok", False))
                     msg = str(payload.get("message", "Quick verification finished."))
                     broken_files = [str(p) for p in (payload.get("broken") or []) if str(p).strip()]
+                    frame_mismatch = [str(p) for p in (payload.get("frame_mismatch") or []) if str(p).strip()]
                     missing_split = [str(p) for p in (payload.get("missing_split") or []) if str(p).strip()]
-                    split_cov_err = str(payload.get("split_cov_err", "")).strip()
+                    duplicate_split = [str(p) for p in (payload.get("duplicate_split") or []) if str(p).strip()]
+                    csv_ref_err = str(payload.get("csv_ref_err", "")).strip()
+                    retryable_failure = bool(payload.get("retryable_failure", True))
                     if ok:
                         self.scene_status_var.set("Verify (Quick) completed")
                         messagebox.showinfo("Verify Scenes (Quick)", msg)
@@ -14006,23 +15089,36 @@ class PipelineMasterGUI:
                         if broken_files:
                             msg += self._format_corrupted_files_block(
                                 broken_files,
-                                "Corrupted scene files",
+                                "Broken or wrong-length scene files",
                             )
-                        if split_cov_err:
-                            msg += f"\n\nSplit CSV check error:\n{split_cov_err}"
+                        if duplicate_split:
+                            msg += self._format_corrupted_files_block(
+                                duplicate_split,
+                                "Duplicate split scene files",
+                            )
+                        if csv_ref_err:
+                            msg += f"\n\nCSV reference error:\n{csv_ref_err}"
                         if missing_split:
                             msg += self._format_corrupted_files_block(
                                 missing_split,
-                                "Missing split files (from CSV)",
+                                "Missing split files",
                             )
                         messagebox.showwarning("Verify Scenes (Quick)", msg)
                     self._scene_verify_result_applied = True
-                    self._pipeline_on_verify_finished("split_scenes", ok, "quick")
+                    self._pipeline_on_verify_finished(
+                        "split_scenes",
+                        ok,
+                        "quick",
+                        retry_on_failure=retryable_failure,
+                    )
                 elif kind == "verify_deep_result" and isinstance(payload, dict):
                     rc = int(payload.get("rc", 1))
                     bad_files = [str(p) for p in (payload.get("bad_files") or []) if str(p).strip()]
+                    frame_mismatch = [str(p) for p in (payload.get("frame_mismatch") or []) if str(p).strip()]
                     missing_split = [str(p) for p in (payload.get("missing_split") or []) if str(p).strip()]
-                    split_cov_err = str(payload.get("split_cov_err", "")).strip()
+                    duplicate_split = [str(p) for p in (payload.get("duplicate_split") or []) if str(p).strip()]
+                    csv_ref_err = str(payload.get("csv_ref_err", "")).strip()
+                    retryable_failure = bool(payload.get("retryable_failure", True))
                     if rc == 0:
                         self.scene_status_var.set("Verify (Deep) completed")
                         messagebox.showinfo(
@@ -14035,22 +15131,31 @@ class PipelineMasterGUI:
                             "Deep verification failed.\n\n"
                             "Broken files were auto-deleted by verifier where possible."
                         )
-                        if split_cov_err:
-                            warn_msg += f"\n\nSplit CSV check error:\n{split_cov_err}"
+                        if csv_ref_err:
+                            warn_msg += f"\n\nCSV reference error:\n{csv_ref_err}"
                         warn_msg += self._format_corrupted_files_block(
                             bad_files,
-                            "Corrupted scene files",
+                            "Broken or wrong-length scene files",
+                        )
+                        warn_msg += self._format_corrupted_files_block(
+                            duplicate_split,
+                            "Duplicate split scene files",
                         )
                         warn_msg += self._format_corrupted_files_block(
                             missing_split,
-                            "Missing split files (from CSV)",
+                            "Missing split files",
                         )
                         messagebox.showwarning(
                             "Verify Scenes (Deep)",
                             warn_msg,
                         )
                     self._scene_verify_result_applied = True
-                    self._pipeline_on_verify_finished("split_scenes", rc == 0, "deep")
+                    self._pipeline_on_verify_finished(
+                        "split_scenes",
+                        rc == 0,
+                        "deep",
+                        retry_on_failure=retryable_failure,
+                    )
                 elif kind == "depth_verify_quick_result" and isinstance(payload, dict):
                     ok = bool(payload.get("ok", False))
                     msg = str(payload.get("message", "Depth quick verification finished."))
@@ -14467,24 +15572,53 @@ class PipelineMasterGUI:
                 elif kind == "merge_verify_deep_result" and isinstance(payload, dict):
                     rc = int(payload.get("rc", 1))
                     bad_files = [str(p) for p in (payload.get("bad_files") or []) if str(p).strip()]
+                    deleted = int(payload.get("deleted", 0) or 0)
+                    cleanup_errors = [str(x) for x in (payload.get("cleanup_errors") or []) if str(x).strip()]
+                    ignored_seg_mono = [
+                        str(p) for p in (payload.get("ignored_seg_mono") or []) if str(p).strip()
+                    ]
+                    unmatched_output = [
+                        str(p) for p in (payload.get("unmatched_output") or []) if str(p).strip()
+                    ]
                     if rc == 0:
                         self.merge_status_var.set("Verify (Deep) completed")
                         messagebox.showinfo(
                             "Verify Merging (Deep)",
-                            "Deep verification completed successfully.",
+                            (
+                                "Deep verification completed successfully."
+                                + (
+                                    f"\n\nIgnored seg-mono SBS files: {len(ignored_seg_mono)}"
+                                    if ignored_seg_mono
+                                    else ""
+                                )
+                            ),
                         )
                     else:
                         self.merge_status_var.set(f"Verify (Deep) failed (exit {rc})")
+                        warn_msg = "Deep verification failed."
+                        if deleted or cleanup_errors:
+                            warn_msg += (
+                                "\n\n"
+                                f"Cleanup after deep verify: deleted {deleted} broken merged file(s), "
+                                f"errors={len(cleanup_errors)}."
+                            )
+                        else:
+                            warn_msg += (
+                                "\n\nBroken files were auto-deleted by verifier where possible."
+                            )
+                        if ignored_seg_mono:
+                            warn_msg += f"\n\nIgnored seg-mono SBS files: {len(ignored_seg_mono)}."
+                        warn_msg += self._format_corrupted_files_block(
+                            unmatched_output,
+                            "Unexpected extra merged outputs",
+                        )
+                        warn_msg += self._format_corrupted_files_block(
+                            bad_files,
+                            "Corrupted merged output files",
+                        )
                         messagebox.showwarning(
                             "Verify Merging (Deep)",
-                            (
-                                "Deep verification failed.\n\n"
-                                "Broken files were auto-deleted by verifier where possible."
-                            )
-                            + self._format_corrupted_files_block(
-                                bad_files,
-                                "Corrupted merged output files",
-                            ),
+                            warn_msg,
                         )
                     self._pipeline_on_verify_finished("merging", rc == 0, "deep")
                 elif kind == "join_verify_result" and isinstance(payload, dict):
@@ -14558,13 +15692,28 @@ class PipelineMasterGUI:
                     self._pipeline_on_verify_finished("mono_to_sbs", ok, mode)
                 elif kind == "verify_done":
                     mode_txt = str(payload or "").strip().lower()
-                    if mode_txt in {"quick", "deep"} and not self._scene_verify_result_applied:
+                    verify_stopped = bool(self._verify_stop_requested)
+                    pipeline_stop_requested = bool(self._pipeline_stop_requested)
+                    if (
+                        mode_txt in {"quick", "deep"}
+                        and not self._scene_verify_result_applied
+                        and not verify_stopped
+                    ):
                         status_txt = self.scene_status_var.get().strip().lower()
                         verify_ok = ("completed" in status_txt) and ("failed" not in status_txt)
                         self._pipeline_on_verify_finished("split_scenes", verify_ok, mode_txt)
                     self._scene_verify_result_applied = False
+                    self._verify_thread = None
                     self._set_verify_running(False)
-                    if self._pipeline_autorun:
+                    if verify_stopped and pipeline_stop_requested:
+                        self._pipeline_autorun = False
+                        self._pipeline_pending_action = None
+                        if self._pipeline_test_active:
+                            self._restore_test_scene_subset()
+                        self.pipeline_run_status_var.set("Pipeline stopped during verification.")
+                        self._pipeline_stop_requested = False
+                        self._pipeline_sync_noninteractive_mode()
+                    elif self._pipeline_autorun:
                         self._pipeline_trigger_next_action()
         except queue.Empty:
             pass
@@ -14748,7 +15897,7 @@ class PipelineMasterGUI:
         if self._inpaint_thread and self._inpaint_thread.is_alive():
             self._stop_inpaint_placeholder(prompt_user=False)
             self._stop_inpaint_placeholder(prompt_user=False)
-        if self._merge_thread and self._merge_thread.is_alive():
+        if (self._merge_thread and self._merge_thread.is_alive()) or self._merge_group_alive():
             self._stop_merge_placeholder(prompt_user=False)
             self._stop_merge_placeholder(prompt_user=False)
         if self._join_thread and self._join_thread.is_alive():
