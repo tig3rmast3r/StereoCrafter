@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import shlex
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 
@@ -20,6 +22,29 @@ class SceneRow:
     frame_count: int | None
     start_sec: float | None
     end_sec: float | None
+
+
+def parse_ratio(value: str) -> Fraction | None:
+    txt = str(value or "").strip()
+    if not txt or txt.upper() == "N/A":
+        return None
+    if "/" in txt:
+        num_txt, den_txt = txt.split("/", 1)
+        try:
+            num = int(num_txt.strip())
+            den = int(den_txt.strip())
+        except Exception:
+            return None
+        if num <= 0 or den <= 0:
+            return None
+        return Fraction(num, den)
+    try:
+        num = float(txt)
+    except Exception:
+        return None
+    if num <= 0:
+        return None
+    return Fraction(str(num))
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +119,46 @@ def output_name_from_scene(source_path: str, scene_number: int) -> str:
     return f"{stem}-Scene-{int(scene_number):03d}.mp4"
 
 
+def probe_source_fps(source_path: str) -> Fraction | None:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate,r_frame_rate",
+        "-of",
+        "json",
+        str(source_path),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except Exception:
+        return None
+    streams = payload.get("streams") or []
+    if not streams:
+        return None
+    stream0 = streams[0] or {}
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        fps = parse_ratio(stream0.get(key) or "")
+        if fps is not None and fps > 0:
+            return fps
+    return None
+
+
 def load_scene_rows(csv_path: Path) -> list[SceneRow]:
     out: list[SceneRow] = []
     with csv_path.open("r", newline="", encoding="utf-8") as f:
@@ -162,27 +227,22 @@ def load_scene_rows(csv_path: Path) -> list[SceneRow]:
     return out
 
 
-def apply_frame_trim(ffmpeg_tokens: list[str], start_frame: int, frame_count: int) -> list[str]:
-    start_frame_zero = max(0, int(start_frame) - 1)
+def apply_frame_output_guard(ffmpeg_tokens: list[str], frame_count: int) -> list[str]:
     frame_count = max(1, int(frame_count))
-    end_frame_zero = start_frame_zero + frame_count - 1
-    frame_filter = (
-        f"select='between(n,{start_frame_zero},{end_frame_zero})',"
-        "setpts=N/FRAME_RATE/TB"
-    )
     tokens = list(ffmpeg_tokens)
-    for idx, tok in enumerate(tokens[:-1]):
-        if tok == "-vf" or tok.startswith("-filter:v"):
-            existing = str(tokens[idx + 1] or "").strip()
-            tokens[idx + 1] = f"{frame_filter},{existing}" if existing else frame_filter
-            break
-    else:
-        tokens.extend(["-vf", frame_filter])
-    if ("-fps_mode" not in tokens) and ("-vsync" not in tokens):
-        tokens.extend(["-fps_mode", "passthrough"])
     if not any(tok == "-frames:v" or tok.startswith("-frames:v") for tok in tokens):
         tokens.extend(["-frames:v", str(frame_count)])
     return tokens
+
+
+def frame_to_seconds(frame_number: int, fps: Fraction) -> float:
+    fps_fraction = Fraction(fps)
+    return float(Fraction(int(frame_number), 1) / fps_fraction)
+
+
+def format_seconds(value: float) -> str:
+    txt = f"{float(value):.15f}".rstrip("0").rstrip(".")
+    return txt if txt else "0"
 
 
 def run_one_job(
@@ -190,6 +250,7 @@ def run_one_job(
     output_path: Path,
     scene_row: SceneRow,
     ffmpeg_tokens: list[str],
+    source_fps: Fraction | None,
     skip_existing: bool,
     delete_failed: bool,
 ) -> tuple[str, str]:
@@ -197,15 +258,28 @@ def run_one_job(
         return "skipped", str(output_path)
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
-    if (scene_row.start_frame is not None) and (scene_row.frame_count is not None):
-        cmd.extend(["-i", source_path])
+    if (
+        (scene_row.start_frame is not None)
+        and (scene_row.frame_count is not None)
+        and (source_fps is not None)
+    ):
+        # SceneDetect CSV stores 1-based frame numbers; derive exact seek/duration from frames
+        # like PySceneDetect does internally, but keep a frame cap as a guard-rail.
+        start_frame_zero = max(0, int(scene_row.start_frame) - 1)
+        frame_count = max(1, int(scene_row.frame_count))
+        start_sec = frame_to_seconds(start_frame_zero, source_fps)
+        duration_sec = frame_to_seconds(frame_count, source_fps)
         cmd.extend(
-            apply_frame_trim(
-                ffmpeg_tokens,
-                start_frame=scene_row.start_frame,
-                frame_count=scene_row.frame_count,
-            )
+            [
+                "-ss",
+                format_seconds(start_sec),
+                "-i",
+                source_path,
+                "-t",
+                format_seconds(duration_sec),
+            ]
         )
+        cmd.extend(apply_frame_output_guard(ffmpeg_tokens, frame_count=frame_count))
     else:
         start_sec = float(scene_row.start_sec or 0.0)
         end_sec = float(scene_row.end_sec or 0.0)
@@ -266,6 +340,21 @@ def main() -> int:
         print(f"[ERROR] no valid scene rows in CSV: {scene_csv}", flush=True)
         return 2
 
+    source_fps = probe_source_fps(source_path)
+    if source_fps is not None:
+        print(
+            (
+                f"[SPLIT] source_fps={source_fps.numerator}/{source_fps.denominator} "
+                f"({float(source_fps):.6f})"
+            ),
+            flush=True,
+        )
+    else:
+        print(
+            "[SPLIT][WARN] failed to probe source fps, falling back to CSV time-based split.",
+            flush=True,
+        )
+
     jobs: list[tuple[Path, SceneRow]] = []
     for scene_row in scene_rows:
         out_name = output_name_from_scene(source_path, scene_row.scene_num)
@@ -292,6 +381,7 @@ def main() -> int:
                 out_path,
                 scene_row,
                 ffmpeg_tokens,
+                source_fps,
                 args.skip_existing == "yes",
                 args.delete_failed == "yes",
             )
