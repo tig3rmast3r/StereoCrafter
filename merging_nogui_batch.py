@@ -1908,6 +1908,7 @@ def infer_output_path_from_inpainted(
 
 def collect_jobs(
     inpainted_folder: str,
+    preferred_inpainted_folder: str,
     splatted_folder: str,
     original_folder: str,
     output_folder: str,
@@ -1917,14 +1918,20 @@ def collect_jobs(
     Collect inpainted files and find matching splatted.
     Returns list of (inpainted_path, splatted_path).
     """
-    patterns = [
-        os.path.join(inpainted_folder, "*_inpainted_right_eye.mp4"),
-        os.path.join(inpainted_folder, "*_inpainted_sbs.mp4"),
-    ]
-    inpainted_files: List[str] = []
-    for pat in patterns:
-        inpainted_files.extend(glob.glob(pat))
-    inpainted_files = sorted(set(inpainted_files))
+    inpainted_by_name: Dict[str, str] = {}
+    for folder in (preferred_inpainted_folder, inpainted_folder):
+        if not folder or not os.path.isdir(folder):
+            continue
+        patterns = [
+            os.path.join(folder, "*_inpainted_right_eye.mp4"),
+            os.path.join(folder, "*_inpainted_sbs.mp4"),
+        ]
+        for pat in patterns:
+            for hit in sorted(glob.glob(pat)):
+                base = os.path.basename(hit)
+                if base not in inpainted_by_name:
+                    inpainted_by_name[base] = hit
+    inpainted_files: List[str] = [inpainted_by_name[k] for k in sorted(inpainted_by_name.keys())]
 
     if only:
         inpainted_files = [p for p in inpainted_files if os.path.basename(p) == only or os.path.basename(p).startswith(only)]
@@ -2634,7 +2641,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Headless single-worker batch runner for merging_gui pipeline (streaming)."
     )
-    ap.add_argument("--inpainted-folder", required=True, help="Folder containing *_inpainted_right_eye.mp4 or *_inpainted_sbs.mp4")
+    ap.add_argument("--inpainted-folder", required=True, help="Fallback folder containing *_inpainted_right_eye.mp4 or *_inpainted_sbs.mp4")
+    ap.add_argument("--preferred-inpainted-folder", default="", help="Optional preferred folder checked before --inpainted-folder (used for sharpened outputs).")
     ap.add_argument("--splatted-folder", required=True, help="Folder containing *_splatted1.mp4 / *_splatted2.mp4 / *_splatted4.mp4")
     ap.add_argument("--original-folder", required=True, help="Folder containing original left-eye videos (single/dual-input case)")
     ap.add_argument("--output-folder", required=True, help="Output folder for merged files")
@@ -2796,6 +2804,7 @@ def main() -> int:
     # Collect jobs
     pairs = collect_jobs(
         inpainted_folder=args.inpainted_folder,
+        preferred_inpainted_folder=args.preferred_inpainted_folder,
         splatted_folder=args.splatted_folder,
         original_folder=args.original_folder,
         output_folder=args.output_folder,

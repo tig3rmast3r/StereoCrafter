@@ -1695,8 +1695,8 @@ class MergingGUI(ThemedTk):
         "use_mask_formerge": False,
         "mask_binarize_threshold": -0.01,
         "mask_dilate_kernel_size": 2,
-        "mask_blur_kernel_size": 4,
-        "shadow_length_px": 30,
+        "mask_blur_kernel_size": 2,
+        "shadow_length_px": 15,
         "shadow_width_adaptive": True,
         "shadow_curve": 0.0,
         "shadow_motion_gain": 1.0,  # hidden in GUI, managed via motion defaults

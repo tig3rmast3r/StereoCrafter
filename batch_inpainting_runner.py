@@ -649,8 +649,8 @@ def _steps_from_sharpness(val: float) -> int:
         return 5
 
     steps = 5 + int(v // 1100)
-    if steps > 11:
-        steps = 11
+    if steps > 8:
+        steps = 8
     return steps
 
 

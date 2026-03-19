@@ -40,7 +40,7 @@ def _normalize_output_root(p: Path) -> Path:
 SPLAT_GUI_PY = "./splatting_gui.py"  # path to your splatting GUI script
 
 INPUT_SOURCE_CLIPS = "./work/seg/"
-INPUT_DEPTH_MAPS   = "./work/depthmap/upscaled/"
+INPUT_DEPTH_MAPS   = "./work/depthmap/"
 OUTPUT_SPLATTED    = "./work/splat/"
 MASK_OUTPUT        = "./work/mask/"   # empty => same folder as main output
 

@@ -11,7 +11,7 @@ RUN_SCRIPT="${RUN_SCRIPT:-run_splatting_runner.sh}"
 WORKERS="${WORKERS:-2}"
 
 INPUT_SOURCE_CLIPS="${INPUT_SOURCE_CLIPS:-./work/seg/}"
-INPUT_DEPTH_MAPS="${INPUT_DEPTH_MAPS:-./work/depthmap/upscaled/}"
+INPUT_DEPTH_MAPS="${INPUT_DEPTH_MAPS:-./work/depthmap/}"
 OUTPUT_SPLATTED="${OUTPUT_SPLATTED:-./work/splat/}"
 
 SHARD_ROOT="${SHARD_ROOT:-${TMPDIR:-/tmp}/splat_parallel_${USER:-user}_$$}"

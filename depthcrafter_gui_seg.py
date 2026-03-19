@@ -176,7 +176,7 @@ class DepthCrafterGUI:
         self.current_input_mode = "batch_folder" # "batch_folder", "single_video_file", "single_image_file", "image_sequence_folder"
         self.single_file_mode_active = False # True if a single file/sequence folder is explicitly loaded
         self.effective_move_original_on_completion = self.MOVE_ORIGINAL_TO_FINISHED_FOLDER_ON_COMPLETION
-        self.use_local_models_only_var = tk.BooleanVar(value=False)
+        self.use_local_models_only_var = tk.BooleanVar(value=True)
         self.status_message_var = tk.StringVar(value="Ready")
         self.current_filename_var = tk.StringVar(value="N/A")
         self.current_resolution_var = tk.StringVar(value="N/A")
@@ -2134,19 +2134,47 @@ class DepthCrafterGUI:
 
         try:
             # 1. Initialize DepthCrafterDemo (Model Loading)
-            if not self.use_local_models_only_var.get():
-                _logger.info("Attempting to check model at Hugging Face Hub against local.")
+            local_unet_path = os.path.normpath("./weights/DepthCrafter")
+            local_pre_train_path = os.path.normpath("./weights/stable-video-diffusion-img2vid-xt-1-1")
+            local_only_requested = self.use_local_models_only_var.get()
+            local_models_available = os.path.isdir(local_unet_path) and os.path.isdir(local_pre_train_path)
+
+            if local_models_available:
+                _logger.info(
+                    "Using local StereoCrafter weights: "
+                    f"unet='{local_unet_path}', pretrain='{local_pre_train_path}'."
+                )
+                unet_path = local_unet_path
+                pre_train_path = local_pre_train_path
+                local_files_only = True
             else:
-                _logger.info("Attempting to load local model.")
+                if local_only_requested:
+                    missing = []
+                    if not os.path.isdir(local_unet_path):
+                        missing.append(local_unet_path)
+                    if not os.path.isdir(local_pre_train_path):
+                        missing.append(local_pre_train_path)
+                    raise FileNotFoundError(
+                        "Local model paths not found: " + ", ".join(missing)
+                    )
+
+                _logger.info(
+                    "Local StereoCrafter weights not found. Falling back to Hugging Face "
+                    "models 'tencent/DepthCrafter' and "
+                    "'stabilityai/stable-video-diffusion-img2vid-xt-1-1'."
+                )
+                unet_path = "tencent/DepthCrafter"
+                pre_train_path = "stabilityai/stable-video-diffusion-img2vid-xt-1-1"
+                local_files_only = False
 
             disable_xformers_for_run = self.disable_xformers_var.get()
 
             demo = DepthCrafterDemo(
-                unet_path="tencent/DepthCrafter",
-                pre_train_path="stabilityai/stable-video-diffusion-img2vid-xt",
+                unet_path=unet_path,
+                pre_train_path=pre_train_path,
                 cpu_offload=self.cpu_offload.get(),
                 use_cudnn_benchmark=self.use_cudnn_benchmark.get(),
-                local_files_only=self.use_local_models_only_var.get(),
+                local_files_only=local_files_only,
                 disable_xformers=disable_xformers_for_run,
             )
         except Exception as e:

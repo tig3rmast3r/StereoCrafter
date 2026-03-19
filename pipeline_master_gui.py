@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import queue
 import re
@@ -13,6 +14,7 @@ import threading
 import concurrent.futures
 import glob
 import tkinter as tk
+from typing import Sequence
 from datetime import datetime
 from collections import Counter
 from pathlib import Path
@@ -23,7 +25,7 @@ try:
 except Exception:
     ThemedTk = None
 
-GUI_VERSION = "2026-03-16"
+GUI_VERSION = "2026-03-20"
 
 
 class VerifyStopRequested(Exception):
@@ -41,16 +43,22 @@ class PipelineMasterGUI:
         "x265": "libx265",
         "h265": "libx265",
     }
-    DEFAULT_DEPTH_SCALE_FACTOR = 0.5
+    DEFAULT_DEPTH_SCALE_FACTOR = 0.56
     MIN_DEPTH_SCALE_FACTOR = 0.5
     MAX_DEPTH_SCALE_FACTOR = 0.8
-    DEFAULT_DEPTH_REALESRGAN_WORKERS = 4
-    DEFAULT_SPLIT_SCENES_WORKERS = 8
+    DEFAULT_DEPTH_REALESRGAN_WORKERS = 2
+    DEFAULT_SPLIT_SCENES_WORKERS = 19
     DEFAULT_PIPELINE_TEST_RUN_FILES = 5
+    DEPTH_REALESRGAN_SCALE_CHOICES = ("2x", "4x")
+    DEPTH_REALESRGAN_MODEL_MAP = {
+        "2x": {"scale": "2", "model": "realesr-animevideov3-x2"},
+        "4x": {"scale": "4", "model": "realesrgan-x4plus"},
+    }
+    REALESRGAN_RELEASES_URL = "https://github.com/xinntao/Real-ESRGAN/releases"
     RETRY_POLICY_PROFILES = ("run", "retry1", "retry2", "retry3")
     RETRY_POLICY_MAX_SPLIT_CHOICES = ("off", "64", "128", "256", "512")
     RETRY_POLICY_OFFLOAD_CHOICES = ("none", "model", "sequential")
-    RETRY_POLICY_DEFAULT = {
+    DEPTH_RETRY_POLICY_DEFAULT = {
         "run": {
             "garbage_collection_threshold": True,
             "expandable_segments": True,
@@ -80,6 +88,36 @@ class PipelineMasterGUI:
             "cpu_offload_mode": "sequential",
         },
     }
+    INPAINT_RETRY_POLICY_DEFAULT = {
+        "run": {
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": "off",
+            "cpu_offload_inherited": True,
+            "cpu_offload_mode": "none",
+        },
+        "retry1": {
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": "512",
+            "cpu_offload_inherited": False,
+            "cpu_offload_mode": "model",
+        },
+        "retry2": {
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": "64",
+            "cpu_offload_inherited": False,
+            "cpu_offload_mode": "model",
+        },
+        "retry3": {
+            "garbage_collection_threshold": True,
+            "expandable_segments": True,
+            "max_split_size_mb": "64",
+            "cpu_offload_inherited": False,
+            "cpu_offload_mode": "sequential",
+        },
+    }
     VERIFY_QUICK_FFPROBE_TIMEOUT_SEC = 3600.0
     VERIFY_QUICK_FFPROBE_TIMEOUT_RETRIES = 1
     VERIFY_DEEP_FFPROBE_TIMEOUT_SEC = 180.0
@@ -97,15 +135,14 @@ class PipelineMasterGUI:
         "- Hable: brighter SDR-style look."
     )
     DEPTH_AUTO_INFO = (
-        "Auto mode: source scenes are downscaled with a selectable factor (0.50..0.80),\n"
-        "processed with DepthCrafter, then restored with RealESRGAN.\n"
-        "RealESRGAN runtime can be selected in Options -> DepthCrafter:\n"
-        "Bundled (Utilities/realesrgan) or Local (system/custom).\n"
-        "If local runtime has issues, switch to Bundled or rebuild locally."
+        "Auto mode: source scenes are downscaled with a selectable factor (0.50..0.80)\n"
+        "and processed directly with DepthCrafter. RealESRGAN is skipped in the auto chain,\n"
+        "so the final auto resolution follows the DepthCrafter multiplier.\n"
+        "If you want optional ESRGAN 2x/4x restore, switch to Manual mode and enable it there."
     )
     DEPTH_MANUAL_INFO = (
-        "Manual mode: choose parameters freely. For compatibility with the pipeline,\n"
-        "output scenes will still be restored automatically to original resolution.\n"
+        "Manual mode: choose parameters freely and optionally enable RealESRGAN as a separate\n"
+        "step (bundled 2x anime model or bundled 4x plus model).\n"
         "Segmenting is not supported in this script.\n"
         "If you need segmenting, use depthcrafter_gui_seg.py manually."
     )
@@ -196,6 +233,7 @@ class PipelineMasterGUI:
         ("splatting", "Splatting"),
         ("sharpness_csv", "Sharpness CSV"),
         ("inpaint", "Inpaint"),
+        ("sharpen", "Sharpen"),
         ("mask_for_merge", "Mask-for-merge"),
         ("autoct_csv", "AutoCT CSV"),
         ("merging", "Merging"),
@@ -209,6 +247,7 @@ class PipelineMasterGUI:
         "depth_upscale",
         "splatting",
         "inpaint",
+        "sharpen",
         "mask_for_merge",
         "merging",
         "mono_to_sbs",
@@ -235,6 +274,7 @@ class PipelineMasterGUI:
         "mask": "mask",
         "mask_for_merge": "mask_for_merge",
         "inpaint": "output",
+        "inpaint_sharpen": "output-sharpen",
         "merge": "sbs",
         "join": "final",
     }
@@ -291,6 +331,7 @@ class PipelineMasterGUI:
         self._inpaint_stop_requested = False
         self._inpaint_stop_clicks = 0
         self._inpaint_resume_after_sharpness = False
+        self._inpaint_resume_after_sharpen = False
         self._merge_thread: threading.Thread | None = None
         self._merge_process: subprocess.Popen | None = None
         self._merge_process_group_id: int | None = None
@@ -460,10 +501,10 @@ class PipelineMasterGUI:
         )
         self.depth_info_text_var = tk.StringVar(value=self.DEPTH_AUTO_INFO)
         self.depth_chunk_size_var = tk.StringVar(
-            value=str(self._config.get("depth_chunk_size", "70"))
+            value=str(self._config.get("depth_chunk_size", "100"))
         )
         self.depth_overlap_var = tk.StringVar(
-            value=str(self._config.get("depth_overlap", "20"))
+            value=str(self._config.get("depth_overlap", "15"))
         )
         self.depth_inference_steps_var = tk.StringVar(
             value=str(self._config.get("depth_inference_steps", "5"))
@@ -534,6 +575,12 @@ class PipelineMasterGUI:
                 "depth_realesrgan_source", "Bundled (Utilities/realesrgan)"
             )
         )
+        self.depth_use_realesrgan_upscale_var = tk.BooleanVar(
+            value=bool(self._config.get("depth_use_realesrgan_upscale", False))
+        )
+        self.depth_realesrgan_scale_var = tk.StringVar(
+            value=str(self._config.get("depth_realesrgan_scale", "2x"))
+        )
         self.depth_realesrgan_workers_var = tk.StringVar(
             value=str(
                 self._config.get(
@@ -560,7 +607,7 @@ class PipelineMasterGUI:
             value=str(self._config.get("splat_batch_size", "50"))
         )
         self.splat_workers_var = tk.StringVar(
-            value=str(self._config.get("splat_workers", "2"))
+            value=str(self._config.get("splat_workers", "4"))
         )
         self.splat_disparity_var = tk.StringVar(
             value=str(self._config.get("splat_disparity", "20"))
@@ -572,10 +619,10 @@ class PipelineMasterGUI:
             value=self._config.get("splat_auto_convergence", "Min Borders")
         )
         self.splat_dilate_x_var = tk.StringVar(
-            value=str(self._config.get("splat_dilate_x", "3"))
+            value=str(self._config.get("splat_dilate_x", "5"))
         )
         self.splat_dilate_y_var = tk.StringVar(
-            value=str(self._config.get("splat_dilate_y", "3"))
+            value=str(self._config.get("splat_dilate_y", "5"))
         )
         self.splat_blur_x_var = tk.StringVar(
             value=str(self._config.get("splat_blur_x", "0"))
@@ -584,7 +631,7 @@ class PipelineMasterGUI:
             value=str(self._config.get("splat_blur_y", "0"))
         )
         self.splat_dilate_left_var = tk.StringVar(
-            value=str(self._config.get("splat_dilate_left", "2"))
+            value=str(self._config.get("splat_dilate_left", "0"))
         )
         self.splat_blur_balance_var = tk.StringVar(
             value=str(self._config.get("splat_blur_balance", "0.5"))
@@ -655,15 +702,16 @@ class PipelineMasterGUI:
         self.inpaint_input_var = tk.StringVar(value="")
         self.inpaint_mask_var = tk.StringVar(value="")
         self.inpaint_output_var = tk.StringVar(value="")
+        self.inpaint_sharpen_output_var = tk.StringVar(value="")
         self.inpaint_mode_var = tk.StringVar(
             value=self._config.get("inpaint_mode", "Auto (recommended)")
         )
         self.inpaint_info_text_var = tk.StringVar(value=self.INPAINT_AUTO_INFO)
         self.inpaint_frames_chunk_var = tk.StringVar(
-            value=str(self._config.get("inpaint_frames_chunk", "50"))
+            value=str(self._config.get("inpaint_frames_chunk", "55"))
         )
         self.inpaint_cpu_offload_var = tk.StringVar(
-            value=self._config.get("inpaint_cpu_offload", "model")
+            value=self._config.get("inpaint_cpu_offload", "none")
         )
         self.inpaint_tile_num_var = tk.StringVar(
             value=str(self._config.get("inpaint_tile_num", "2"))
@@ -680,9 +728,15 @@ class PipelineMasterGUI:
         self.inpaint_use_sharpness_csv_var = tk.BooleanVar(
             value=bool(self._config.get("inpaint_use_sharpness_csv", True))
         )
+        self.inpaint_use_sharpen_var = tk.BooleanVar(
+            value=bool(self._config.get("inpaint_use_sharpen", True))
+        )
         default_sharp_workers = "19"
         self.inpaint_sharpness_workers_var = tk.StringVar(
             value=str(self._config.get("inpaint_sharpness_workers", default_sharp_workers))
+        )
+        self.inpaint_sharpen_workers_var = tk.StringVar(
+            value=str(self._config.get("inpaint_sharpen_workers", "19"))
         )
         self.inpaint_inference_steps_var = tk.StringVar(
             value=str(self._config.get("inpaint_inference_steps", "8"))
@@ -729,7 +783,7 @@ class PipelineMasterGUI:
             value=str(
                 self._config.get(
                     "merge_mask_formerge_workers",
-                    self._config.get("merge_autoct_workers", "8"),
+                    self._config.get("merge_autoct_workers", "19"),
                 )
             )
         )
@@ -755,10 +809,10 @@ class PipelineMasterGUI:
             value=str(self._config.get("merge_mask_dilate", "2"))
         )
         self.merge_mask_blur_var = tk.StringVar(
-            value=str(self._config.get("merge_mask_blur", "4"))
+            value=str(self._config.get("merge_mask_blur", "2"))
         )
         self.merge_shadow_length_var = tk.StringVar(
-            value=str(self._config.get("merge_shadow_length", "25"))
+            value=str(self._config.get("merge_shadow_length", "15"))
         )
         self.merge_shadow_curve_var = tk.StringVar(
             value=str(self._config.get("merge_shadow_curve", "0"))
@@ -869,13 +923,19 @@ class PipelineMasterGUI:
                 )
             )
         )
-        depth_retry_cfg = self._retry_policy_from_config_key("depth_retry_policy")
-        inpaint_retry_cfg = self._retry_policy_from_config_key("inpaint_retry_policy")
+        depth_retry_cfg = self._retry_policy_from_config_key(
+            "depth_retry_policy",
+            self.DEPTH_RETRY_POLICY_DEFAULT,
+        )
+        inpaint_retry_cfg = self._retry_policy_from_config_key(
+            "inpaint_retry_policy",
+            self.INPAINT_RETRY_POLICY_DEFAULT,
+        )
         self.depth_retry_policy_vars: dict[str, dict[str, tk.Variable]] = {}
         self.inpaint_retry_policy_vars: dict[str, dict[str, tk.Variable]] = {}
         for profile in self.RETRY_POLICY_PROFILES:
-            dcfg = depth_retry_cfg.get(profile, self.RETRY_POLICY_DEFAULT[profile])
-            icfg = inpaint_retry_cfg.get(profile, self.RETRY_POLICY_DEFAULT[profile])
+            dcfg = depth_retry_cfg.get(profile, self.DEPTH_RETRY_POLICY_DEFAULT[profile])
+            icfg = inpaint_retry_cfg.get(profile, self.INPAINT_RETRY_POLICY_DEFAULT[profile])
             self.depth_retry_policy_vars[profile] = {
                 "garbage_collection_threshold": tk.BooleanVar(
                     value=bool(dcfg.get("garbage_collection_threshold", True))
@@ -943,10 +1003,10 @@ class PipelineMasterGUI:
             self.scene_crf_var.set("1")
         if self.scene_encoder_preset_var.get().strip().lower() in {"", "veryfast"}:
             self.scene_encoder_preset_var.set("fast")
-        if self.depth_chunk_size_var.get().strip() in {"", "110"}:
-            self.depth_chunk_size_var.set("70")
-        if self.depth_overlap_var.get().strip() in {"", "25"}:
-            self.depth_overlap_var.set("20")
+        if self.depth_chunk_size_var.get().strip() in {"", "70", "110"}:
+            self.depth_chunk_size_var.set("100")
+        if self.depth_overlap_var.get().strip() in {"", "15", "20", "25"}:
+            self.depth_overlap_var.set("15")
         if self.depth_inference_steps_var.get().strip() == "":
             self.depth_inference_steps_var.set("5")
         self.depth_scale_factor_var.set(
@@ -960,6 +1020,9 @@ class PipelineMasterGUI:
             "Local (system/custom path)",
         }:
             self.depth_realesrgan_source_var.set("Bundled (Utilities/realesrgan)")
+        self.depth_realesrgan_scale_var.set(
+            self._normalize_depth_realesrgan_scale(self.depth_realesrgan_scale_var.get())
+        )
         try:
             if int(self.depth_realesrgan_workers_var.get().strip()) < 1:
                 raise ValueError
@@ -971,19 +1034,26 @@ class PipelineMasterGUI:
             if int(self.splat_workers_var.get().strip()) < 1:
                 raise ValueError
         except Exception:
-            self.splat_workers_var.set("2")
+            self.splat_workers_var.set("4")
         if self.splat_layout_var.get().strip() not in {"Single Warp", "Dual", "Quad"}:
             self.splat_layout_var.set("Single Warp")
         if self.splat_auto_convergence_var.get().strip() not in {"Min Borders", "Off"}:
             self.splat_auto_convergence_var.set("Min Borders")
         if self.inpaint_mode_var.get().strip() not in {"Auto (recommended)", "Manual"}:
             self.inpaint_mode_var.set("Auto (recommended)")
+        if self.inpaint_mode_var.get().strip() == "Auto (recommended)":
+            self.inpaint_use_sharpen_var.set(True)
         if self.inpaint_frames_chunk_var.get().strip() == "":
-            self.inpaint_frames_chunk_var.set("50")
+            self.inpaint_frames_chunk_var.set("55")
         if self.inpaint_cpu_offload_var.get().strip() == "":
-            self.inpaint_cpu_offload_var.set("model")
+            self.inpaint_cpu_offload_var.set("none")
         if self.inpaint_inference_steps_var.get().strip() == "":
             self.inpaint_inference_steps_var.set("8")
+        try:
+            if int(self.inpaint_sharpen_workers_var.get().strip()) < 1:
+                raise ValueError
+        except Exception:
+            self.inpaint_sharpen_workers_var.set("19")
         self.depth_codec_var.set(
             self._normalize_ffmpeg_codec(
                 self.depth_codec_var.get(),
@@ -1028,9 +1098,7 @@ class PipelineMasterGUI:
         if self.merge_autoct_workers_var.get().strip() == "":
             self.merge_autoct_workers_var.set("8")
         if self.merge_mask_formerge_workers_var.get().strip() == "":
-            self.merge_mask_formerge_workers_var.set(
-                self.merge_autoct_workers_var.get().strip() or "8"
-            )
+            self.merge_mask_formerge_workers_var.set("19")
         if self.merge_parallel_workers_var.get().strip() == "":
             self.merge_parallel_workers_var.set("2")
         if self.merge_chunks_var.get().strip() == "":
@@ -1040,9 +1108,9 @@ class PipelineMasterGUI:
         if self.merge_mask_dilate_var.get().strip() == "":
             self.merge_mask_dilate_var.set("2")
         if self.merge_mask_blur_var.get().strip() == "":
-            self.merge_mask_blur_var.set("4")
+            self.merge_mask_blur_var.set("2")
         if self.merge_shadow_length_var.get().strip() == "":
-            self.merge_shadow_length_var.set("25")
+            self.merge_shadow_length_var.set("15")
         if self.merge_shadow_curve_var.get().strip() == "":
             self.merge_shadow_curve_var.set("0")
         if not bool(self.splat_replace_mask_var.get()):
@@ -1480,7 +1548,7 @@ class PipelineMasterGUI:
             row=2, column=2, padx=4
         )
 
-        ttk.Label(parent, text="Depth upscaled folder (auto):").grid(
+        ttk.Label(parent, text="Depth upscaled folder (optional/manual):").grid(
             row=3, column=0, sticky="w", pady=3
         )
         ttk.Entry(parent, textvariable=self.depth_upscaled_var, state="readonly").grid(
@@ -1579,19 +1647,43 @@ class PipelineMasterGUI:
             row=2, column=6, columnspan=2, sticky="w", padx=(6, 0), pady=(8, 0)
         )
 
+        self.depth_use_realesrgan_check = ttk.Checkbutton(
+            params_frame,
+            text="Use RealESRGAN Upscale",
+            variable=self.depth_use_realesrgan_upscale_var,
+            command=self._on_depth_realesrgan_toggle,
+        )
+        self.depth_use_realesrgan_check.grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        ttk.Label(params_frame, text="Scale:").grid(row=3, column=2, sticky="w", pady=(8, 0))
+        self.depth_realesrgan_scale_combo = ttk.Combobox(
+            params_frame,
+            textvariable=self.depth_realesrgan_scale_var,
+            values=list(self.DEPTH_REALESRGAN_SCALE_CHOICES),
+            width=8,
+            state="readonly",
+        )
+        self.depth_realesrgan_scale_combo.grid(
+            row=3, column=3, sticky="w", padx=(6, 12), pady=(8, 0)
+        )
+        self.depth_realesrgan_scale_combo.bind(
+            "<<ComboboxSelected>>", self._on_depth_realesrgan_scale_changed
+        )
+
         ttk.Label(params_frame, text="ESRGAN workers:").grid(
-            row=3, column=0, sticky="w", pady=(8, 0)
+            row=3, column=4, sticky="w", pady=(8, 0)
         )
         self.depth_realesrgan_workers_entry = ttk.Entry(
             params_frame, textvariable=self.depth_realesrgan_workers_var, width=8
         )
         self.depth_realesrgan_workers_entry.grid(
-            row=3, column=1, sticky="w", padx=(6, 12), pady=(8, 0)
+            row=3, column=5, sticky="w", padx=(6, 12), pady=(8, 0)
         )
         ttk.Label(
             params_frame,
-            text="Used by Run ESRGAN (editable in Auto mode).",
-        ).grid(row=3, column=2, columnspan=6, sticky="w", pady=(8, 0))
+            text="Manual-only optional step. In Auto it is disabled and skipped.",
+        ).grid(row=3, column=6, columnspan=2, sticky="w", pady=(8, 0))
 
         encode_frame = ttk.LabelFrame(parent, text="Encoding Args (inherited)", padding=8)
         encode_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
@@ -2101,7 +2193,7 @@ class PipelineMasterGUI:
         self._set_splat_running(False)
 
     def _build_inpaint_tab(self, parent: ttk.Frame) -> None:
-        parent.grid_rowconfigure(11, weight=1)
+        parent.grid_rowconfigure(12, weight=1)
         parent.grid_columnconfigure(1, weight=1)
 
         ttk.Label(parent, text="Inpaint input clips (auto):").grid(
@@ -2134,8 +2226,18 @@ class PipelineMasterGUI:
             row=2, column=2, padx=4
         )
 
+        ttk.Label(parent, text="Sharpen Output:").grid(
+            row=3, column=0, sticky="w", pady=3
+        )
+        ttk.Entry(parent, textvariable=self.inpaint_sharpen_output_var, state="readonly").grid(
+            row=3, column=1, sticky="ew", padx=6
+        )
+        ttk.Button(parent, text="Open", command=self._open_inpaint_sharpen_output_folder).grid(
+            row=3, column=2, padx=4
+        )
+
         mode_frame = ttk.LabelFrame(parent, text="Inpainting Mode", padding=8)
-        mode_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=6)
+        mode_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=6)
         mode_frame.grid_columnconfigure(3, weight=1)
 
         ttk.Label(mode_frame, text="Preset:").grid(row=0, column=0, sticky="w")
@@ -2164,7 +2266,7 @@ class PipelineMasterGUI:
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         params_frame = ttk.LabelFrame(parent, text="Inpainting Parameters", padding=8)
-        params_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=6)
+        params_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
         for col in range(10):
             params_frame.grid_columnconfigure(col, weight=0)
         params_frame.grid_columnconfigure(9, weight=1)
@@ -2233,8 +2335,26 @@ class PipelineMasterGUI:
             row=2, column=7, sticky="w", padx=(6, 12), pady=(8, 0)
         )
 
+        self.inpaint_sharpen_check = ttk.Checkbutton(
+            params_frame,
+            text="Sharpen",
+            variable=self.inpaint_use_sharpen_var,
+            command=self._on_inpaint_sharpen_toggle,
+        )
+        self.inpaint_sharpen_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        ttk.Label(params_frame, text="Sharpen workers:").grid(
+            row=3, column=2, sticky="w", pady=(8, 0)
+        )
+        self.inpaint_sharpen_workers_entry = ttk.Entry(
+            params_frame, textvariable=self.inpaint_sharpen_workers_var, width=8
+        )
+        self.inpaint_sharpen_workers_entry.grid(
+            row=3, column=3, sticky="w", padx=(6, 12), pady=(8, 0)
+        )
+
         encode_frame = ttk.LabelFrame(parent, text="Encoding Args (inherited)", padding=8)
-        encode_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
+        encode_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
         encode_frame.grid_columnconfigure(9, weight=1)
 
         self.inpaint_override_check = ttk.Checkbutton(
@@ -2278,14 +2398,14 @@ class PipelineMasterGUI:
         )
 
         cmd_frame = ttk.LabelFrame(parent, text="Command Preview", padding=8)
-        cmd_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
+        cmd_frame.grid(row=7, column=0, columnspan=3, sticky="ew", pady=6)
         cmd_frame.grid_columnconfigure(0, weight=1)
         ttk.Entry(cmd_frame, textvariable=self.inpaint_cmd_preview_var, state="readonly").grid(
             row=0, column=0, sticky="ew"
         )
 
         buttons = ttk.Frame(parent)
-        buttons.grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 6))
+        buttons.grid(row=8, column=0, columnspan=3, sticky="w", pady=(4, 6))
         self.inpaint_preview_btn = ttk.Button(
             buttons, text="Preview Command", command=self._preview_inpaint_command
         )
@@ -2298,24 +2418,36 @@ class PipelineMasterGUI:
             buttons, text="Run Inpainting", command=self._run_inpaint_placeholder
         )
         self.inpaint_run_btn.grid(row=0, column=2, padx=6)
+        self.inpaint_sharpen_run_btn = ttk.Button(
+            buttons, text="Run Sharpen", command=self._start_inpaint_sharpen
+        )
+        self.inpaint_sharpen_run_btn.grid(row=0, column=3, padx=6)
         self.inpaint_verify_quick_btn = ttk.Button(
             buttons, text="Verify Scenes (Quick)", command=self._start_inpaint_verify_quick
         )
-        self.inpaint_verify_quick_btn.grid(row=0, column=3, padx=6)
+        self.inpaint_verify_quick_btn.grid(row=0, column=4, padx=6)
         self.inpaint_verify_deep_btn = ttk.Button(
             buttons, text="Verify Scenes (Deep)", command=self._start_inpaint_verify_deep
         )
-        self.inpaint_verify_deep_btn.grid(row=0, column=4, padx=6)
+        self.inpaint_verify_deep_btn.grid(row=0, column=5, padx=6)
+        self.inpaint_sharpen_verify_quick_btn = ttk.Button(
+            buttons, text="Verify Sharpen (Quick)", command=self._start_inpaint_sharpen_verify_quick
+        )
+        self.inpaint_sharpen_verify_quick_btn.grid(row=0, column=6, padx=6)
+        self.inpaint_sharpen_verify_deep_btn = ttk.Button(
+            buttons, text="Verify Sharpen (Deep)", command=self._start_inpaint_sharpen_verify_deep
+        )
+        self.inpaint_sharpen_verify_deep_btn.grid(row=0, column=7, padx=6)
         self.inpaint_stop_btn = ttk.Button(
             buttons, text="Stop", command=self._stop_inpaint_placeholder, state=tk.DISABLED
         )
-        self.inpaint_stop_btn.grid(row=0, column=5, padx=6)
+        self.inpaint_stop_btn.grid(row=0, column=8, padx=6)
         ttk.Button(buttons, text="Clear Log", command=self._clear_inpaint_log).grid(
-            row=0, column=6, padx=6
+            row=0, column=9, padx=6
         )
 
         status_frame = ttk.Frame(parent)
-        status_frame.grid(row=8, column=0, columnspan=3, sticky="ew")
+        status_frame.grid(row=9, column=0, columnspan=3, sticky="ew")
         status_frame.grid_columnconfigure(1, weight=1)
         status_frame.grid_columnconfigure(2, weight=1)
         ttk.Label(status_frame, text="Status:").grid(row=0, column=0, sticky="w")
@@ -2332,7 +2464,7 @@ class PipelineMasterGUI:
         self.inpaint_progress.grid(row=0, column=2, sticky="ew", padx=4)
 
         log_frame = ttk.LabelFrame(parent, text="Inpainting Log", padding=6)
-        log_frame.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+        log_frame.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
         log_frame.grid_rowconfigure(0, weight=1)
         log_frame.grid_columnconfigure(0, weight=1)
 
@@ -2376,6 +2508,13 @@ class PipelineMasterGUI:
         os.makedirs(folder, exist_ok=True)
         self._append_inpaint_log(f"Inpaint output folder ready: {folder}")
 
+    def _open_inpaint_sharpen_output_folder(self) -> None:
+        folder = self.inpaint_sharpen_output_var.get().strip()
+        if not folder:
+            return
+        os.makedirs(folder, exist_ok=True)
+        self._append_inpaint_log(f"Sharpen output folder ready: {folder}")
+
     def _on_inpaint_mode_changed(self, _event=None) -> None:
         mode = self.inpaint_mode_var.get().strip()
         if mode == "Manual":
@@ -2393,10 +2532,19 @@ class PipelineMasterGUI:
         self.inpaint_overlap_var.set("3")
         self.inpaint_tail_pad_var.set("2")
         self.inpaint_use_sharpness_csv_var.set(True)
+        self.inpaint_use_sharpen_var.set(True)
         self.inpaint_inference_steps_var.set("8")
 
     def _on_inpaint_auto_steps_toggle(self) -> None:
         self._apply_inpaint_control_states()
+
+    def _on_inpaint_sharpen_toggle(self) -> None:
+        self._apply_inpaint_control_states()
+
+    def _sharpen_step_enabled_in_current_mode(self) -> bool:
+        if self.inpaint_mode_var.get().strip() == "Auto (recommended)":
+            return True
+        return bool(self.inpaint_use_sharpen_var.get())
 
     def _apply_inpaint_control_states(self) -> None:
         mode_manual = self.inpaint_mode_var.get().strip() == "Manual"
@@ -2414,6 +2562,20 @@ class PipelineMasterGUI:
         else:
             self.inpaint_inference_steps_entry.configure(state=tk.DISABLED)
 
+        sharpen_manual_state = tk.NORMAL if mode_manual else tk.DISABLED
+        self.inpaint_sharpen_check.configure(state=sharpen_manual_state)
+        sharpen_workers_state = tk.NORMAL if (
+            self.inpaint_mode_var.get().strip() == "Auto (recommended)"
+            or bool(self.inpaint_use_sharpen_var.get())
+        ) else tk.DISABLED
+        self.inpaint_sharpen_workers_entry.configure(state=sharpen_workers_state)
+        sharpen_buttons_state = tk.NORMAL if self._sharpen_step_enabled_in_current_mode() else tk.DISABLED
+        self.inpaint_sharpen_run_btn.configure(state=sharpen_buttons_state)
+        if not (self._inpaint_thread and self._inpaint_thread.is_alive()) and not self._verify_running:
+            self.inpaint_sharpen_verify_quick_btn.configure(state=sharpen_buttons_state)
+            self.inpaint_sharpen_verify_deep_btn.configure(state=sharpen_buttons_state)
+
+        self._update_replace_mask_dependent_controls()
         self._preview_inpaint_command()
         self._refresh_pipeline_status_panel()
 
@@ -2823,6 +2985,592 @@ class PipelineMasterGUI:
                     pass
             self._log_queue.put(("inpaint_done", {"step": "sharpness_csv", "success": step_success}))
 
+    def _build_inpaint_sharpen_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
+        output_dir = self.inpaint_sharpen_output_var.get().strip()
+        codec_value = self._normalize_ffmpeg_codec(
+            self.inpaint_codec_var.get(),
+            self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
+        )
+        self.inpaint_codec_var.set(codec_value)
+        env_updates: dict[str, str] = {
+            "PYTHON": sys.executable,
+            "RUNNER": "batch_inpaint_sharpen_runner.py",
+            "INPUT_DIR": self.inpaint_output_var.get().strip(),
+            "MASK_DIR": self.inpaint_mask_var.get().strip(),
+            "OUTPUT_DIR": output_dir,
+            "SHARPNESS_CSV_PATH": self.inpaint_sharpness_csv_var.get().strip(),
+            "GLOB": "*.mp4",
+            "WORKERS": self.inpaint_sharpen_workers_var.get().strip() or "19",
+            "STOP_MARKER": os.path.join(
+                output_dir or os.path.join(
+                    self.work_folder_var.get().strip() or "./work",
+                    self.STANDARD_SUBDIRS["inpaint_sharpen"],
+                ),
+                ".stop_after_current",
+            ),
+            "SKIP_EXISTING": "1",
+            "OUTPUT_CODEC": codec_value,
+            "OUTPUT_PRESET": self.inpaint_preset_var.get().strip(),
+            "OUTPUT_PIX_FMT": self.inpaint_pix_fmt_var.get().strip(),
+            "OUTPUT_CRF": self.inpaint_crf_var.get().strip() or "0",
+            "OUTPUT_EXTRA_ARGS": self.inpaint_extra_ffmpeg_args_var.get().strip(),
+        }
+        cmd = ["bash", "run_inpaint_sharpen_runner.sh"]
+        preview = " ".join(
+            [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
+            + [shlex.quote(x) for x in cmd]
+        )
+        return cmd, env_updates, preview
+
+    def _start_inpaint_sharpen(self, resume_after_sharpness: bool = False) -> None:
+        self._inpaint_resume_after_sharpen = False
+        if self._inpaint_thread and self._inpaint_thread.is_alive():
+            messagebox.showinfo("Sharpen", "Another inpainting/sharpen task is running.")
+            return
+        if self._verify_running:
+            messagebox.showinfo("Sharpen", "Stop verification before running Sharpen.")
+            return
+        if not self._sharpen_step_enabled_in_current_mode():
+            messagebox.showinfo("Sharpen", "Sharpen is disabled in Manual mode.")
+            return
+        try:
+            cmd, env_updates, _preview = self._build_inpaint_sharpen_runner_payload()
+        except Exception as exc:
+            messagebox.showerror("Sharpen", f"Invalid sharpen options:\n{exc}")
+            return
+
+        launcher_script = Path("run_inpaint_sharpen_runner.sh").resolve()
+        if not launcher_script.is_file():
+            messagebox.showerror("Sharpen", f"Launcher not found:\n{launcher_script}")
+            return
+        runner_script = Path(env_updates.get("RUNNER", "batch_inpaint_sharpen_runner.py")).resolve()
+        if not runner_script.is_file():
+            messagebox.showerror("Sharpen", f"Runner not found:\n{runner_script}")
+            return
+
+        input_dir = self.inpaint_output_var.get().strip()
+        mask_dir = self.inpaint_mask_var.get().strip()
+        output_dir = self.inpaint_sharpen_output_var.get().strip()
+        if not input_dir or not os.path.isdir(input_dir):
+            messagebox.showerror("Sharpen", f"Inpaint output folder not found:\n{input_dir or '(empty)'}")
+            return
+        if not mask_dir or not os.path.isdir(mask_dir):
+            messagebox.showerror("Sharpen", f"Mask folder not found:\n{mask_dir or '(empty)'}")
+            return
+        if not output_dir:
+            messagebox.showerror("Sharpen", "Sharpen output folder is required.")
+            return
+        os.makedirs(output_dir, exist_ok=True)
+
+        mask_supported = self._is_splat_replace_mask_active()
+        has_masks = self._has_any_replace_masks(mask_dir)
+        if not mask_supported or not has_masks:
+            messagebox.showerror(
+                "Sharpen",
+                (
+                    "Sharpen requires replace masks exported in Splatting.\n"
+                    "Enable Replace mask in Splatting and ensure mask files exist in work/mask."
+                ),
+            )
+            return
+
+        sharp_csv_path = self.inpaint_sharpness_csv_var.get().strip()
+        if not sharp_csv_path:
+            sharp_csv_path = str(
+                Path(self.work_folder_var.get().strip() or "./work").resolve() / "sharpness.csv"
+            )
+            self.inpaint_sharpness_csv_var.set(sharp_csv_path)
+
+        sharp_ok, sharp_msg, sharp_missing = self._verify_sharpness_csv_coverage(
+            self.inpaint_input_var.get().strip(),
+            sharp_csv_path,
+        )
+        if not sharp_ok:
+            if not self._pipeline_test_active:
+                self._pipeline_set_completed("sharpness_csv", False)
+                self._pipeline_set_verified("sharpness_csv", "none")
+                self._refresh_pipeline_status_panel()
+                self._save_pipeline_state()
+            self._append_inpaint_log(f"[SHARP][VERIFY] {sharp_msg}")
+            if sharp_missing:
+                preview = "\n".join(sharp_missing[:12])
+                more = "" if len(sharp_missing) <= 12 else f"\n... and {len(sharp_missing) - 12} more"
+                self._append_inpaint_log(f"[SHARP][VERIFY] Missing rows:\n{preview}{more}")
+            messagebox.showwarning(
+                "Sharpen",
+                (
+                    f"{sharp_msg}\n\n"
+                    "Sharpness CSV will be regenerated now before Sharpen."
+                ),
+            )
+            self.inpaint_status_var.set("Sharpness CSV incomplete, rebuilding...")
+            self._inpaint_resume_after_sharpen = True
+            self._start_inpaint_sharpness_csv(resume_inpaint_after=False)
+            return
+
+        expected_sharpen, sharpen_err = self._collect_expected_sharpen_outputs(
+            self.inpaint_input_var.get().strip(),
+            sharp_csv_path,
+        )
+        if sharpen_err:
+            messagebox.showerror("Sharpen", sharpen_err)
+            return
+        if not expected_sharpen:
+            self._append_inpaint_log("[SHARPEN] 0 eligible scenes (sharpness <= 7 for all inputs).")
+            self.inpaint_status_var.set("Sharpen completed (0 eligible scenes)")
+            self.inpaint_progress_var.set(100.0)
+            self._pipeline_on_run_finished("sharpen", True)
+            return
+
+        self._inpaint_resume_after_sharpen = False
+        self._inpaint_stop_requested = False
+        self._inpaint_stop_clicks = 0
+        self.inpaint_status_var.set("Running Sharpen...")
+        self.inpaint_progress_var.set(0.0)
+        self._set_inpaint_running(True)
+        if not self._pipeline_test_active:
+            self._pipeline_invalidate_from("sharpen")
+        self._append_inpaint_log("=== Sharpen started ===")
+        self._append_inpaint_log("CMD: " + " ".join(shlex.quote(x) for x in cmd))
+        self._append_inpaint_log(
+            "ENV: " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
+        )
+        self._inpaint_thread = threading.Thread(
+            target=self._run_inpaint_sharpen_worker,
+            args=(cmd, env_updates),
+            daemon=True,
+        )
+        self._inpaint_thread.start()
+
+    def _run_inpaint_sharpen_worker(self, cmd: list[str], env_updates: dict[str, str]) -> None:
+        proc = None
+        step_success = False
+        try:
+            env = os.environ.copy()
+            env.update({k: str(v) for k, v in env_updates.items()})
+            preexec = os.setsid if hasattr(os, "setsid") else None
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                env=env,
+                preexec_fn=preexec,
+            )
+            self._inpaint_process = proc
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip("\n")
+                if line:
+                    self._log_queue.put(("inpaint_line", f"[SHARPEN] {line}"))
+                    self._try_parse_inpaint_progress(line)
+                if self._inpaint_stop_requested:
+                    break
+            rc = proc.wait()
+            if self._inpaint_stop_requested:
+                self._log_queue.put(("inpaint_status", "Sharpen stopped by user"))
+            elif rc == 0:
+                step_success = True
+                self._log_queue.put(("inpaint_status", "Sharpen completed"))
+                self._log_queue.put(("inpaint_progress", "100"))
+            else:
+                self._log_queue.put(("inpaint_status", f"Sharpen failed (exit {rc})"))
+        except Exception as exc:
+            self._log_queue.put(("inpaint_line", f"[SHARPEN][ERROR] {exc}"))
+            self._log_queue.put(("inpaint_status", "Sharpen failed"))
+        finally:
+            self._inpaint_process = None
+            if proc and proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            self._log_queue.put(("inpaint_done", {"step": "sharpen", "success": step_success}))
+
+    def _preferred_inpainted_dir_for_consumers(self) -> str:
+        if not self._sharpen_step_enabled_in_current_mode():
+            return ""
+        return self.inpaint_sharpen_output_var.get().strip()
+
+    def _prepare_named_verify_subset_dir(
+        self,
+        folder: str,
+        tag: str,
+        names: Sequence[str],
+    ) -> str:
+        resolved = str(Path(folder).resolve()) if folder else str(folder)
+        if not resolved or not os.path.isdir(resolved):
+            return resolved
+        wanted = sorted({str(x).strip() for x in (names or []) if str(x).strip()})
+        if not wanted:
+            return resolved
+        if self._pipeline_test_active:
+            root_dir = Path(self._pipeline_test_dir or "")
+            if not root_dir.is_dir():
+                return resolved
+            subset_root = root_dir / "_verify_subset_named"
+        else:
+            subset_root = Path(self.work_folder_var.get().strip() or "./work").resolve() / ".verify_subset_named"
+        safe_tag = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(tag).strip() or "verify")
+        subset_dir = subset_root / safe_tag
+        try:
+            if subset_dir.exists():
+                shutil.rmtree(subset_dir, ignore_errors=True)
+            subset_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return resolved
+        linked = 0
+        for name in wanted:
+            src = Path(resolved) / name
+            if src.is_file() and self._pipeline_link_or_copy_file(src, subset_dir / src.name):
+                linked += 1
+        if linked <= 0:
+            return resolved
+        return str(subset_dir.resolve())
+
+    def _match_reference_files_for_targets(
+        self,
+        target_names: Sequence[str],
+        ref_dir: str,
+        ref_patterns: Sequence[str],
+    ) -> tuple[list[str], list[str]]:
+        ref_files = self._collect_files_for_patterns(ref_dir, list(ref_patterns))
+        exact_idx, norm_idx = self._quick_verify_build_name_indexes(ref_files)
+        matched_refs: list[str] = []
+        missing_refs: list[str] = []
+        for name in target_names:
+            target_path = str(Path(name))
+            ref_path, _how = self._quick_verify_match_reference_path(
+                target_path,
+                exact_idx,
+                norm_idx,
+            )
+            if ref_path:
+                matched_refs.append(ref_path)
+            else:
+                missing_refs.append(str(name))
+        matched_refs = sorted({str(p) for p in matched_refs if str(p).strip()})
+        return matched_refs, missing_refs
+
+    def _validate_inpaint_sharpen_verify_inputs(
+        self,
+    ) -> tuple[bool, str, str, list[str], list[str], list[str]]:
+        sharp_csv_path = self.inpaint_sharpness_csv_var.get().strip()
+        expected_names, err = self._collect_expected_sharpen_outputs(
+            self.inpaint_input_var.get().strip(),
+            sharp_csv_path,
+        )
+        if err:
+            messagebox.showerror("Verify Sharpen", err)
+            return False, "", "", [], [], []
+        if not expected_names:
+            return True, "", "", [], [], []
+        out_dir = self.inpaint_sharpen_output_var.get().strip()
+        if not out_dir:
+            messagebox.showerror("Verify Sharpen", "Sharpen output folder is required.")
+            return False, "", "", [], [], []
+        if not os.path.isdir(out_dir):
+            messagebox.showerror("Verify Sharpen", f"Sharpen output folder not found:\n{out_dir}")
+            return False, "", "", [], [], []
+        ok_ref, ref_dir, ref_patterns, ref_kind = self._resolve_verify_reference(
+            "sharpen", "Verify Sharpen"
+        )
+        if not ok_ref:
+            return False, "", "", [], [], []
+        out_dir = self._pipeline_prepare_verify_subset_dir(
+            out_dir, "sharpen_target", ["*.mp4"]
+        )
+        self._append_inpaint_log(f"[VERIFY] reference source: {ref_kind} ({ref_dir})")
+        return True, out_dir, ref_dir, list(ref_patterns), expected_names, []
+
+    def _start_inpaint_sharpen_verify_quick(self) -> None:
+        if self._inpaint_thread and self._inpaint_thread.is_alive():
+            messagebox.showinfo("Verify Sharpen", "Stop Sharpen before running verification.")
+            return
+        if self._verify_running:
+            messagebox.showinfo("Verify Sharpen", "Another verification is already running.")
+            return
+        ok, out_dir, ref_dir, ref_patterns, expected_names, _unused = self._validate_inpaint_sharpen_verify_inputs()
+        if not ok:
+            return
+        if not expected_names:
+            self.inpaint_status_var.set("Verify Sharpen (Quick) completed")
+            messagebox.showinfo("Verify Sharpen (Quick)", "0 eligible scenes.")
+            self._pipeline_on_verify_finished("sharpen", True, "quick")
+            return
+        if shutil.which("ffprobe") is None:
+            messagebox.showerror("Verify Sharpen", "ffprobe not found in PATH.")
+            return
+
+        self._set_verify_running(True, mode="sharpen_quick")
+        self.inpaint_status_var.set("Verify Sharpen (Quick) running...")
+        self._append_inpaint_log("=== Verify Sharpen (Quick) started ===")
+        self._verify_thread = threading.Thread(
+            target=self._run_inpaint_sharpen_verify_quick_worker,
+            args=(out_dir, ref_dir, ref_patterns, expected_names),
+            daemon=True,
+        )
+        self._verify_thread.start()
+
+    def _run_inpaint_sharpen_verify_quick_worker(
+        self,
+        out_dir: str,
+        ref_dir: str,
+        ref_patterns: list[str],
+        expected_names: list[str],
+    ) -> None:
+        try:
+            root = Path(out_dir)
+            target_files = [str(root / name) for name in expected_names if (root / name).is_file()]
+            missing_output = [name for name in expected_names if not (root / name).is_file()]
+            matched_refs, missing_refs = self._match_reference_files_for_targets(
+                expected_names,
+                ref_dir,
+                ref_patterns,
+            )
+            if not target_files and not missing_output:
+                self._log_queue.put(("sharpen_verify_quick_result", {
+                    "ok": True,
+                    "message": "0 eligible scenes.",
+                    "broken_output": [],
+                    "broken_reference": [],
+                    "missing_output": [],
+                }))
+                return
+
+            ref_files = list(matched_refs)
+            if not ref_files:
+                self._log_queue.put(("sharpen_verify_quick_result", {
+                    "ok": False,
+                    "message": "No reference replace-mask files found.",
+                    "broken_output": [],
+                    "broken_reference": [],
+                    "missing_output": missing_output + list(missing_refs),
+                }))
+                return
+
+            max_workers = self._get_verify_scenes_workers()
+            self._log_queue.put(
+                ("inpaint_line", f"[SHARPEN][QUICK] checking eligible output files={len(target_files)} and reference files={len(ref_files)} with {max_workers} workers")
+            )
+            out_stats = self._quick_verify_probe_group(
+                target_files,
+                max_workers,
+                "inpaint_line",
+                "output",
+                "[SHARPEN][QUICK]",
+            )
+            ref_stats = self._quick_verify_probe_group(
+                ref_files,
+                max_workers,
+                "inpaint_line",
+                "reference",
+                "[SHARPEN][QUICK]",
+            )
+            pair_stats = self._quick_verify_collect_packet_mismatch_targets(
+                target_files,
+                ref_files,
+                out_stats.get("meta_by_path", {}),
+                ref_stats.get("meta_by_path", {}),
+                frame_tol=1,
+            )
+            packet_mismatch_output = pair_stats.get("mismatch_targets") or []
+            unmatched_output = pair_stats.get("unmatched_targets") or []
+            missing_reference = sorted(
+                set((pair_stats.get("missing_reference") or []) + list(missing_refs))
+            )
+            broken_output = sorted(set((out_stats.get("broken") or []) + packet_mismatch_output))
+
+            frames_ok = False
+            frames_msg = "n.d."
+            if out_stats["frames_available"] and ref_stats["frames_available"]:
+                df = abs(int(out_stats["total_frames"]) - int(ref_stats["total_frames"]))
+                frames_ok = df <= 1
+                frames_msg = (
+                    f"output={int(out_stats['total_frames'])} vs "
+                    f"reference={int(ref_stats['total_frames'])} (delta={df})"
+                )
+            ok_final = (
+                not missing_output
+                and not broken_output
+                and not ref_stats["broken"]
+                and not unmatched_output
+                and not missing_reference
+                and (frames_ok or frames_msg == "n.d.")
+            )
+            message = (
+                f"Sharpen quick verify completed.\n"
+                f"Eligible scenes: {len(expected_names)}\n"
+                f"Present output files: {len(target_files)}\n"
+                f"Missing output files: {len(missing_output)}\n"
+                f"Broken output files: {len(out_stats['broken'])}\n"
+                f"Packet mismatch output files: {len(packet_mismatch_output)}\n"
+                f"Unmatched output files: {len(unmatched_output)}\n"
+                f"Missing reference files: {len(missing_reference)}\n"
+                f"Broken reference files: {len(ref_stats['broken'])}\n"
+                f"Packet details: {frames_msg}"
+            )
+            self._log_queue.put(("sharpen_verify_quick_result", {
+                "ok": ok_final,
+                "message": message,
+                "broken_output": broken_output,
+                "broken_reference": ref_stats["broken"],
+                "missing_output": missing_output,
+            }))
+        except Exception as e:
+            self._log_queue.put(("sharpen_verify_quick_result", {
+                "ok": False,
+                "message": f"Sharpen quick verify failed: {type(e).__name__}: {e}",
+                "broken_output": [],
+                "broken_reference": [],
+                "missing_output": [],
+            }))
+        finally:
+            self._log_queue.put(("verify_done", "sharpen_quick"))
+
+    def _start_inpaint_sharpen_verify_deep(self) -> None:
+        if self._inpaint_thread and self._inpaint_thread.is_alive():
+            messagebox.showinfo("Verify Sharpen", "Stop Sharpen before running verification.")
+            return
+        if self._verify_running:
+            messagebox.showinfo("Verify Sharpen", "Another verification is already running.")
+            return
+        ok, out_dir, ref_dir, ref_patterns, expected_names, _unused = self._validate_inpaint_sharpen_verify_inputs()
+        if not ok:
+            return
+        if not expected_names:
+            self.inpaint_status_var.set("Verify Sharpen (Deep) completed")
+            messagebox.showinfo("Verify Sharpen (Deep)", "0 eligible scenes.")
+            self._pipeline_on_verify_finished("sharpen", True, "deep")
+            return
+
+        missing_output = [
+            name for name in expected_names if not (Path(out_dir) / name).is_file()
+        ]
+        if missing_output:
+            messagebox.showwarning(
+                "Verify Sharpen (Deep)",
+                "Missing eligible sharpen outputs:\n\n" + "\n".join(missing_output[:20]),
+            )
+            self._pipeline_on_verify_finished("sharpen", False, "deep")
+            return
+
+        script_path = Path("Utilities/verifyscenes.py").resolve()
+        if not script_path.is_file():
+            messagebox.showerror("Verify Sharpen", f"Script not found:\n{script_path}")
+            return
+
+        stage_out_dir = self._prepare_named_verify_subset_dir(
+            out_dir,
+            "sharpen_target",
+            expected_names,
+        )
+        matched_refs, missing_refs = self._match_reference_files_for_targets(
+            expected_names,
+            ref_dir,
+            ref_patterns,
+        )
+        if missing_refs:
+            messagebox.showwarning(
+                "Verify Sharpen (Deep)",
+                "Missing replace-mask references for eligible sharpen outputs:\n\n"
+                + "\n".join(missing_refs[:20]),
+            )
+            self._pipeline_on_verify_finished("sharpen", False, "deep")
+            return
+        stage_ref_dir = self._prepare_named_verify_subset_dir(
+            ref_dir,
+            "sharpen_ref",
+            [Path(p).name for p in matched_refs],
+        )
+
+        workers = self._get_verify_scenes_workers()
+        cmd = [
+            sys.executable,
+            str(script_path),
+            str(Path(stage_out_dir).resolve()),
+            str(Path(stage_ref_dir).resolve()),
+            "--extensions",
+            self.VERIFY_ALL_VIDEO_EXTENSIONS,
+            "--workers",
+            str(workers),
+            "--probe-timeout-sec",
+            str(self.VERIFY_DEEP_FFPROBE_TIMEOUT_SEC),
+            "--probe-timeout-retries",
+            str(self.VERIFY_DEEP_FFPROBE_TIMEOUT_RETRIES),
+            "--delete",
+            "yes",
+            "--no-single-line-progress",
+        ]
+
+        self._set_verify_running(True, mode="sharpen_deep")
+        self.inpaint_status_var.set("Verify Sharpen (Deep) running...")
+        self._append_inpaint_log("=== Verify Sharpen (Deep) started ===")
+        self._append_inpaint_log("CMD: " + " ".join(shlex.quote(x) for x in cmd))
+        self._verify_thread = threading.Thread(
+            target=self._run_inpaint_sharpen_verify_deep_worker,
+            args=(cmd, str(Path(out_dir).resolve()), str(Path(stage_out_dir).resolve())),
+            daemon=True,
+        )
+        self._verify_thread.start()
+
+    def _run_inpaint_sharpen_verify_deep_worker(
+        self,
+        cmd: list[str],
+        original_out_dir: str,
+        staged_out_dir: str,
+    ) -> None:
+        rc = 1
+        bad_files: list[str] = []
+        seen_bad: set[str] = set()
+        try:
+            if self._verify_stop_requested:
+                raise VerifyStopRequested()
+            proc = self._verify_popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+            assert proc.stdout is not None
+            try:
+                for raw in proc.stdout:
+                    if self._verify_stop_requested:
+                        raise VerifyStopRequested()
+                    line = raw.rstrip("\n")
+                    if line:
+                        self._log_queue.put(("inpaint_line", f"[SHARPEN][DEEP] {line}"))
+                        bad_path = self._resolve_verifyscenes_bad_path(line, staged_out_dir)
+                        if bad_path:
+                            orig = str(Path(original_out_dir) / Path(bad_path).name)
+                            if orig not in seen_bad:
+                                seen_bad.add(orig)
+                                bad_files.append(orig)
+                rc = proc.wait()
+            finally:
+                self._unregister_verify_process(proc)
+        except VerifyStopRequested:
+            rc = 1
+        except Exception as e:
+            self._log_queue.put(("inpaint_line", f"[SHARPEN][DEEP][ERROR] {type(e).__name__}: {e}"))
+            rc = 1
+        finally:
+            self._log_queue.put(
+                (
+                    "sharpen_verify_deep_result",
+                    {
+                        "rc": rc,
+                        "stopped": bool(self._verify_stop_requested),
+                        "bad_files": bad_files,
+                    },
+                )
+            )
+            self._log_queue.put(("verify_done", "sharpen_deep"))
+
     def _stop_inpaint_placeholder(self, prompt_user: bool = True) -> None:
         running = bool(self._inpaint_thread and self._inpaint_thread.is_alive())
         if not running:
@@ -2884,10 +3632,19 @@ class PipelineMasterGUI:
         self.inpaint_preview_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
         self.inpaint_sharp_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
         self.inpaint_run_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
+        sharpen_run_state = tk.DISABLED if (is_running or not self._sharpen_step_enabled_in_current_mode()) else tk.NORMAL
+        self.inpaint_sharpen_run_btn.configure(state=sharpen_run_state)
         self.inpaint_stop_btn.configure(state=tk.NORMAL if is_running else tk.DISABLED)
         verify_state = tk.DISABLED if (is_running or self._verify_running) else tk.NORMAL
         self.inpaint_verify_quick_btn.configure(state=verify_state)
         self.inpaint_verify_deep_btn.configure(state=verify_state)
+        sharpen_verify_state = (
+            tk.DISABLED
+            if (is_running or self._verify_running or not self._sharpen_step_enabled_in_current_mode())
+            else tk.NORMAL
+        )
+        self.inpaint_sharpen_verify_quick_btn.configure(state=sharpen_verify_state)
+        self.inpaint_sharpen_verify_deep_btn.configure(state=sharpen_verify_state)
         if is_running:
             self.inpaint_stop_btn.configure(text="Stop")
         else:
@@ -3634,17 +4391,15 @@ class PipelineMasterGUI:
             self.merge_mode_var.set("Auto (recommended)")
             self.merge_info_text_var.set(self.MERGE_AUTO_INFO)
             self.merge_autoct_workers_var.set("8")
-            self.merge_mask_formerge_workers_var.set(
-                self.merge_autoct_workers_var.get().strip() or "8"
-            )
+            self.merge_mask_formerge_workers_var.set("19")
             self.merge_parallel_workers_var.set("2")
             self.merge_use_gpu_var.set(False)
             self.merge_output_format_var.set("Full SBS")
             self.merge_chunks_var.set("20")
             self.merge_mask_binarize_var.set("0.5")
             self.merge_mask_dilate_var.set("2")
-            self.merge_mask_blur_var.set("4")
-            self.merge_shadow_length_var.set("25")
+            self.merge_mask_blur_var.set("2")
+            self.merge_shadow_length_var.set("15")
             self.merge_shadow_curve_var.set("0")
             self.merge_shadow_motion_enabled_var.set(True)
             self.merge_dynamic_shadow_width_var.set(True)
@@ -3734,6 +4489,7 @@ class PipelineMasterGUI:
         workers = self._get_merge_worker_count()
         use_parallel = workers >= 2
         ct_mode = self.merge_ct_auto_mode_var.get().strip() or "CSV Blend"
+        preferred_inpainted_dir = self._preferred_inpainted_dir_for_consumers()
         output_format_ui = self.merge_output_format_var.get().strip()
         output_format_runner = (
             "Half SBS (Left-Right)"
@@ -3749,6 +4505,7 @@ class PipelineMasterGUI:
             "PYTHON": sys.executable,
             "RUNNER": "merging_nogui_batch_parallel.py" if use_parallel else "merging_nogui_batch.py",
             "INPAINTED_FOLDER": self.merge_inpainted_var.get().strip(),
+            "PREFERRED_INPAINTED_FOLDER": preferred_inpainted_dir,
             "SPLATTED_FOLDER": self.merge_splatted_var.get().strip(),
             "ORIGINAL_FOLDER": self.merge_original_var.get().strip(),
             "OUTPUT_FOLDER": output_dir,
@@ -4052,6 +4809,7 @@ class PipelineMasterGUI:
             try:
                 autoct_ok, autoct_msg, incomplete_scenes = self._verify_autoct_csv_packet_coverage(
                     inpainted_dir=env_updates.get("INPAINTED_FOLDER", "").strip(),
+                    preferred_inpainted_dir=env_updates.get("PREFERRED_INPAINTED_FOLDER", "").strip(),
                     splatted_dir=env_updates.get("SPLATTED_FOLDER", "").strip(),
                     replace_mask_dir=mask_dir,
                     csv_path=csv_path,
@@ -4182,6 +4940,7 @@ class PipelineMasterGUI:
             return
 
         inpainted = self.merge_inpainted_var.get().strip()
+        preferred_inpainted = self._preferred_inpainted_dir_for_consumers()
         splatted = self.merge_splatted_var.get().strip()
         original = self.merge_original_var.get().strip()
         out_csv = self.merge_autoct_csv_var.get().strip()
@@ -4256,6 +5015,13 @@ class PipelineMasterGUI:
             str(Path(mask_folder).resolve()),
             "--resume-validate-packets",
         ]
+        if preferred_inpainted and os.path.isdir(preferred_inpainted):
+            cmd.extend(
+                [
+                    "--preferred-inpainted-folder",
+                    str(Path(preferred_inpainted).resolve()),
+                ]
+            )
 
         self._merge_stop_requested = False
         self._merge_stop_clicks = 0
@@ -6407,7 +7173,10 @@ class PipelineMasterGUI:
             font=("TkDefaultFont", 11),
         ).grid(row=0, column=0, sticky="nsew")
 
-    def _retry_policy_default(self) -> dict[str, dict[str, object]]:
+    def _retry_policy_default(
+        self,
+        default_map: dict[str, dict[str, object]],
+    ) -> dict[str, dict[str, object]]:
         return {
             key: {
                 "garbage_collection_threshold": bool(cfg.get("garbage_collection_threshold", True)),
@@ -6416,7 +7185,7 @@ class PipelineMasterGUI:
                 "cpu_offload_inherited": bool(cfg.get("cpu_offload_inherited", True)),
                 "cpu_offload_mode": self._normalize_retry_offload_mode(cfg.get("cpu_offload_mode", "model")),
             }
-            for key, cfg in self.RETRY_POLICY_DEFAULT.items()
+            for key, cfg in default_map.items()
         }
 
     def _normalize_retry_max_split(self, value: object) -> str:
@@ -6441,9 +7210,11 @@ class PipelineMasterGUI:
         return "model"
 
     def _normalize_retry_policy_config(
-        self, data: object
+        self,
+        data: object,
+        default_map: dict[str, dict[str, object]],
     ) -> dict[str, dict[str, object]]:
-        out = self._retry_policy_default()
+        out = self._retry_policy_default(default_map)
         if not isinstance(data, dict):
             return out
         for profile in self.RETRY_POLICY_PROFILES:
@@ -6475,8 +7246,12 @@ class PipelineMasterGUI:
             }
         return out
 
-    def _retry_policy_from_config_key(self, key: str) -> dict[str, dict[str, object]]:
-        return self._normalize_retry_policy_config(self._config.get(key))
+    def _retry_policy_from_config_key(
+        self,
+        key: str,
+        default_map: dict[str, dict[str, object]],
+    ) -> dict[str, dict[str, object]]:
+        return self._normalize_retry_policy_config(self._config.get(key), default_map)
 
     def _collect_retry_policy_config_from_vars(
         self, vars_map: dict[str, dict[str, tk.Variable]]
@@ -6536,10 +7311,13 @@ class PipelineMasterGUI:
         return json.dumps(payload, separators=(",", ":"))
 
     def _set_retry_policy_vars_to_defaults(self) -> None:
-        defaults = self._retry_policy_default()
+        defaults_map = (
+            (self.depth_retry_policy_vars, self._retry_policy_default(self.DEPTH_RETRY_POLICY_DEFAULT)),
+            (self.inpaint_retry_policy_vars, self._retry_policy_default(self.INPAINT_RETRY_POLICY_DEFAULT)),
+        )
         for profile in self.RETRY_POLICY_PROFILES:
-            drow = defaults[profile]
-            for vars_map in (self.depth_retry_policy_vars, self.inpaint_retry_policy_vars):
+            for vars_map, defaults in defaults_map:
+                drow = defaults[profile]
                 row = vars_map[profile]
                 row["garbage_collection_threshold"].set(
                     bool(drow["garbage_collection_threshold"])
@@ -6670,7 +7448,8 @@ class PipelineMasterGUI:
         ttk.Label(
             depth_opts,
             text=(
-                "Bundled uses Utilities/realesrgan/realesrgan-ncnn-vulkan with anime 2x model.\n"
+                "Bundled uses Utilities/realesrgan/realesrgan-ncnn-vulkan with anime 2x or plus 4x model,\n"
+                "depending on the scale selected in the Depth tab.\n"
                 "Local uses your PATH/custom runtime configuration."
             ),
             justify="left",
@@ -7116,10 +7895,14 @@ class PipelineMasterGUI:
             scene_stems,
             ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"],
         )
-        state["depth_upscale"]["completed"] = self._pipeline_test_has_scene_outputs(
-            self.depth_upscaled_var.get().strip(),
-            scene_stems,
-            ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"],
+        state["depth_upscale"]["completed"] = (
+            self._pipeline_test_has_scene_outputs(
+                self.depth_upscaled_var.get().strip(),
+                scene_stems,
+                ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"],
+            )
+            if self._is_pipeline_step_required("depth_upscale")
+            else False
         )
         state["splatting"]["completed"] = self._pipeline_test_has_scene_outputs(
             self._resolve_splat_hires_dir(),
@@ -7132,6 +7915,21 @@ class PipelineMasterGUI:
             scene_stems,
             ["*_inpainted_right_eye.mp4", "*_inpainted_sbs.mp4"],
             must_contain="_inpainted_",
+        )
+        sharpen_expected, sharpen_err = self._collect_expected_sharpen_outputs(
+            self.inpaint_input_var.get().strip(),
+            self.inpaint_sharpness_csv_var.get().strip(),
+        )
+        state["sharpen"]["completed"] = bool(
+            not sharpen_err
+            and (
+                len(sharpen_expected) == 0
+                or self._count_named_existing_files(
+                    self.inpaint_sharpen_output_var.get().strip(),
+                    sharpen_expected,
+                )
+                >= len(sharpen_expected)
+            )
         )
         state["mask_for_merge"]["completed"] = self._pipeline_test_has_scene_outputs(
             self.merge_mask_formerge_var.get().strip(),
@@ -7161,6 +7959,7 @@ class PipelineMasterGUI:
             try:
                 ok, _msg, _missing = self._verify_autoct_csv_packet_coverage(
                     inpainted_dir=self.merge_inpainted_var.get().strip(),
+                    preferred_inpainted_dir=self._preferred_inpainted_dir_for_consumers(),
                     splatted_dir=self.merge_splatted_var.get().strip(),
                     replace_mask_dir=self.merge_replace_mask_var.get().strip(),
                     csv_path=self.merge_autoct_csv_var.get().strip(),
@@ -7197,6 +7996,7 @@ class PipelineMasterGUI:
             "inpaint_input_var",
             "inpaint_mask_var",
             "inpaint_output_var",
+            "inpaint_sharpen_output_var",
             "inpaint_sharpness_csv_var",
             "merge_inpainted_var",
             "merge_splatted_var",
@@ -7257,11 +8057,15 @@ class PipelineMasterGUI:
     def _is_pipeline_step_required(self, step: str) -> bool:
         if self._pipeline_test_active and step in {"mono_to_sbs", "join", "remux"}:
             return False
+        if step == "depth_upscale":
+            return self._depth_upscale_enabled_in_manual()
         if step == "sharpness_csv":
             return (
                 self.inpaint_mode_var.get().strip() == "Auto (recommended)"
                 or bool(self.inpaint_use_sharpness_csv_var.get())
             )
+        if step == "sharpen":
+            return self._sharpen_step_enabled_in_current_mode()
         if step == "autoct_csv":
             return self.merge_ct_auto_mode_var.get().strip() == "CSV Blend"
         return True
@@ -7286,7 +8090,10 @@ class PipelineMasterGUI:
                 if done_w is not None:
                     done_w.configure(text="-", fg="#999999")
                 if verify_w is not None:
-                    verify_w.configure(text="N/A", fg="#999999")
+                    verify_w.configure(
+                        text="Disabled" if step in {"depth_upscale", "sharpen"} else "N/A",
+                        fg="#999999",
+                    )
                 done_count += 1
                 continue
             if done:
@@ -7374,8 +8181,8 @@ class PipelineMasterGUI:
 
         # Depth defaults.
         self.depth_mode_var.set("Auto (recommended)")
-        self.depth_chunk_size_var.set("70")
-        self.depth_overlap_var.set("20")
+        self.depth_chunk_size_var.set("100")
+        self.depth_overlap_var.set("15")
         self.depth_inference_steps_var.set("5")
         self.depth_cpu_offload_var.set("model")
         self.depth_seed_var.set("42")
@@ -7389,6 +8196,8 @@ class PipelineMasterGUI:
         self.depth_encode_override_var.set(False)
         self.depth_extra_ffmpeg_args_var.set("")
         self.depth_realesrgan_source_var.set("Bundled (Utilities/realesrgan)")
+        self.depth_use_realesrgan_upscale_var.set(False)
+        self.depth_realesrgan_scale_var.set("2x")
         self.depth_realesrgan_workers_var.set(str(self.DEFAULT_DEPTH_REALESRGAN_WORKERS))
         self._on_depth_mode_changed()
         self._on_depth_override_toggle(initial=True)
@@ -7396,7 +8205,7 @@ class PipelineMasterGUI:
         # Splat defaults.
         self.splat_mode_var.set("Auto (recommended)")
         self.splat_batch_size_var.set("50")
-        self.splat_workers_var.set("2")
+        self.splat_workers_var.set("4")
         self.splat_disparity_var.set("20")
         self.splat_encode_override_var.set(False)
         self.splat_extra_ffmpeg_args_var.set("")
@@ -7405,9 +8214,11 @@ class PipelineMasterGUI:
 
         # Inpaint defaults.
         self.inpaint_mode_var.set("Auto (recommended)")
-        self.inpaint_frames_chunk_var.set("50")
-        self.inpaint_cpu_offload_var.set("model")
+        self.inpaint_frames_chunk_var.set("55")
+        self.inpaint_cpu_offload_var.set("none")
         self.inpaint_sharpness_workers_var.set("19")
+        self.inpaint_use_sharpen_var.set(True)
+        self.inpaint_sharpen_workers_var.set("19")
         self.inpaint_encode_override_var.set(False)
         self.inpaint_extra_ffmpeg_args_var.set("")
         self._on_inpaint_mode_changed()
@@ -7863,6 +8674,14 @@ class PipelineMasterGUI:
         depth_upscaled_count = self._count_video_files(self.depth_upscaled_var.get().strip())
         splat_count = self._count_video_files(self._resolve_splat_hires_dir())
         inpaint_count = self._count_video_files(self.inpaint_output_var.get().strip())
+        sharpen_expected, sharpen_err = self._collect_expected_sharpen_outputs(
+            self.inpaint_input_var.get().strip(),
+            self.inpaint_sharpness_csv_var.get().strip(),
+        )
+        sharpen_count = self._count_named_existing_files(
+            self.inpaint_sharpen_output_var.get().strip(),
+            sharpen_expected,
+        )
         mask_formerge_count = self._count_video_files(self.merge_mask_formerge_var.get().strip())
         merge_count = self._count_video_files(self.merge_output_var.get().strip())
         mono_to_sbs_ok, _mono_msg, _mono_broken_output, _mono_broken_reference = (
@@ -7881,7 +8700,12 @@ class PipelineMasterGUI:
             "depthcrafter", split_ok and split_ref_count > 0 and depth_count >= split_ref_count
         )
         self._pipeline_set_completed(
-            "depth_upscale", split_ok and split_ref_count > 0 and depth_upscaled_count >= split_ref_count
+            "depth_upscale",
+            (
+                split_ok and split_ref_count > 0 and depth_upscaled_count >= split_ref_count
+                if self._is_pipeline_step_required("depth_upscale")
+                else False
+            ),
         )
         self._pipeline_set_completed(
             "splatting", split_ok and split_ref_count > 0 and splat_count >= split_ref_count
@@ -7889,6 +8713,18 @@ class PipelineMasterGUI:
         self._pipeline_set_completed("sharpness_csv", sharp_done)
         self._pipeline_set_completed(
             "inpaint", split_ok and split_ref_count > 0 and inpaint_count >= split_ref_count
+        )
+        self._pipeline_set_completed(
+            "sharpen",
+            (
+                not sharpen_err
+                and (
+                    len(sharpen_expected) == 0
+                    or sharpen_count >= len(sharpen_expected)
+                )
+            )
+            if self._is_pipeline_step_required("sharpen")
+            else False,
         )
         self._pipeline_set_completed("autoct_csv", autoct_done)
         self._pipeline_set_completed(
@@ -8060,6 +8896,7 @@ class PipelineMasterGUI:
         test_splat_hires = test_splat_root / "hires"
         test_mask = test_root / "mask"
         test_output = test_root / "output"
+        test_output_sharpen = test_root / "output-sharpen"
         test_mask_formerge = test_root / "mask_for_merge"
         test_sbs = test_root / "sbs"
         test_final = test_root / "final"
@@ -8071,6 +8908,7 @@ class PipelineMasterGUI:
             test_splat_hires,
             test_mask,
             test_output,
+            test_output_sharpen,
             test_mask_formerge,
             test_sbs,
             test_final,
@@ -8092,6 +8930,7 @@ class PipelineMasterGUI:
             splat_hires_src = ""
         mask_src = prev_paths.get("splat_mask_output_var", "")
         inpaint_src = prev_paths.get("inpaint_output_var", "")
+        inpaint_sharpen_src = prev_paths.get("inpaint_sharpen_output_var", "")
         mask_formerge_src = prev_paths.get("merge_mask_formerge_var", "")
         merge_src = prev_paths.get("merge_output_var", "")
 
@@ -8129,6 +8968,13 @@ class PipelineMasterGUI:
             must_contain="_inpainted_",
         )
         self._pipeline_link_scene_files(
+            inpaint_sharpen_src,
+            str(test_output_sharpen),
+            ["*_inpainted_right_eye.mp4", "*_inpainted_sbs.mp4"],
+            scene_stems,
+            must_contain="_inpainted_",
+        )
+        self._pipeline_link_scene_files(
             mask_formerge_src,
             str(test_mask_formerge),
             ["*_replace_mask.*"],
@@ -8161,12 +9007,13 @@ class PipelineMasterGUI:
         self.depth_output_var.set(str(test_depth))
         self.depth_upscaled_var.set(str(test_depth_up))
         self.splat_input_clips_var.set(str(test_seg))
-        self.splat_input_depth_var.set(str(test_depth_up))
+        self._sync_depth_to_splat_input_path()
         self.splat_output_var.set(str(test_splat_root))
         self.splat_mask_output_var.set(str(test_mask))
         self.inpaint_input_var.set(str(test_splat_hires))
         self.inpaint_mask_var.set(str(test_mask))
         self.inpaint_output_var.set(str(test_output))
+        self.inpaint_sharpen_output_var.set(str(test_output_sharpen))
         self.inpaint_sharpness_csv_var.set(str(sharp_csv_test))
         self.merge_inpainted_var.set(str(test_output))
         self.merge_splatted_var.set(str(test_splat_hires))
@@ -8404,6 +9251,12 @@ class PipelineMasterGUI:
             must_contain="_inpainted_",
         )
         _sync_dir(
+            test_root / "output-sharpen",
+            "inpaint_sharpen_output_var",
+            ["*_inpainted_right_eye.mp4", "*_inpainted_sbs.mp4"],
+            must_contain="_inpainted_",
+        )
+        _sync_dir(
             test_root / "mask_for_merge",
             "merge_mask_formerge_var",
             ["*_replace_mask.*"],
@@ -8466,6 +9319,7 @@ class PipelineMasterGUI:
                 continue
             if var_name in prev_paths:
                 var_obj.set(str(prev_paths[var_name]))
+        self._sync_depth_to_splat_input_path()
 
         cleaned = False
         if test_root is not None and test_root.exists() and sync_errors == 0:
@@ -8646,6 +9500,10 @@ class PipelineMasterGUI:
             before = bool(self._inpaint_thread and self._inpaint_thread.is_alive())
             self._run_inpaint_placeholder()
             return bool(self._inpaint_thread and self._inpaint_thread.is_alive()) and not before
+        if step == "sharpen":
+            before = bool(self._inpaint_thread and self._inpaint_thread.is_alive())
+            self._start_inpaint_sharpen()
+            return bool(self._inpaint_thread and self._inpaint_thread.is_alive()) and not before
         if step == "autoct_csv":
             before = bool(self._merge_thread and self._merge_thread.is_alive())
             self._start_merge_autoct_csv()
@@ -8685,6 +9543,8 @@ class PipelineMasterGUI:
             self._start_splat_verify_deep() if mode == "deep" else self._start_splat_verify_quick()
         elif step == "inpaint":
             self._start_inpaint_verify_deep() if mode == "deep" else self._start_inpaint_verify_quick()
+        elif step == "sharpen":
+            self._start_inpaint_sharpen_verify_deep() if mode == "deep" else self._start_inpaint_sharpen_verify_quick()
         elif step == "mask_for_merge":
             self._start_merge_mask_verify_deep() if mode == "deep" else self._start_merge_mask_verify_quick()
         elif step == "merging":
@@ -8846,29 +9706,115 @@ class PipelineMasterGUI:
         mode = self.depth_mode_var.get().strip()
         if mode == "Manual":
             self.depth_info_text_var.set(self.DEPTH_MANUAL_INFO)
-            state_auto = tk.NORMAL
-            state_res = tk.NORMAL
         else:
             self.depth_mode_var.set("Auto (recommended)")
             self.depth_info_text_var.set(self.DEPTH_AUTO_INFO)
             self._reset_depth_auto_locked_defaults()
-            state_auto = tk.NORMAL
-            state_res = tk.DISABLED
+        self._apply_depth_control_states()
+
+    def _reset_depth_auto_locked_defaults(self) -> None:
+        # Fields disabled in Auto mode are informational and update dynamically.
+        self.depth_use_realesrgan_upscale_var.set(False)
+        self.depth_realesrgan_scale_var.set("2x")
+        self.depth_realesrgan_workers_var.set(str(self.DEFAULT_DEPTH_REALESRGAN_WORKERS))
+        self._update_depth_resolution_preview()
+
+    def _normalize_depth_realesrgan_scale(self, value: object) -> str:
+        txt = str(value or "").strip().lower()
+        if txt in {"2", "2x"}:
+            return "2x"
+        if txt in {"4", "4x"}:
+            return "4x"
+        return "2x"
+
+    def _depth_upscale_enabled_in_manual(self) -> bool:
+        return (
+            self.depth_mode_var.get().strip() == "Manual"
+            and bool(self.depth_use_realesrgan_upscale_var.get())
+        )
+
+    def _sync_depth_to_splat_input_path(self) -> None:
+        preferred = (
+            self.depth_upscaled_var.get().strip()
+            if self._depth_upscale_enabled_in_manual()
+            else self.depth_output_var.get().strip()
+        )
+        self.splat_input_depth_var.set(os.path.normpath(preferred) if preferred else "")
+
+    def _selected_depth_realesrgan_profile(self) -> tuple[str, str, str]:
+        choice = self._normalize_depth_realesrgan_scale(self.depth_realesrgan_scale_var.get())
+        if self.depth_realesrgan_scale_var.get().strip() != choice:
+            self.depth_realesrgan_scale_var.set(choice)
+        profile = self.DEPTH_REALESRGAN_MODEL_MAP.get(
+            choice,
+            self.DEPTH_REALESRGAN_MODEL_MAP["2x"],
+        )
+        return choice, str(profile["scale"]), str(profile["model"])
+
+    def _refresh_depth_action_buttons(self, is_running: bool | None = None) -> None:
+        if is_running is None:
+            is_running = bool(self._depth_thread and self._depth_thread.is_alive())
+        verify_active = bool(self._verify_running)
+        manual_upscale_enabled = self._depth_upscale_enabled_in_manual()
+        self.depth_preview_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
+        self.depth_run_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
+        self.depth_upscale_btn.configure(
+            state=(
+                tk.NORMAL
+                if (not is_running and not verify_active and manual_upscale_enabled)
+                else tk.DISABLED
+            )
+        )
+        verify_state = tk.DISABLED if (is_running or verify_active) else tk.NORMAL
+        self.depth_verify_quick_btn.configure(state=verify_state)
+        self.depth_verify_deep_btn.configure(state=verify_state)
+        upscale_verify_state = (
+            tk.NORMAL if (verify_state == tk.NORMAL and manual_upscale_enabled) else tk.DISABLED
+        )
+        self.depth_upscaled_verify_quick_btn.configure(state=upscale_verify_state)
+        self.depth_upscaled_verify_deep_btn.configure(state=upscale_verify_state)
+
+    def _apply_depth_control_states(self) -> None:
+        mode_manual = self.depth_mode_var.get().strip() == "Manual"
+        state_auto = tk.NORMAL
+        state_res = tk.NORMAL if mode_manual else tk.DISABLED
+        upscale_controls_enabled = self._depth_upscale_enabled_in_manual()
 
         self.depth_chunk_size_entry.configure(state=state_auto)
         self.depth_overlap_entry.configure(state=state_auto)
         self.depth_inference_steps_entry.configure(state=state_auto)
         self.depth_seed_entry.configure(state=state_auto)
         self.depth_scale_factor_scale.configure(state=state_auto)
-        self.depth_cpu_offload_combo.configure(state="readonly" if state_auto == tk.NORMAL else tk.DISABLED)
+        self.depth_cpu_offload_combo.configure(state="readonly")
         self.depth_res_x_entry.configure(state=state_res)
         self.depth_res_y_entry.configure(state=state_res)
+        self.depth_use_realesrgan_check.configure(
+            state=tk.NORMAL if mode_manual else tk.DISABLED
+        )
+        self.depth_realesrgan_scale_combo.configure(
+            state="readonly" if upscale_controls_enabled else tk.DISABLED
+        )
+        self.depth_realesrgan_workers_entry.configure(
+            state=tk.NORMAL if upscale_controls_enabled else tk.DISABLED
+        )
+
+        self._sync_depth_to_splat_input_path()
         self._update_depth_resolution_preview()
         self._preview_depth_command()
+        self._preview_splat_command()
+        self._refresh_depth_action_buttons()
+        self._refresh_pipeline_status_panel()
 
-    def _reset_depth_auto_locked_defaults(self) -> None:
-        # Fields disabled in Auto mode are informational and update dynamically.
-        self._update_depth_resolution_preview()
+    def _on_depth_realesrgan_toggle(self) -> None:
+        if self.depth_mode_var.get().strip() != "Manual":
+            self.depth_use_realesrgan_upscale_var.set(False)
+        self._apply_depth_control_states()
+
+    def _on_depth_realesrgan_scale_changed(self, _event=None) -> None:
+        self.depth_realesrgan_scale_var.set(
+            self._normalize_depth_realesrgan_scale(self.depth_realesrgan_scale_var.get())
+        )
+        self._preview_depth_command()
 
     def _normalize_depth_scale_factor(self, value) -> float:
         try:
@@ -9396,8 +10342,12 @@ class PipelineMasterGUI:
             return int(src_w), int(src_h)
         return None, None
 
-    def _resolve_depth_upscale_dest(self, scale_factor: float) -> str:
-        if abs(float(scale_factor) - 0.5) <= 1e-9:
+    def _resolve_depth_upscale_dest(
+        self,
+        scale_factor: float,
+        realesrgan_scale: float = 2.0,
+    ) -> str:
+        if abs(float(scale_factor) * float(realesrgan_scale) - 1.0) <= 1e-9:
             return ""
         ref_dir = self.depth_input_var.get().strip()
         if ref_dir and os.path.isdir(ref_dir):
@@ -9418,6 +10368,13 @@ class PipelineMasterGUI:
         ):
             return f"{src_w}x{src_h}"
         return ""
+
+    @staticmethod
+    def _realesrgan_model_files_exist(model_dir: str, model_name: str) -> bool:
+        if not model_dir or not model_name:
+            return False
+        root = Path(model_dir).expanduser()
+        return (root / f"{model_name}.bin").is_file() and (root / f"{model_name}.param").is_file()
 
     def _build_depth_upscale_payload(self) -> tuple[list[str], dict[str, str], str]:
         depth_codec = (self.depth_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC).lower()
@@ -9442,11 +10399,10 @@ class PipelineMasterGUI:
 
         in_dir = self.depth_output_var.get().strip()
         out_dir = self.depth_upscaled_var.get().strip()
-        scale = "2"
-        model = "realesr-animevideov3-x2"
+        _choice, scale, model = self._selected_depth_realesrgan_profile()
         tile = "auto"
         scale_factor = self._get_depth_scale_factor()
-        dest = self._resolve_depth_upscale_dest(scale_factor)
+        dest = self._resolve_depth_upscale_dest(scale_factor, float(scale))
         try:
             jobs_num = max(
                 1,
@@ -9487,6 +10443,15 @@ class PipelineMasterGUI:
         if self._verify_running:
             messagebox.showinfo("Depth Upscale", "Stop verification before running ESRGAN.")
             return
+        if not self._depth_upscale_enabled_in_manual():
+            messagebox.showinfo(
+                "Depth Upscale",
+                (
+                    "RealESRGAN is available only in Manual mode when "
+                    "`Use RealESRGAN Upscale` is enabled."
+                ),
+            )
+            return
         try:
             cmd, env_updates, _preview = self._build_depth_upscale_payload()
         except Exception as exc:
@@ -9523,6 +10488,31 @@ class PipelineMasterGUI:
                     "Depth Upscale",
                     f"Bundled RealESRGAN model dir not found:\n{model_dir or '(empty)'}",
                 )
+                return
+            model_name = str(cmd[5]).strip() if len(cmd) > 5 else ""
+            scale_choice, _scale, _model = self._selected_depth_realesrgan_profile()
+            if not self._realesrgan_model_files_exist(model_dir, model_name):
+                if scale_choice == "4x":
+                    messagebox.showerror(
+                        "Depth Upscale",
+                        (
+                            "Bundled RealESRGAN 4x model is not available in this repo.\n\n"
+                            "The 4x model is usually omitted because it is too large and must be "
+                            "downloaded manually.\n\n"
+                            f"Missing model: {model_name}\n"
+                            f"Model dir: {model_dir}\n\n"
+                            f"Download it from:\n{self.REALESRGAN_RELEASES_URL}"
+                        ),
+                    )
+                else:
+                    messagebox.showerror(
+                        "Depth Upscale",
+                        (
+                            "Bundled RealESRGAN model not found.\n\n"
+                            f"Missing model: {model_name}\n"
+                            f"Model dir: {model_dir}"
+                        ),
+                    )
                 return
         else:
             if runtime_bin:
@@ -9731,15 +10721,8 @@ class PipelineMasterGUI:
                 self._append_depth_log(f"[CLEANUP] could not remove temp dir: {exc}")
 
     def _set_depth_running(self, is_running: bool) -> None:
-        self.depth_preview_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
-        self.depth_run_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
-        self.depth_upscale_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
         self.depth_stop_btn.configure(state=tk.NORMAL if is_running else tk.DISABLED)
-        verify_state = tk.DISABLED if (is_running or self._verify_running) else tk.NORMAL
-        self.depth_verify_quick_btn.configure(state=verify_state)
-        self.depth_verify_deep_btn.configure(state=verify_state)
-        self.depth_upscaled_verify_quick_btn.configure(state=verify_state)
-        self.depth_upscaled_verify_deep_btn.configure(state=verify_state)
+        self._refresh_depth_action_buttons(is_running)
         if is_running:
             self.depth_stop_btn.configure(text="Stop")
         else:
@@ -9790,11 +10773,11 @@ class PipelineMasterGUI:
         # Fields disabled in Auto mode.
         self.splat_layout_var.set("Single Warp")
         self.splat_auto_convergence_var.set("Min Borders")
-        self.splat_dilate_x_var.set("3")
-        self.splat_dilate_y_var.set("3")
+        self.splat_dilate_x_var.set("5")
+        self.splat_dilate_y_var.set("5")
         self.splat_blur_x_var.set("0")
         self.splat_blur_y_var.set("0")
-        self.splat_dilate_left_var.set("2")
+        self.splat_dilate_left_var.set("0")
         self.splat_blur_balance_var.set("0.5")
         self.splat_gamma_var.set("1")
         self.splat_convergence_var.set("50")
@@ -10144,14 +11127,19 @@ class PipelineMasterGUI:
         return ""
 
     @staticmethod
-    def _collect_inpainted_scene_files(inpainted_dir: str) -> list[Path]:
-        if not inpainted_dir or not os.path.isdir(inpainted_dir):
-            return []
+    def _collect_inpainted_scene_files(
+        inpainted_dir: str,
+        preferred_inpainted_dir: str = "",
+    ) -> list[Path]:
         files: dict[str, Path] = {}
-        for pat in ("*_inpainted_right_eye.mp4", "*_inpainted_sbs.mp4"):
-            for p in Path(inpainted_dir).glob(pat):
-                if p.is_file():
-                    files[p.name] = p
+        for folder in (preferred_inpainted_dir, inpainted_dir):
+            if not folder or not os.path.isdir(folder):
+                continue
+            root = Path(folder)
+            for pat in ("*_inpainted_right_eye.mp4", "*_inpainted_sbs.mp4"):
+                for p in root.glob(pat):
+                    if p.is_file() and p.name not in files:
+                        files[p.name] = p
         return [files[k] for k in sorted(files.keys())]
 
     @staticmethod
@@ -10442,6 +11430,56 @@ class PipelineMasterGUI:
             return set()
         return rows
 
+    @staticmethod
+    def _normalize_sharpness_scene_key(name: str) -> str:
+        stem = Path(str(name or "")).stem
+        for suffix in (
+            "_replace_mask",
+            "_inpainted_right_eye",
+            "_inpainted_sbs",
+            "_splatted1",
+            "_splatted2",
+            "_splatted4",
+        ):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+        return stem
+
+    @classmethod
+    def _expected_inpaint_output_name_from_source_name(cls, source_name: str) -> str:
+        base = Path(str(source_name or "")).name
+        stem = Path(base).stem
+        is_quad = stem.endswith("_splatted4")
+        core = cls._normalize_sharpness_scene_key(base)
+        suffix = "_inpainted_sbs" if is_quad else "_inpainted_right_eye"
+        return f"{core}{suffix}.mp4"
+
+    @classmethod
+    def _load_sharpness_csv_level_map(
+        cls,
+        csv_path: str,
+    ) -> dict[str, tuple[float, int, str]]:
+        if not csv_path or not os.path.isfile(csv_path):
+            return {}
+        out: dict[str, tuple[float, int, str]] = {}
+        try:
+            with open(csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    name = str((row or {}).get("file", "")).strip()
+                    if not name:
+                        continue
+                    try:
+                        raw = float((row or {}).get("sharpness_raw", "0") or 0.0)
+                    except Exception:
+                        raw = 0.0
+                    level = max(5, min(11, int(math.trunc(raw / 1100.0)) + 4))
+                    out[Path(name).name] = (raw, level, name)
+                    out[cls._normalize_sharpness_scene_key(name)] = (raw, level, name)
+        except Exception:
+            return {}
+        return out
+
     def _verify_sharpness_csv_coverage(
         self,
         inpaint_input_dir: str,
@@ -10466,6 +11504,57 @@ class PipelineMasterGUI:
             f"Sharpness CSV verified: {len(expected)}/{len(expected)} scene rows.",
             [],
         )
+
+    def _collect_expected_sharpen_outputs(
+        self,
+        inpaint_input_dir: str,
+        sharpness_csv_path: str,
+        *,
+        min_level: int = 8,
+    ) -> tuple[list[str], str]:
+        ok, msg, _missing = self._verify_sharpness_csv_coverage(
+            inpaint_input_dir,
+            sharpness_csv_path,
+        )
+        if not ok:
+            return [], msg
+        if not inpaint_input_dir or not os.path.isdir(inpaint_input_dir):
+            return [], f"Inpaint input folder not found: {inpaint_input_dir or '(empty)'}"
+
+        level_map = self._load_sharpness_csv_level_map(sharpness_csv_path)
+        if not level_map:
+            return [], f"sharpness.csv unreadable or empty: {sharpness_csv_path or '(empty)'}"
+
+        expected: list[str] = []
+        seen: set[str] = set()
+        for p in self._collect_video_files_for_patterns(
+            inpaint_input_dir,
+            self.VERIFY_VIDEO_PATTERNS,
+        ):
+            key = self._normalize_sharpness_scene_key(p.name)
+            info = level_map.get(p.name) or level_map.get(key)
+            if not info:
+                continue
+            _raw, level, source_name = info
+            if int(level) < int(min_level):
+                continue
+            out_name = self._expected_inpaint_output_name_from_source_name(source_name)
+            if out_name not in seen:
+                seen.add(out_name)
+                expected.append(out_name)
+        expected.sort()
+        return expected, ""
+
+    @staticmethod
+    def _count_named_existing_files(folder: str, expected_names: Sequence[str]) -> int:
+        if not folder or not os.path.isdir(folder):
+            return 0
+        root = Path(folder)
+        count = 0
+        for name in expected_names:
+            if (root / str(name)).is_file():
+                count += 1
+        return count
 
     @staticmethod
     def _load_autoct_csv_rows(
@@ -10508,6 +11597,7 @@ class PipelineMasterGUI:
         csv_path: str,
         *,
         cleanup_incomplete: bool,
+        preferred_inpainted_dir: str = "",
     ) -> tuple[bool, str, list[str]]:
         if not inpainted_dir or not os.path.isdir(inpainted_dir):
             raise RuntimeError(f"Inpainted folder not found: {inpainted_dir or '(empty)'}")
@@ -10518,7 +11608,10 @@ class PipelineMasterGUI:
         if not csv_path or not os.path.isfile(csv_path):
             return False, f"autoct.csv not found: {csv_path or '(empty)'}", []
 
-        expected_files = self._collect_inpainted_scene_files(inpainted_dir)
+        expected_files = self._collect_inpainted_scene_files(
+            inpainted_dir,
+            preferred_inpainted_dir=preferred_inpainted_dir,
+        )
         if not expected_files:
             return True, "AutoCT CSV verify: no inpainted scenes found.", []
 
@@ -10626,6 +11719,17 @@ class PipelineMasterGUI:
             self.inpaint_sharp_btn.configure(
                 state=tk.NORMAL if (allow_csv_features and not inpaint_running) else tk.DISABLED
             )
+        sharpen_enabled = self._sharpen_step_enabled_in_current_mode()
+        if hasattr(self, "inpaint_sharpen_run_btn"):
+            self.inpaint_sharpen_run_btn.configure(
+                state=tk.NORMAL
+                if (allow_csv_features and sharpen_enabled and not inpaint_running)
+                else tk.DISABLED
+            )
+        if hasattr(self, "inpaint_sharpen_verify_quick_btn"):
+            verify_state = tk.NORMAL if (allow_csv_features and sharpen_enabled and not inpaint_running and not self._verify_running) else tk.DISABLED
+            self.inpaint_sharpen_verify_quick_btn.configure(state=verify_state)
+            self.inpaint_sharpen_verify_deep_btn.configure(state=verify_state)
         if hasattr(self, "merge_csv_btn"):
             self.merge_csv_btn.configure(
                 state=tk.NORMAL if (allow_csv_features and not merge_running) else tk.DISABLED
@@ -10869,7 +11973,7 @@ class PipelineMasterGUI:
             )
             return True, depth_ref_dir, list(self.VERIFY_VIDEO_PATTERNS), "depthmap"
 
-        if stage_key in {"inpaint", "merge", "merge_mask"}:
+        if stage_key in {"inpaint", "sharpen", "merge", "merge_mask"}:
             mask_candidates = [
                 self.merge_replace_mask_var.get().strip(),
                 self.inpaint_mask_var.get().strip(),
@@ -11651,6 +12755,12 @@ class PipelineMasterGUI:
             self._log_queue.put(("verify_done", "depth_deep"))
 
     def _validate_depth_upscaled_verify_inputs(self) -> tuple[bool, str, str]:
+        if not self._depth_upscale_enabled_in_manual():
+            messagebox.showerror(
+                "Verify Upscale",
+                "Enable `Use RealESRGAN Upscale` in Manual mode before verifying the upscaled depth.",
+            )
+            return False, "", ""
         upscaled_dir = self.depth_upscaled_var.get().strip()
         ref_dir = self.depth_input_var.get().strip()
         if not upscaled_dir:
@@ -11971,7 +13081,7 @@ class PipelineMasterGUI:
         self.depth_output_var.set(os.path.normpath(depth_out))
         self.depth_upscaled_var.set(os.path.normpath(depth_upscaled))
         self.splat_input_clips_var.set(os.path.normpath(scene_out))
-        self.splat_input_depth_var.set(os.path.normpath(depth_upscaled))
+        self._sync_depth_to_splat_input_path()
         self.splat_output_var.set(
             os.path.normpath(os.path.join(work_dir, self.STANDARD_SUBDIRS["splat"]))
         )
@@ -11988,6 +13098,11 @@ class PipelineMasterGUI:
         )
         self.inpaint_output_var.set(
             os.path.normpath(os.path.join(work_dir, self.STANDARD_SUBDIRS["inpaint"]))
+        )
+        self.inpaint_sharpen_output_var.set(
+            os.path.normpath(
+                os.path.join(work_dir, self.STANDARD_SUBDIRS["inpaint_sharpen"])
+            )
         )
         self.inpaint_sharpness_csv_var.set(
             os.path.normpath(os.path.join(work_dir, "sharpness.csv"))
@@ -12770,6 +13885,8 @@ class PipelineMasterGUI:
             ("splat_verify_deep_btn", "Verify Scenes (Deep)", self._start_splat_verify_deep),
             ("inpaint_verify_quick_btn", "Verify Scenes (Quick)", self._start_inpaint_verify_quick),
             ("inpaint_verify_deep_btn", "Verify Scenes (Deep)", self._start_inpaint_verify_deep),
+            ("inpaint_sharpen_verify_quick_btn", "Verify Sharpen (Quick)", self._start_inpaint_sharpen_verify_quick),
+            ("inpaint_sharpen_verify_deep_btn", "Verify Sharpen (Deep)", self._start_inpaint_sharpen_verify_deep),
             (
                 "merge_mask_verify_quick_btn",
                 "Verify Mask (Quick)",
@@ -12799,6 +13916,8 @@ class PipelineMasterGUI:
             "splat_deep": "splat_verify_deep_btn",
             "inpaint_quick": "inpaint_verify_quick_btn",
             "inpaint_deep": "inpaint_verify_deep_btn",
+            "sharpen_quick": "inpaint_sharpen_verify_quick_btn",
+            "sharpen_deep": "inpaint_sharpen_verify_deep_btn",
             "merge_mask_quick": "merge_mask_verify_quick_btn",
             "merge_mask_deep": "merge_mask_verify_deep_btn",
             "merge_quick": "merge_verify_quick_btn",
@@ -12923,6 +14042,8 @@ class PipelineMasterGUI:
             return self.depth_status_var, self._append_depth_log, "Verify Depth"
         if cur.startswith("splat_"):
             return self.splat_status_var, self._append_splat_log, "Verify Splatting"
+        if cur.startswith("sharpen_"):
+            return self.inpaint_status_var, self._append_inpaint_log, "Verify Sharpen"
         if cur.startswith("inpaint_"):
             return self.inpaint_status_var, self._append_inpaint_log, "Verify Inpainting"
         if cur.startswith("merge_mask_"):
@@ -12948,6 +14069,8 @@ class PipelineMasterGUI:
             "splat_verify_deep_result",
             "inpaint_verify_quick_result",
             "inpaint_verify_deep_result",
+            "sharpen_verify_quick_result",
+            "sharpen_verify_deep_result",
             "merge_mask_verify_quick_result",
             "merge_mask_verify_deep_result",
             "merge_verify_quick_result",
@@ -12986,6 +14109,14 @@ class PipelineMasterGUI:
             "inpaint_verify_deep_result": (
                 self.inpaint_status_var,
                 "Verify Inpainting (Deep) stopped",
+            ),
+            "sharpen_verify_quick_result": (
+                self.inpaint_status_var,
+                "Verify Sharpen (Quick) stopped",
+            ),
+            "sharpen_verify_deep_result": (
+                self.inpaint_status_var,
+                "Verify Sharpen (Deep) stopped",
             ),
             "merge_mask_verify_quick_result": (
                 self.merge_status_var,
@@ -13070,10 +14201,6 @@ class PipelineMasterGUI:
         if is_running:
             self.scene_verify_quick_btn.configure(state=tk.DISABLED)
             self.scene_verify_deep_btn.configure(state=tk.DISABLED)
-            self.depth_verify_quick_btn.configure(state=tk.DISABLED)
-            self.depth_verify_deep_btn.configure(state=tk.DISABLED)
-            self.depth_upscaled_verify_quick_btn.configure(state=tk.DISABLED)
-            self.depth_upscaled_verify_deep_btn.configure(state=tk.DISABLED)
             self.splat_verify_quick_btn.configure(state=tk.DISABLED)
             self.splat_verify_deep_btn.configure(state=tk.DISABLED)
             self.inpaint_verify_quick_btn.configure(state=tk.DISABLED)
@@ -13097,16 +14224,6 @@ class PipelineMasterGUI:
                     self.scene_verify_quick_btn.configure(state=tk.NORMAL)
                     self.scene_verify_deep_btn.configure(state=tk.NORMAL)
             depth_is_running = bool(self._depth_thread and self._depth_thread.is_alive())
-            if depth_is_running:
-                self.depth_verify_quick_btn.configure(state=tk.DISABLED)
-                self.depth_verify_deep_btn.configure(state=tk.DISABLED)
-                self.depth_upscaled_verify_quick_btn.configure(state=tk.DISABLED)
-                self.depth_upscaled_verify_deep_btn.configure(state=tk.DISABLED)
-            else:
-                self.depth_verify_quick_btn.configure(state=tk.NORMAL)
-                self.depth_verify_deep_btn.configure(state=tk.NORMAL)
-                self.depth_upscaled_verify_quick_btn.configure(state=tk.NORMAL)
-                self.depth_upscaled_verify_deep_btn.configure(state=tk.NORMAL)
             splat_is_running = bool(self._splat_thread and self._splat_thread.is_alive())
             if splat_is_running:
                 self.splat_verify_quick_btn.configure(state=tk.DISABLED)
@@ -13141,6 +14258,7 @@ class PipelineMasterGUI:
                 self.join_verify_btn.configure(state=tk.NORMAL)
             self._verify_stop_requested = False
             self._verify_stop_clicks = 0
+        self._refresh_depth_action_buttons()
         self._refresh_verify_buttons()
         self._refresh_pipeline_run_button()
 
@@ -14956,7 +16074,14 @@ class PipelineMasterGUI:
                         and str(pending_before[0]).strip().lower() == "inpaint"
                         and str(pending_before[1]).strip().lower() == "run"
                     )
+                    pending_sharpen_run = (
+                        isinstance(pending_before, tuple)
+                        and len(pending_before) >= 2
+                        and str(pending_before[0]).strip().lower() == "sharpen"
+                        and str(pending_before[1]).strip().lower() == "run"
+                    )
                     should_resume_inpaint = False
+                    should_resume_sharpen = False
                     if isinstance(payload, dict):
                         step_name = str(payload.get("step", "")).strip().lower()
                         success = bool(payload.get("success", False))
@@ -14967,20 +16092,30 @@ class PipelineMasterGUI:
                             and not stop_requested
                         ):
                             should_resume_inpaint = True
+                        if (
+                            step_name == "sharpness_csv"
+                            and bool(self._inpaint_resume_after_sharpen)
+                            and success
+                            and not stop_requested
+                        ):
+                            should_resume_sharpen = True
                     self._set_inpaint_running(False)
-                    if step_name in {"sharpness_csv", "inpaint"}:
+                    if step_name in {"sharpness_csv", "inpaint", "sharpen"}:
                         self._pipeline_on_run_finished(step_name, success)
                     else:
                         status_txt = self.inpaint_status_var.get().strip().lower()
                         if "sharpness csv created" in status_txt:
                             self._pipeline_on_run_finished("sharpness_csv", True)
                             step_name = "sharpness_csv"
+                        elif "sharpen completed" in status_txt:
+                            self._pipeline_on_run_finished("sharpen", True)
+                            step_name = "sharpen"
                         elif "completed" in status_txt:
                             self._pipeline_on_run_finished("inpaint", True)
                             step_name = "inpaint"
                         else:
                             pending = self._pipeline_pending_action
-                            if pending and pending[1] == "run" and pending[0] in {"sharpness_csv", "inpaint"}:
+                            if pending and pending[1] == "run" and pending[0] in {"sharpness_csv", "inpaint", "sharpen"}:
                                 self._pipeline_on_run_finished(pending[0], False)
                                 step_name = pending[0]
                     if step_name == "sharpness_csv" and bool(self._inpaint_resume_after_sharpness):
@@ -14993,8 +16128,21 @@ class PipelineMasterGUI:
                         elif pending_inpaint_run and not success:
                             # Sharpness preflight failed while Inpaint run was pending.
                             self._pipeline_on_run_finished("inpaint", False)
+                    if step_name == "sharpness_csv" and bool(self._inpaint_resume_after_sharpen):
+                        self._inpaint_resume_after_sharpen = False
+                        if should_resume_sharpen:
+                            self._append_inpaint_log(
+                                "[SHARPEN] Sharpness CSV rebuilt. Resuming Sharpen automatically..."
+                            )
+                            self.root.after(10, self._start_inpaint_sharpen)
+                        elif pending_sharpen_run and not success:
+                            self._pipeline_on_run_finished("sharpen", False)
                     if stop_requested:
-                        stop_label = "Sharpness CSV" if step_name == "sharpness_csv" else "Inpainting"
+                        stop_label = (
+                            "Sharpness CSV"
+                            if step_name == "sharpness_csv"
+                            else ("Sharpen" if step_name == "sharpen" else "Inpainting")
+                        )
                         self._append_inpaint_log(f"[STOP] {stop_label} stopped.")
                         self._finalize_pipeline_stop(stop_label)
                 elif kind == "merge_done":
@@ -15446,6 +16594,87 @@ class PipelineMasterGUI:
                             ),
                         )
                     self._pipeline_on_verify_finished("inpaint", rc == 0, "deep")
+                elif kind == "sharpen_verify_quick_result" and isinstance(payload, dict):
+                    ok = bool(payload.get("ok", False))
+                    msg = str(payload.get("message", "Sharpen quick verification finished."))
+                    broken_output = [
+                        str(p) for p in (payload.get("broken_output") or []) if str(p).strip()
+                    ]
+                    broken_reference = [
+                        str(p) for p in (payload.get("broken_reference") or []) if str(p).strip()
+                    ]
+                    missing_output = [
+                        str(p) for p in (payload.get("missing_output") or []) if str(p).strip()
+                    ]
+                    if ok:
+                        self.inpaint_status_var.set("Verify Sharpen (Quick) completed")
+                        messagebox.showinfo("Verify Sharpen (Quick)", msg)
+                    else:
+                        self.inpaint_status_var.set("Verify Sharpen (Quick) failed")
+                        deleted = 0
+                        cleanup_err = 0
+                        cleanup_skipped = False
+                        cleanup_total = 0
+                        if broken_output:
+                            deleted, cleanup_err, cleanup_skipped, cleanup_total = (
+                                self._cleanup_broken_files_with_confirmation(
+                                    broken_output,
+                                    self._append_inpaint_log,
+                                    "sharpen output",
+                                    "Verify Sharpen (Quick)",
+                                )
+                            )
+                        if cleanup_skipped:
+                            msg = (
+                                f"{msg}\n\n"
+                                f"Cleanup skipped by user: {cleanup_total} file(s) flagged for deletion."
+                            )
+                        elif deleted or cleanup_err:
+                            msg = (
+                                f"{msg}\n\n"
+                                f"Auto-cleanup: deleted {deleted} broken file(s), "
+                                f"errors={cleanup_err}."
+                            )
+                        if broken_output:
+                            msg += self._format_corrupted_files_block(
+                                broken_output,
+                                "Corrupted sharpen output files",
+                            )
+                        if missing_output:
+                            msg += self._format_corrupted_files_block(
+                                missing_output,
+                                "Missing eligible sharpen output files",
+                            )
+                        if broken_reference:
+                            msg += self._format_corrupted_files_block(
+                                broken_reference,
+                                "Corrupted reference files",
+                            )
+                        messagebox.showwarning("Verify Sharpen (Quick)", msg)
+                    self._pipeline_on_verify_finished("sharpen", ok, "quick")
+                elif kind == "sharpen_verify_deep_result" and isinstance(payload, dict):
+                    rc = int(payload.get("rc", 1))
+                    bad_files = [str(p) for p in (payload.get("bad_files") or []) if str(p).strip()]
+                    if rc == 0:
+                        self.inpaint_status_var.set("Verify Sharpen (Deep) completed")
+                        messagebox.showinfo(
+                            "Verify Sharpen (Deep)",
+                            "Deep verification completed successfully.",
+                        )
+                    else:
+                        self.inpaint_status_var.set(f"Verify Sharpen (Deep) failed (exit {rc})")
+                        messagebox.showwarning(
+                            "Verify Sharpen (Deep)",
+                            (
+                                "Deep verification failed.\n\n"
+                                "Broken files were flagged from the eligible sharpen subset."
+                            )
+                            + self._format_corrupted_files_block(
+                                bad_files,
+                                "Corrupted sharpen output files",
+                            ),
+                        )
+                    self._pipeline_on_verify_finished("sharpen", rc == 0, "deep")
                 elif kind == "merge_mask_verify_quick_result" and isinstance(payload, dict):
                     ok = bool(payload.get("ok", False))
                     msg = str(payload.get("message", "Mask quick verification finished."))
@@ -15760,6 +16989,8 @@ class PipelineMasterGUI:
             "depth_pix_fmt": self.depth_pix_fmt_var.get().strip(),
             "depth_extra_ffmpeg_args": self.depth_extra_ffmpeg_args_var.get().strip(),
             "depth_realesrgan_source": self.depth_realesrgan_source_var.get().strip(),
+            "depth_use_realesrgan_upscale": bool(self.depth_use_realesrgan_upscale_var.get()),
+            "depth_realesrgan_scale": self.depth_realesrgan_scale_var.get().strip(),
             "depth_realesrgan_workers": self.depth_realesrgan_workers_var.get().strip(),
             "splat_mode": self.splat_mode_var.get().strip(),
             "splat_batch_size": self.splat_batch_size_var.get().strip(),
@@ -15801,6 +17032,8 @@ class PipelineMasterGUI:
             "inpaint_tail_pad": self.inpaint_tail_pad_var.get().strip(),
             "inpaint_use_sharpness_csv": bool(self.inpaint_use_sharpness_csv_var.get()),
             "inpaint_sharpness_workers": self.inpaint_sharpness_workers_var.get().strip(),
+            "inpaint_use_sharpen": bool(self.inpaint_use_sharpen_var.get()),
+            "inpaint_sharpen_workers": self.inpaint_sharpen_workers_var.get().strip(),
             "inpaint_inference_steps": self.inpaint_inference_steps_var.get().strip(),
             "inpaint_encode_override": bool(self.inpaint_encode_override_var.get()),
             "inpaint_codec": self.inpaint_codec_var.get().strip(),

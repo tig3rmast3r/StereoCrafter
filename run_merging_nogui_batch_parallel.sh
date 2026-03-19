@@ -5,6 +5,7 @@ PYTHON="${PYTHON:-python3}"
 RUNNER="${RUNNER:-merging_nogui_batch_parallel.py}"
 
 INPAINTED_FOLDER="${INPAINTED_FOLDER:-./work/output/}"
+PREFERRED_INPAINTED_FOLDER="${PREFERRED_INPAINTED_FOLDER:-}"
 SPLATTED_FOLDER="${SPLATTED_FOLDER:-./work/splat/hires/}"
 ORIGINAL_FOLDER="${ORIGINAL_FOLDER:-./work/seg/}"
 OUTPUT_FOLDER="${OUTPUT_FOLDER:-./work/sbs/}"
@@ -87,6 +88,10 @@ CMD=(
   --ct-clamp-ab-max "$CT_CLAMP_AB_MAX"
   --ct-ring-width "$CT_RING_WIDTH"
 )
+
+if [ -n "${PREFERRED_INPAINTED_FOLDER// }" ] && [ -d "$PREFERRED_INPAINTED_FOLDER" ]; then
+  CMD+=(--preferred-inpainted-folder "$PREFERRED_INPAINTED_FOLDER")
+fi
 
 if [ -z "${REPLACE_MASK_FOLDER// }" ] || [ ! -d "$REPLACE_MASK_FOLDER" ]; then
   echo "[ERR ] replace-mask folder missing: ${REPLACE_MASK_FOLDER:-<empty>}"

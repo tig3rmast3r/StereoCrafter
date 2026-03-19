@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_MODEL_DIR="$SCRIPT_DIR/realesrgan/models"
+
 IN_DIR="${1:?uso: $0 IN_DIR OUT_DIR [SCALE] [MODEL] [TILE] [DEST_WxH] [JOBS] [RETRIES]}"
 OUT_DIR="${2:?uso: $0 IN_DIR OUT_DIR [SCALE] [MODEL] [TILE] [DEST_WxH] [JOBS] [RETRIES]}"
 SCALE="${3:-2}"
@@ -11,12 +14,24 @@ MAX_JOBS="${7:-4}"     # default 4
 MAX_RETRIES="${8:-3}"  # default 3 retry per file
 
 REALESRGAN_BIN="${REALESRGAN_BIN:-realesrgan-ncnn-vulkan}"
-REALESRGAN_MODEL_DIR="${REALESRGAN_MODEL_DIR:-}"
+REALESRGAN_MODEL_DIR="${REALESRGAN_MODEL_DIR:-$DEFAULT_MODEL_DIR}"
 REALESRGAN_OUT_CODEC="${REALESRGAN_OUT_CODEC:-h264_nvenc}"
 REALESRGAN_OUT_PRESET="${REALESRGAN_OUT_PRESET:-medium}"
 REALESRGAN_OUT_CRF="${REALESRGAN_OUT_CRF:-0}"
 REALESRGAN_OUT_PIX_FMT="${REALESRGAN_OUT_PIX_FMT:-yuv420p}"
 REALESRGAN_OUT_EXTRA_ARGS="${REALESRGAN_OUT_EXTRA_ARGS:-}"
+
+if [[ ! -d "$REALESRGAN_MODEL_DIR" ]]; then
+  REALESRGAN_MODEL_DIR=""
+fi
+
+if [[ -n "$REALESRGAN_MODEL_DIR" ]]; then
+  if [[ ! -f "$REALESRGAN_MODEL_DIR/${MODEL}.bin" || ! -f "$REALESRGAN_MODEL_DIR/${MODEL}.param" ]]; then
+    echo "Requested RealESRGAN model not found in: $REALESRGAN_MODEL_DIR" >&2
+    echo "Missing model: $MODEL" >&2
+    exit 1
+  fi
+fi
 
 resolve_tile_for_file() {
   local in_path="$1"
@@ -30,12 +45,17 @@ resolve_tile_for_file() {
   fi
 
   if [[ -n "$tile_lc" && "$tile_lc" != "auto" ]]; then
-    echo "[WARN] invalid TILE='$TILE', using auto tile from input height." >&2
+    echo "[WARN] invalid TILE='$TILE', using auto tile from input height/2." >&2
   fi
 
   h="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$in_path" 2>/dev/null | head -n1 | tr -d '[:space:]')"
   if [[ "$h" =~ ^[0-9]+$ ]] && (( h > 0 )); then
-    echo "$h"
+    local auto_tile
+    auto_tile=$(( (h + 1) / 2 ))
+    if (( auto_tile < 32 )); then
+      auto_tile=32
+    fi
+    echo "$auto_tile"
     return 0
   fi
 
@@ -94,7 +114,7 @@ echo "FPS (dal primo file): $FPS"
 if [[ "${TILE//[[:space:]]/}" =~ ^[0-9]+$ ]] && (( ${TILE//[[:space:]]/} > 0 )); then
   echo "Scale: $SCALE  Model: $MODEL  Tile: ${TILE//[[:space:]]/}"
 else
-  echo "Scale: $SCALE  Model: $MODEL  Tile: auto (per-file input height)"
+  echo "Scale: $SCALE  Model: $MODEL  Tile: auto (input height / 2, rounded up)"
 fi
 if [[ -n "$REALESRGAN_MODEL_DIR" ]]; then
   echo "Model dir: $REALESRGAN_MODEL_DIR"
@@ -251,7 +271,10 @@ process_one() {
       cmd+=(-crf "$crf_v")
     fi
 
-    cmd+=(-profile:v main -pix_fmt "$REALESRGAN_OUT_PIX_FMT")
+    if [[ "$codec_l" == "h264_nvenc" ]]; then
+      cmd+=(-profile:v main)
+    fi
+    cmd+=(-pix_fmt "$REALESRGAN_OUT_PIX_FMT")
     if [[ -n "${REALESRGAN_OUT_EXTRA_ARGS// }" ]]; then
       # shellcheck disable=SC2206
       extra_tokens=($REALESRGAN_OUT_EXTRA_ARGS)

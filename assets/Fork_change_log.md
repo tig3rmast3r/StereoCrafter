@@ -1,6 +1,6 @@
 # Changes in this Fork
 
-This fork is tested only with Linux (ubuntu 22.04 and 24.04 in my case), Windows "should" work but at least you need a Win build for RealESRGAN <br>
+This fork is tested only with Linux (ubuntu 22.04 and 24.04 in my case), Windows "should" work for gui versions but pipeline_master_gui and all auto batches uses bash scripts that needs to be reimplemented using powershell <br>
 Aim to this Fork is to create a full sbs 1080p 3d content as result with a one-click solution but keeping ways to customize it.<br>
 Supports only 8 bit format (inpainting is 8 bit anyway so it's actually impossible to get 10 bit hdr end to end) with the following pix formats yuv420p, yuv422p and yuv444p (latest 2 can be achieved downscaling from 4k, no chroma upscaling)
 All runner scripts are tuned for intel 265k, 48GB ram and RTX 4090<br>
@@ -114,6 +114,13 @@ Long live to 3D!!
 - [fix] wrong progress feedback for merging script on errors/restarts
 - [fix] verifyscenes will also delete apparently good files but with wrong length
 
+2026-03-20 (Sharpen, PMG changes and fixes)
+- [new] Preliminary Sharpen integration, will sharp inpainted mask zones a bit to compensate for blurry inpaint that is more prominent on masked zones, it will sharp only scenes that requires it (based on sharpness.csv)
+- [changed] reduced max steps from 11 to 8 for inpainting (sharpen will do a better job than extra inpaint steps)
+- [changed] RealESRGAN step is now optional, while sometimes gives good results (eg, with downscaled 4k to yuv444p), some other times it has issues and give results worse than using the original 0.5x depthmap, so for safety i have disabled it as default but can be re-enabled in manual mode
+- [changed] Fine tuned several defaults for auto mode according to the above change and to new tests with other sources, defaults are now tuned for a standard 1920*800 window as input
+- [fix] depthcrafter automatic download was loading an older model for img2vid
+
 2026-04-16 (New Scenes requeue utility, better "Stop" and fixes)
 - [new] New Utility that will automatically move/delete selected scenes from the project in order to re-process them again. It accepts annotations csv from Utilities/run_sbs_left_click_logger_player.sh or manual names on the specified TextBox (file name in this case will automatically set the step)
 - [new] Start/resume will now become "Stop" when running, in order to stop the run even during verifyscenes
@@ -124,3 +131,10 @@ Long live to 3D!!
 - [fix] Verifyscenes on merge tab will exclude files coming from seg-mono during the process
 - [fix] latest fixes about Depthcrafter run stability was not implemented on the Inpainting step
 - [fix] split scene from csv was using length time instead of length frame
+
+2026-03-19 (Sharpen, PMG changes and fixes)
+- [new] Preliminary Sharpen integration, will sharp inpainted mask zones a bit to compensate for blurry inpaint that is more prominent on masked zones, it will sharp only scenes that requires it (based on sharpness.csv)
+- [changed] reduced max steps from 11 to 8 for inpainting (sharpen will do a better job than extra inpaint steps)
+- [changed] RealESRGAN step is now optional, while sometimes gives good results (eg, with downscaled 4k to yuv444p), some other times it has issues and give results worse than using the original 0.5x depthmap, so for safety i have disabled it as default but can be re-enabled in manual mode
+- [changed] Fine tuned several defaults for auto mode according to the above change and to new tests with other sources, defaults are now tuned for a standard 1920*800 window as input
+- [fix] depthcrafter automatic download was loading an older model for img2vid

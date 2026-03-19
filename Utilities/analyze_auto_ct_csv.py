@@ -538,6 +538,7 @@ def main() -> int:
         description="Precompute Auto CT CSV guidance per frame (frame-by-frame)."
     )
     ap.add_argument("--inpainted-folder", required=True)
+    ap.add_argument("--preferred-inpainted-folder", default="")
     ap.add_argument("--splatted-folder", required=True)
     ap.add_argument("--original-folder", required=True)
     ap.add_argument("--output-csv", required=True)
@@ -652,6 +653,7 @@ def main() -> int:
 
     jobs = collect_jobs(
         inpainted_folder=args.inpainted_folder,
+        preferred_inpainted_folder=args.preferred_inpainted_folder,
         splatted_folder=args.splatted_folder,
         original_folder=args.original_folder,
         output_folder="",

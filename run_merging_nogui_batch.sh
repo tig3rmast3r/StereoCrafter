@@ -12,6 +12,7 @@ RUNNER="${RUNNER:-merging_nogui_batch.py}"
 
 # Folder containing the inpainted outputs (e.g. *_inpainted_right_eye.mp4 or *_inpainted_sbs.mp4)
 INPAINTED_FOLDER="${INPAINTED_FOLDER:-./work/output/}"
+PREFERRED_INPAINTED_FOLDER="${PREFERRED_INPAINTED_FOLDER:-}"
 
 # Folder containing splatted inputs (e.g. *_splatted1.mp4 / *_splatted2.mp4 / *_splatted4.mp4)
 SPLATTED_FOLDER="${SPLATTED_FOLDER:-./work/splat/hires/}"
@@ -99,6 +100,10 @@ CMD=(
   --ct-clamp-ab-max "$CT_CLAMP_AB_MAX"
   --ct-ring-width "$CT_RING_WIDTH"
 )
+
+if [ -n "${PREFERRED_INPAINTED_FOLDER// }" ] && [ -d "$PREFERRED_INPAINTED_FOLDER" ]; then
+  CMD+=(--preferred-inpainted-folder "$PREFERRED_INPAINTED_FOLDER")
+fi
 
 if [ -z "${REPLACE_MASK_FOLDER// }" ] || [ ! -d "$REPLACE_MASK_FOLDER" ]; then
   echo "[ERR ] replace-mask folder missing: ${REPLACE_MASK_FOLDER:-<empty>}"

@@ -40,10 +40,10 @@ Scenedetect CSV is NOT available as stand alone, is a single line command btw. U
 python Utilities/split_scenes_from_csv.py
 # manually move mono files to seg-mono folder
 ./run_depthcrafter_nogui_batch.sh
-./Utilities/upscale_esrgan_x264.sh #or nvenc variant
 ./run_splatting_runner_parallel.sh
 python Utilities/analyze_inpaint_sharpness.py
 ./run_inpainting_runner.sh
+./run_inpaint_sharpen_runner.sh
 ./run_mask_formerge_nogui.sh
 python Utilities/analyze_auto_ct_csv.py
 ./run_merging_nogui_batch_parallel.sh #or run_merging_nogui_batch.sh for single thread

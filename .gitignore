@@ -84,6 +84,7 @@ outputs/
 weights/
 old/
 segmenting_WIP/
+sharpen_WIP/
 temp/
 work/
 logs/
@@ -91,7 +92,8 @@ logs/
 *.log
 *.csv
 context/
-
+Utilities/realesrgan/models/realesrgan-x4plus.bin
+Utilities/realesrgan/models/realesrgan-x4plus.param
 config*.json
 yolo12s.pt
 yolo12n.pt
