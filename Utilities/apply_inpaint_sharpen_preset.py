@@ -66,6 +66,33 @@ def cleanup_partial_output(output_path: Path) -> None:
         pass
 
 
+def probe_video_timing(path: Path) -> Tuple[str, str]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=r_frame_rate,time_base",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        import json
+
+        out = subprocess.check_output(cmd, text=True)
+        doc = json.loads(out or "{}")
+    except Exception:
+        return "", ""
+    streams = doc.get("streams") or []
+    if not streams:
+        return "", ""
+    stream = streams[0] or {}
+    return str(stream.get("r_frame_rate") or ""), str(stream.get("time_base") or "")
+
+
 @dataclass
 class PresetResult:
     file: str
@@ -145,7 +172,7 @@ def open_ffmpeg_writer(
     output_path: Path,
     width: int,
     height: int,
-    fps: float,
+    fps_arg: str,
     args: SimpleNamespace,
 ) -> subprocess.Popen[bytes]:
     cmd = [
@@ -160,7 +187,7 @@ def open_ffmpeg_writer(
         "-s",
         f"{int(width)}x{int(height)}",
         "-r",
-        format_fps(float(fps)),
+        str(fps_arg or "24000/1001"),
         "-i",
         "-",
         "-an",
@@ -213,6 +240,8 @@ def apply_sharpen_clip(
     gain: float = DEFAULT_GAIN,
 ) -> int:
     width, height, _frames, fps = probe_video_meta(input_path)
+    input_r_frame_rate, _input_time_base = probe_video_timing(input_path)
+    fps_arg = input_r_frame_rate or format_fps(float(fps))
     partial_path = partial_output_path(output_path)
     cleanup_partial_output(output_path)
     cap = cv2.VideoCapture(str(input_path))
@@ -223,7 +252,7 @@ def apply_sharpen_clip(
         cap.release()
         raise RuntimeError(f"could not open mask video: {mask_path}")
 
-    writer = open_ffmpeg_writer(partial_path, width, height, fps, processing_args)
+    writer = open_ffmpeg_writer(partial_path, width, height, fps_arg, processing_args)
     frames_written = 0
     try:
         while True:
@@ -272,6 +301,8 @@ def existing_output_is_valid(input_path: Path, output_path: Path) -> bool:
     try:
         in_w, in_h, in_frames, _in_fps = probe_video_meta(input_path)
         out_w, out_h, out_frames, _out_fps = probe_video_meta(output_path)
+        in_r_frame_rate, in_time_base = probe_video_timing(input_path)
+        out_r_frame_rate, out_time_base = probe_video_timing(output_path)
     except Exception:
         return False
     if in_w <= 0 or in_h <= 0 or out_w <= 0 or out_h <= 0:
@@ -279,6 +310,10 @@ def existing_output_is_valid(input_path: Path, output_path: Path) -> bool:
     if out_w != in_w or out_h != in_h:
         return False
     if in_frames > 0 and out_frames > 0 and out_frames != in_frames:
+        return False
+    if in_r_frame_rate and out_r_frame_rate and out_r_frame_rate != in_r_frame_rate:
+        return False
+    if in_time_base and out_time_base and out_time_base != in_time_base:
         return False
     return bool(out_frames > 0 or in_frames <= 0)
 

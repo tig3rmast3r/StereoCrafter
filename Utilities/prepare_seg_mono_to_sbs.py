@@ -46,11 +46,12 @@ def _probe_video_info(ffprobe_bin: str, video_path: Path) -> dict[str, int | str
         ffprobe_bin,
         "-v",
         "error",
-        "-select_streams",
-        "v:0",
         "-count_packets",
         "-show_entries",
-        "stream=width,height,nb_read_packets,nb_read_frames",
+        (
+            "stream=codec_type,width,height,nb_read_packets,nb_read_frames,"
+            "r_frame_rate,time_base,color_range,color_space,color_transfer,color_primaries"
+        ),
         "-of",
         "json",
         str(video_path),
@@ -73,7 +74,17 @@ def _probe_video_info(ffprobe_bin: str, video_path: Path) -> dict[str, int | str
     streams = doc.get("streams") or []
     if not streams:
         raise RuntimeError("missing video stream in ffprobe output")
-    st = streams[0] or {}
+    video_stream = None
+    extra_streams = 0
+    for stream in streams:
+        st = stream or {}
+        if str(st.get("codec_type") or "").strip().lower() == "video" and video_stream is None:
+            video_stream = st
+        elif str(st.get("codec_type") or "").strip().lower() != "video":
+            extra_streams += 1
+    if not video_stream:
+        raise RuntimeError("missing video stream in ffprobe output")
+    st = video_stream
     width = st.get("width")
     height = st.get("height")
     if width in (None, "", "N/A"):
@@ -93,6 +104,13 @@ def _probe_video_info(ffprobe_bin: str, video_path: Path) -> dict[str, int | str
         "width": int(float(width)),
         "height": int(float(height)),
         "packets": packet_count,
+        "r_frame_rate": str(st.get("r_frame_rate") or ""),
+        "time_base": str(st.get("time_base") or ""),
+        "color_range": str(st.get("color_range") or ""),
+        "color_space": str(st.get("color_space") or ""),
+        "color_transfer": str(st.get("color_transfer") or ""),
+        "color_primaries": str(st.get("color_primaries") or ""),
+        "extra_streams": int(extra_streams),
     }
 
 
@@ -163,6 +181,20 @@ def _is_existing_output_healthy(
         return False, "packet count unavailable"
     if abs(int(src_packets) - int(out_packets)) > 1:
         return False, f"packets={out_packets} expected={src_packets}"
+    src_r_frame_rate = str(src_info.get("r_frame_rate") or "").strip()
+    out_r_frame_rate = str(out_info.get("r_frame_rate") or "").strip()
+    if src_r_frame_rate and out_r_frame_rate and out_r_frame_rate != src_r_frame_rate:
+        return False, f"r_frame_rate={out_r_frame_rate} expected={src_r_frame_rate}"
+    src_time_base = str(src_info.get("time_base") or "").strip()
+    out_time_base = str(out_info.get("time_base") or "").strip()
+    if src_time_base and out_time_base and out_time_base != src_time_base:
+        return False, f"time_base={out_time_base} expected={src_time_base}"
+    if int(out_info.get("extra_streams") or 0) != 0:
+        return False, f"extra_streams={int(out_info.get('extra_streams') or 0)}"
+    for field in ("color_space", "color_transfer", "color_primaries"):
+        value = str(out_info.get(field) or "").strip().lower()
+        if value != "bt709":
+            return False, f"{field}={value or '(missing)'} expected=bt709"
     return True, "ok"
 
 
@@ -198,6 +230,12 @@ def _run_ffmpeg(
         filter_graph,
         "-map",
         "[v]",
+        "-map_metadata",
+        "-1",
+        "-map_chapters",
+        "-1",
+        "-write_tmcd",
+        "0",
         "-an",
         "-sn",
         "-dn",
@@ -210,6 +248,18 @@ def _run_ffmpeg(
         cmd.extend([f"-{quality_flag}", quality])
     if pix_fmt:
         cmd.extend(["-pix_fmt", pix_fmt])
+    cmd.extend(
+        [
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-movflags",
+            "+write_colr",
+        ]
+    )
     if extra_ffmpeg_args.strip():
         cmd.extend(shlex.split(extra_ffmpeg_args.strip()))
     cmd.append(str(dst))

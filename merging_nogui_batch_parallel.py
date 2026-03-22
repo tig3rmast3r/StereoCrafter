@@ -18,6 +18,7 @@ import argparse
 import csv
 import gc
 import glob
+import json
 import logging
 import os
 import re
@@ -47,6 +48,7 @@ from dependency.stereocrafter_util import (  # type: ignore
 
 LOG = logging.getLogger("merge_runner")
 _FAULTHANDLER_LOG = None
+PLANNED_RESTART_CODE = 99
 
 
 def _enable_debug_faulthandler(worker_id: Optional[int] = None) -> None:
@@ -100,6 +102,43 @@ def _clear_stop_marker(path: str) -> None:
             os.remove(path)
     except Exception:
         pass
+
+
+def _resume_state_path(output_folder: str, worker_id: int, num_workers: int) -> str:
+    suffix = f".w{int(worker_id)}of{int(num_workers)}"
+    return os.path.join(os.path.abspath(output_folder), f".merge_resume_state{suffix}.json")
+
+
+def _load_resume_state(path: str) -> Optional[Dict[str, object]]:
+    try:
+        if not path or not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        LOG.warning(f"Failed to read merge resume state {path}: {e}")
+    return None
+
+
+def _save_resume_state(path: str, data: Dict[str, object]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=True, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        LOG.warning(f"Failed writing merge resume state {path}: {e}")
+
+
+def _clear_resume_state(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        LOG.warning(f"Failed clearing merge resume state {path}: {e}")
 
 
 # =========================
@@ -1764,6 +1803,7 @@ class JobPaths:
     inpainted_base: str
     core_name: str
     is_sbs_input: bool
+    skipped_existing: bool
 
 
 def build_output_path(
@@ -2028,6 +2068,7 @@ def process_one_job(
                 os.path.splitext(inpainted_video_path)[0],
                 core_name,
                 is_sbs_input,
+                True,
             )
         if cleanup_partials and skip_existing and os.path.exists(precomputed_output_path):
             LOG.warning(
@@ -2155,7 +2196,17 @@ def process_one_job(
         if cleanup_partials:
             cleanup_partial_output_files(output_path)
         LOG.info(f"SKIP (exists): {os.path.basename(output_path)}")
-        return JobPaths(inpainted_video_path, splatted_video_path, original_video_path_to_move, replace_mask_path, output_path, inpainted_base, core_name, is_sbs_input)
+        return JobPaths(
+            inpainted_video_path,
+            splatted_video_path,
+            original_video_path_to_move,
+            replace_mask_path,
+            output_path,
+            inpainted_base,
+            core_name,
+            is_sbs_input,
+            True,
+        )
     if cleanup_partials and skip_existing and os.path.exists(output_path):
         LOG.warning(
             f"Removing invalid existing output before re-encode: {os.path.basename(output_path)}"
@@ -2638,7 +2689,17 @@ def process_one_job(
         torch.cuda.empty_cache()
 
     LOG.info(f"DONE: {os.path.basename(output_path)}")
-    return JobPaths(inpainted_video_path, splatted_video_path, original_video_path_to_move, replace_mask_path, output_path, inpainted_base, core_name, is_sbs_input)
+    return JobPaths(
+        inpainted_video_path,
+        splatted_video_path,
+        original_video_path_to_move,
+        replace_mask_path,
+        output_path,
+        inpainted_base,
+        core_name,
+        is_sbs_input,
+        False,
+    )
 
 
 def main() -> int:
@@ -2651,6 +2712,7 @@ def main() -> int:
     ap.add_argument("--original-folder", required=True, help="Folder containing original left-eye videos (single/dual-input case)")
     ap.add_argument("--output-folder", required=True, help="Output folder for merged files")
     ap.add_argument("--stop-marker", default="", help="Path to a marker file used for graceful stop-after-current-file behavior.")
+    ap.add_argument("--restart-every", type=int, default=0, help="Planned process restart after this many successfully processed non-skip files per worker (0=disabled).")
     ap.add_argument("--only", default=None, help="Process only one file (basename or prefix match)")
     ap.add_argument("--debug", action="store_true", default=False, help="Enable debug mode (or set MERGE_DEBUG=1).")
     ap.add_argument("--verbosity", type=int, default=None, help="0=warnings,1=info,2=debug")
@@ -2806,6 +2868,7 @@ def main() -> int:
         if args.stop_marker
         else _default_stop_marker_path(args.output_folder)
     )
+    restart_every = max(0, int(args.restart_every or 0))
 
     # Collect jobs
     pairs = collect_jobs(
@@ -2821,12 +2884,37 @@ def main() -> int:
     if wid < 0 or wid >= nw:
         LOG.error(f"Invalid --worker-id {wid} for --num-workers {nw}")
         return 2
+    resume_path = _resume_state_path(args.output_folder, worker_id=wid, num_workers=nw)
     if nw > 1:
         pairs = [p for i, p in enumerate(pairs) if (i % nw) == wid]
         LOG.info(f"[SHARD] worker {wid}/{nw} will process {len(pairs)} jobs")
     if not pairs:
         LOG.warning("No matching jobs found.")
+        _clear_resume_state(resume_path)
         return 0
+
+    resume_state = _load_resume_state(resume_path)
+    resume_start_idx = 0
+    if resume_state:
+        same_worker = (
+            int(resume_state.get("worker_id", -1)) == wid
+            and int(resume_state.get("num_workers", -1)) == nw
+        )
+        last_ok_idx = resume_state.get("last_ok_idx")
+        if same_worker and isinstance(last_ok_idx, int) and 0 <= last_ok_idx < len(pairs):
+            resume_start_idx = last_ok_idx + 1
+            if resume_start_idx < len(pairs):
+                LOG.info(
+                    f"[RESUME] worker {wid}/{nw} fast resume enabled. "
+                    f"Starting from job {resume_start_idx + 1}/{len(pairs)} without recheck."
+                )
+            else:
+                LOG.info(f"[RESUME] worker {wid}/{nw} checkpoint already points past the last job. Clearing stale state.")
+                _clear_resume_state(resume_path)
+                return 0
+        else:
+            LOG.warning(f"[RESUME] worker {wid}/{nw} invalid merge resume state, clearing: {resume_state}")
+            _clear_resume_state(resume_path)
 
     try:
         preloaded_ct_csv_blend_preset_map = _prepare_ct_csv_blend_map_once(settings)
@@ -2839,8 +2927,11 @@ def main() -> int:
     splat_finished_root = os.path.join(args.splatted_folder, "finished")
     orig_finished_root = os.path.join(args.original_folder, "finished")
     rm_finished_root = os.path.join(str(settings.get("replace_mask_folder") or args.splatted_folder), "finished")
+    processed_this_run = 0
 
-    for (inpainted_path, splatted_path) in pairs:
+    for local_idx, (inpainted_path, splatted_path) in enumerate(pairs):
+        if local_idx < resume_start_idx:
+            continue
         if _stop_marker_exists(stop_marker_path):
             LOG.info(f"[STOP] marker detected, stopping before next file: {stop_marker_path}")
             return 0
@@ -2930,6 +3021,28 @@ def main() -> int:
                 move_file(job_paths.splatted_video_path, splat_finished_root)
                 move_file(job_paths.original_video_path, orig_finished_root)
                 move_file(job_paths.replace_mask_path, rm_finished_root)
+            _save_resume_state(
+                resume_path,
+                {
+                    "kind": "merge_resume",
+                    "worker_id": wid,
+                    "num_workers": nw,
+                    "last_ok_idx": local_idx,
+                    "last_ok_input": inpainted_path,
+                    "updated_at": int(time.time()),
+                },
+            )
+            if job_paths is not None and not bool(job_paths.skipped_existing):
+                processed_this_run += 1
+                if restart_every > 0 and processed_this_run >= restart_every and (local_idx + 1) < len(pairs):
+                    LOG.info(
+                        "[PLANNED RESTART] "
+                        f"worker={wid}/{nw} "
+                        f"processed_this_run={processed_this_run} "
+                        f"last_ok_idx={local_idx} "
+                        f"code={PLANNED_RESTART_CODE}"
+                    )
+                    return PLANNED_RESTART_CODE
         else:
             LOG.error(f"GIVING UP: {base} -> {last_err}")
             # Final best-effort cleanup on terminal failure.
@@ -2950,6 +3063,7 @@ def main() -> int:
     if _stop_marker_exists(stop_marker_path):
         LOG.info(f"[STOP] marker still present at end of batch: {stop_marker_path}")
 
+    _clear_resume_state(resume_path)
     LOG.info("All done.")
     return 0
 

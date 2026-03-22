@@ -54,6 +54,8 @@ FFMPEG_CRF="${FFMPEG_CRF:-}"
 FFMPEG_PRESET="${FFMPEG_PRESET:-}"
 FFMPEG_PIX_FMT="${FFMPEG_PIX_FMT:-}"
 FFMPEG_EXTRA_ARGS="${FFMPEG_EXTRA_ARGS:-}"
+RESTART_EVERY="${RESTART_EVERY:-1}"
+PLANNED_RESTART_CODE="${PLANNED_RESTART_CODE:-99}"
 
 # ---------------------------------
 # Crash/kill retry policy (process)
@@ -86,6 +88,7 @@ CMD=(
   --original-folder "$ORIGINAL_FOLDER"
   --output-folder "$OUTPUT_FOLDER"
   --stop-marker "$STOP_MARKER"
+  --restart-every "$RESTART_EVERY"
   --output-format "$OUTPUT_FORMAT"
   --chunk-size "$CHUNK_SIZE"
   --ct-preset "$CT_PRESET"
@@ -294,6 +297,11 @@ while true; do
   if [ "$STOP_REQUESTED" -eq 1 ] || [ -f "$STOP_REQUEST_FILE" ]; then
     echo "[STOP] graceful stop completed (last rc=$code)"
     exit 0
+  fi
+
+  if [ "$code" -eq "$PLANNED_RESTART_CODE" ]; then
+    echo "[RESTART] planned process restart requested -> relaunching immediately"
+    continue
   fi
 
   if [ "$code" -eq 0 ] && [ ! -f "$STOP_MARKER" ]; then

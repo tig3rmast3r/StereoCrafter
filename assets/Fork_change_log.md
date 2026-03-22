@@ -142,3 +142,8 @@ Long live to 3D!!
 - [fix] existing sharpness.csv was not honored on test runs
 - [fix] AutoCT csv missing speed optimizations (2.5x faster)
 - [fix] Run stops when shapen step throws an error
+
+2026-03-22 (More Fixes)
+- [change] merging step will auto restart workers after each file to prevent RAM buildup
+- [fix] Sharpen clips had incorrect fps causing join step to fail
+- [fix] seg-mono to flat sbs clips was not identical to merged clips

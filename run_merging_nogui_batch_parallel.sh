@@ -37,6 +37,8 @@ FFMPEG_CRF="${FFMPEG_CRF:-}"
 FFMPEG_PRESET="${FFMPEG_PRESET:-}"
 FFMPEG_PIX_FMT="${FFMPEG_PIX_FMT:-}"
 FFMPEG_EXTRA_ARGS="${FFMPEG_EXTRA_ARGS:-}"
+RESTART_EVERY="${RESTART_EVERY:-1}"
+PLANNED_RESTART_CODE="${PLANNED_RESTART_CODE:-99}"
 
 MAX_RETRIES="${MAX_RETRIES:-100}"
 RETRY_SLEEP_SEC="${RETRY_SLEEP_SEC:-2}"
@@ -74,6 +76,7 @@ CMD=(
   --original-folder "$ORIGINAL_FOLDER"
   --output-folder "$OUTPUT_FOLDER"
   --stop-marker "$STOP_MARKER"
+  --restart-every "$RESTART_EVERY"
   --output-format "$OUTPUT_FORMAT"
   --chunk-size "$CHUNK_SIZE"
   --ct-preset "$CT_PRESET"
@@ -328,6 +331,14 @@ parse_worker_log_line() {
     echo "[RETRY] worker $wid ${line#*] }"
     return
   fi
+  if [[ "$line" =~ ^\[PLANNED[[:space:]]RESTART\] ]]; then
+    echo "[INFO] worker $wid ${line}"
+    return
+  fi
+  if [[ "$line" =~ ^\[RESUME\] ]]; then
+    echo "[INFO] worker $wid ${line}"
+    return
+  fi
   if [[ "$line" =~ ^\[FAIL[[:space:]]w${wid}\] ]]; then
     echo "[ERR ] worker $wid ${line}"
     return
@@ -423,6 +434,10 @@ run_worker_with_retries() {
     if [ -f "$STOP_REQUEST_FILE" ]; then
       echo "[STOP w$wid] graceful stop completed (last rc=$code)"
       return 0
+    fi
+    if [ "$code" -eq "$PLANNED_RESTART_CODE" ]; then
+      echo "[RESTART w$wid] planned process restart requested -> relaunching immediately"
+      continue
     fi
     if [ "$code" -eq 130 ]; then
       echo "[STOP w$wid] interrupted by user"

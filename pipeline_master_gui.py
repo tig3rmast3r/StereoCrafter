@@ -4539,6 +4539,7 @@ class PipelineMasterGUI:
             "FFMPEG_PRESET": self.merge_preset_var.get().strip(),
             "FFMPEG_PIX_FMT": self.merge_pix_fmt_var.get().strip(),
             "FFMPEG_EXTRA_ARGS": self.merge_extra_ffmpeg_args_var.get().strip(),
+            "RESTART_EVERY": "1",
         }
         if use_parallel:
             env_updates["WORKERS"] = str(workers)
