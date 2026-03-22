@@ -83,6 +83,9 @@ All the extra scripts are made multithreading/parallel when possible, helping re
 - due to many changes is almost impossible to merge right now but i want to really thank all the guys from TencentARC and the Enoky/Billynom8 fork that made so many improvements, as that fork is still quite active i'll try to cherry pick useful improvements when i see something that may fit this workflow<br>
 Long live to 3D!!
 
+### Time to encode
+- in linux with intel 265k 48GB Ram + RTX 4090 total time is 0.01x, that means 1h->100h required time. 80% of this time is taken by the inpainting step. A full power RTX 5090 (575+ Watts) is around 20% faster
+
 # CHANGE LOG
 
 2026-03-06
@@ -132,8 +135,10 @@ Long live to 3D!!
 - [changed] Fine tuned several defaults for auto mode according to the above change and to new tests with other sources, defaults are now tuned for a standard 1920*800 window as input
 - [fix] depthcrafter automatic download was loading an older model for img2vid
 
-2026-03-21
+2026-03-21 (Fixes!)
 - [fix] updated numpy in vast requirements
 - [fix] check files/test run behaviour
-- [fix] auto resume if pipeline_master_gui crashes duting a test run
+- [fix] auto resume if pipeline_master_gui crashes during a test run
 - [fix] existing sharpness.csv was not honored on test runs
+- [fix] AutoCT csv missing speed optimizations (2.5x faster)
+- [fix] Run stops when shapen step throws an error
