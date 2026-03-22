@@ -25,7 +25,7 @@ try:
 except Exception:
     ThemedTk = None
 
-GUI_VERSION = "2026-03-20"
+GUI_VERSION = "2026-03-22"
 
 
 class VerifyStopRequested(Exception):
@@ -257,6 +257,7 @@ class PipelineMasterGUI:
     PIPELINE_OPTIONAL_STEPS = {"sharpness_csv", "autoct_csv"}
     PIPELINE_VERIFY_CHOICES = ["Disabled", "Quick", "Deep"]
     PIPELINE_STATE_FILENAME = "pipeline_state.json"
+    PIPELINE_TEST_STATE_FILENAME = "pipeline_test_state.json"
     VERIFY_VIDEO_PATTERNS = ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"]
     VERIFY_REPLACE_MASK_PATTERNS = [
         "*_replace_mask.mp4",
@@ -361,6 +362,8 @@ class PipelineMasterGUI:
         self._pipeline_test_dir: str = ""
         self._pipeline_test_prev_paths: dict[str, str] = {}
         self._pipeline_test_step_state = self._default_pipeline_step_state()
+        self._pipeline_test_recovery_attempted = False
+        self._pipeline_skip_notice_steps: set[str] = set()
         self._pipeline_ui_noninteractive = False
         self._pipeline_popup_log_buffer: list[str] = []
         self.pipeline_popup_log_text: tk.Text | None = None
@@ -395,7 +398,7 @@ class PipelineMasterGUI:
         self._preview_scene_command()
         self._refresh_pipeline_status_panel()
         self._poll_log_queue()
-        self.root.after(200, self._start_source_analysis_on_startup)
+        self.root.after(200, self._run_startup_tasks)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -5281,7 +5284,7 @@ class PipelineMasterGUI:
             self._finalize_pipeline_stop(stop_label)
 
     def _try_parse_merge_progress(self, line: str) -> None:
-        m = re.search(r"^\[(?:RUN|OK|SKIP|ERR)\s*\]\s*(\d+)\s*/\s*(\d+)", line)
+        m = re.search(r"^\[(?:RUN|OK|SKIP|ERR|DONE)\s*\]\s*(\d+)\s*/\s*(\d+)", line)
         if m:
             try:
                 idx = int(m.group(1))
@@ -5292,8 +5295,6 @@ class PipelineMasterGUI:
             except Exception:
                 pass
             return
-        if line.startswith("[DONE]"):
-            self._log_queue.put(("merge_progress", "100"))
 
     def _validate_merge_mask_verify_inputs(self) -> tuple[bool, str, str, list[str]]:
         mask_dir = self.merge_mask_formerge_var.get().strip()
@@ -7761,6 +7762,68 @@ class PipelineMasterGUI:
                 out[str(p.resolve())] = p.resolve()
         return [out[k] for k in sorted(out.keys())]
 
+    def _pipeline_collect_seg_scene_names_and_stems(
+        self,
+        seg_dir: str,
+    ) -> tuple[list[str], list[str]]:
+        root = Path(seg_dir)
+        if not root.is_dir():
+            return [], []
+        names: list[str] = []
+        stems: list[str] = []
+        seen_stems: set[str] = set()
+        for path in self._collect_video_files_for_patterns(seg_dir, self.VERIFY_VIDEO_PATTERNS):
+            if not path.is_file():
+                continue
+            names.append(path.name)
+            stem = self._pipeline_scene_stem_from_name(path.name)
+            if stem and stem not in seen_stems:
+                seen_stems.add(stem)
+                stems.append(stem)
+        return names, stems
+
+    def _pipeline_collect_scene_coverage_stems(
+        self,
+        folder: str,
+        scene_stems: list[str],
+        patterns: list[str],
+        *,
+        must_contain: str = "",
+    ) -> set[str]:
+        covered: set[str] = set()
+        if not scene_stems:
+            return covered
+        files = self._pipeline_collect_scene_matched_files(
+            folder,
+            patterns,
+            scene_stems,
+            must_contain=must_contain,
+        )
+        for path in files:
+            name = path.name
+            for stem in scene_stems:
+                if self._pipeline_name_matches_scene_stem(name, stem):
+                    covered.add(stem)
+                    break
+        return covered
+
+    def _pipeline_count_scene_output_coverage(
+        self,
+        folder: str,
+        scene_stems: list[str],
+        patterns: list[str],
+        *,
+        must_contain: str = "",
+    ) -> int:
+        return len(
+            self._pipeline_collect_scene_coverage_stems(
+                folder,
+                scene_stems,
+                patterns,
+                must_contain=must_contain,
+            )
+        )
+
     def _pipeline_link_scene_files(
         self,
         src_dir: str,
@@ -7792,8 +7855,13 @@ class PipelineMasterGUI:
     ) -> None:
         if not src_csv or not os.path.isfile(src_csv):
             return
-        selected = {str(Path(x).name) for x in scene_names}
-        if not selected:
+        selected_names = {str(Path(x).name) for x in scene_names if str(x).strip()}
+        selected_stems = {
+            self._pipeline_scene_stem_from_name(x)
+            for x in scene_names
+            if self._pipeline_scene_stem_from_name(x)
+        }
+        if not selected_names and not selected_stems:
             return
         try:
             with open(src_csv, "r", newline="", encoding="utf-8") as f:
@@ -7804,7 +7872,10 @@ class PipelineMasterGUI:
                 rows = []
                 for row in reader:
                     file_name = str(Path(str((row or {}).get("file", "")).strip()).name)
-                    if file_name in selected:
+                    if file_name in selected_names or any(
+                        self._pipeline_name_matches_scene_stem(file_name, stem)
+                        for stem in selected_stems
+                    ):
                         rows.append(dict(row or {}))
             if not fieldnames:
                 return
@@ -7888,8 +7959,17 @@ class PipelineMasterGUI:
             scene_names
             and all((Path(scene_dir) / name).is_file() for name in scene_names)
         )
-        state["scenedetect"]["completed"] = scene_files_ready
-        state["split_scenes"]["completed"] = scene_files_ready
+        normal_scene_state = self._pipeline_step_state.get("scenedetect", {"completed": False})
+        normal_split_state = self._pipeline_step_state.get(
+            "split_scenes",
+            {"completed": False, "verified": "none"},
+        )
+        state["scenedetect"]["completed"] = bool(
+            scene_files_ready or bool(normal_scene_state.get("completed", False))
+        )
+        state["split_scenes"]["completed"] = bool(
+            scene_files_ready or bool(normal_split_state.get("completed", False))
+        )
         state["depthcrafter"]["completed"] = self._pipeline_test_has_scene_outputs(
             self.depth_output_var.get().strip(),
             scene_stems,
@@ -8008,6 +8088,183 @@ class PipelineMasterGUI:
             "join_input_var",
             "join_output_var",
         ]
+
+    @classmethod
+    def _pipeline_test_state_file(cls, test_root: Path | str) -> Path:
+        return Path(test_root).expanduser().resolve() / cls.PIPELINE_TEST_STATE_FILENAME
+
+    def _capture_pipeline_test_prev_paths(self) -> dict[str, str]:
+        prev_paths: dict[str, str] = {}
+        for var_name in self._pipeline_test_path_var_names():
+            var_obj = getattr(self, var_name, None)
+            if var_obj is not None:
+                prev_paths[var_name] = str(var_obj.get()).strip()
+        return prev_paths
+
+    def _save_pipeline_test_resume_state(self, test_root: Path | str) -> None:
+        test_root_path = Path(test_root).expanduser().resolve()
+        payload = {
+            "manifest": [str(x).strip() for x in (self._pipeline_test_manifest or []) if str(x).strip()],
+            "scene_stems": [str(x).strip() for x in (self._pipeline_test_scene_stems or []) if str(x).strip()],
+            "source_dir": str(self._pipeline_test_source_dir or "").strip(),
+            "prev_paths": {
+                str(k): str(v).strip()
+                for k, v in dict(self._pipeline_test_prev_paths or {}).items()
+                if str(k).strip()
+            },
+        }
+        try:
+            test_root_path.mkdir(parents=True, exist_ok=True)
+            self._pipeline_test_state_file(test_root_path).write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _load_pipeline_test_resume_state(self, test_root: Path | str) -> dict[str, object]:
+        path = self._pipeline_test_state_file(test_root)
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _run_startup_tasks(self) -> None:
+        if self._recover_pipeline_test_subset_on_startup():
+            return
+        self._start_source_analysis_on_startup()
+
+    def _recover_pipeline_test_subset_on_startup(self) -> bool:
+        if self._pipeline_test_recovery_attempted or self._pipeline_test_active:
+            return False
+        self._pipeline_test_recovery_attempted = True
+
+        work_root = Path(self.work_folder_var.get().strip() or "./work").resolve()
+        test_root = work_root / ".pipeline_test_subset"
+        if not test_root.is_dir():
+            return False
+
+        test_seg = test_root / "seg"
+        if not test_seg.is_dir():
+            return False
+
+        meta = self._load_pipeline_test_resume_state(test_root)
+        seg_files = self._collect_video_files_for_patterns(
+            str(test_seg),
+            self.VERIFY_VIDEO_PATTERNS,
+        )
+        seg_names = [p.name for p in seg_files if p.is_file()]
+        if not seg_names:
+            return False
+
+        meta_manifest = [str(x).strip() for x in (meta.get("manifest") or []) if str(x).strip()]
+        selected = [name for name in meta_manifest if (test_seg / name).is_file()]
+        if not selected:
+            selected = seg_names
+
+        scene_stems = [self._pipeline_scene_stem_from_name(x) for x in selected]
+        scene_stems = [s for s in scene_stems if s]
+        if not scene_stems:
+            return False
+
+        current_prev_paths = self._capture_pipeline_test_prev_paths()
+        meta_prev_paths_raw = meta.get("prev_paths") or {}
+        meta_prev_paths = (
+            {
+                str(k): str(v).strip()
+                for k, v in dict(meta_prev_paths_raw).items()
+                if str(k).strip()
+            }
+            if isinstance(meta_prev_paths_raw, dict)
+            else {}
+        )
+        prev_paths = {
+            var_name: str(meta_prev_paths.get(var_name) or current_prev_paths.get(var_name) or "").strip()
+            for var_name in self._pipeline_test_path_var_names()
+        }
+
+        test_depth = test_root / "depthmap"
+        test_depth_up = test_depth / "upscaled"
+        test_splat_root = test_root / "splat"
+        test_splat_hires = test_splat_root / "hires"
+        test_mask = test_root / "mask"
+        test_output = test_root / "output"
+        test_output_sharpen = test_root / "output-sharpen"
+        test_mask_formerge = test_root / "mask_for_merge"
+        test_sbs = test_root / "sbs"
+        test_final = test_root / "final"
+        sharp_csv_test = test_root / "sharpness_test.csv"
+        autoct_csv_test = test_root / "autoct_test.csv"
+
+        self.scene_output_var.set(str(test_seg))
+        self.depth_input_var.set(str(test_seg))
+        self.depth_output_var.set(str(test_depth))
+        self.depth_upscaled_var.set(str(test_depth_up))
+        self.splat_input_clips_var.set(str(test_seg))
+        self._sync_depth_to_splat_input_path()
+        self.splat_output_var.set(str(test_splat_root))
+        self.splat_mask_output_var.set(str(test_mask))
+        self.inpaint_input_var.set(str(test_splat_hires))
+        self.inpaint_mask_var.set(str(test_mask))
+        self.inpaint_output_var.set(str(test_output))
+        self.inpaint_sharpen_output_var.set(str(test_output_sharpen))
+        self.inpaint_sharpness_csv_var.set(str(sharp_csv_test))
+        self.merge_inpainted_var.set(str(test_output))
+        self.merge_splatted_var.set(str(test_splat_hires))
+        self.merge_original_var.set(str(test_seg))
+        self.merge_replace_mask_var.set(str(test_mask))
+        self.merge_mask_formerge_var.set(str(test_mask_formerge))
+        self.merge_output_var.set(str(test_sbs))
+        self.merge_autoct_csv_var.set(str(autoct_csv_test))
+        self.join_input_var.set(str(test_sbs))
+        self.join_output_var.set(str(test_final / "final_sbs_1080_hevc_nvenc.mp4"))
+
+        self._pipeline_test_active = True
+        self._pipeline_test_manifest = list(selected)
+        self._pipeline_test_scene_stems = list(scene_stems)
+        self._pipeline_test_source_dir = str(meta.get("source_dir") or current_prev_paths.get("scene_output_var") or "").strip()
+        self._pipeline_test_dir = str(test_root)
+        self._pipeline_test_prev_paths = dict(prev_paths)
+        self._pipeline_test_step_state = {
+            key: {
+                "completed": bool((self._pipeline_step_state.get(key) or {}).get("completed", False)),
+                "verified": (
+                    str((self._pipeline_step_state.get(key) or {}).get("verified", "none")).strip().lower()
+                    if str((self._pipeline_step_state.get(key) or {}).get("verified", "none")).strip().lower()
+                    in {"none", "quick", "deep"}
+                    else "none"
+                ),
+            }
+            for key, _label in self.PIPELINE_STEPS
+        }
+        self._pipeline_recompute_test_step_state()
+        self._preview_depth_command()
+        self._preview_splat_command()
+        self._preview_inpaint_command()
+        self._preview_merge_command()
+        self._preview_join_command()
+        self._refresh_pipeline_status_panel()
+
+        recover_msg = (
+            f"Recovered Test Run subset from disk ({len(selected)} scene clip(s)). "
+            "Resuming automatically from the first incomplete step."
+        )
+        self.pipeline_run_status_var.set(recover_msg)
+        self._append_pipeline_popup_log("INFO", "Startup Test Run Recovery", recover_msg)
+        self._pipeline_reset_skip_notices()
+        self.root.after(150, self._resume_recovered_test_subset_when_ready)
+        return True
+
+    def _resume_recovered_test_subset_when_ready(self) -> None:
+        if not self._pipeline_test_active:
+            return
+        if self._any_pipeline_activity():
+            self.root.after(250, self._resume_recovered_test_subset_when_ready)
+            return
+        self._pipeline_start_resume()
 
     def _default_pipeline_step_state(self) -> dict[str, dict[str, object]]:
         return {
@@ -8632,7 +8889,7 @@ class PipelineMasterGUI:
     def _pipeline_check_files(self, show_popup: bool = True) -> bool:
         seg_dir = self.scene_output_var.get().strip()
         out_dir = self.merge_output_var.get().strip()
-        seg_files = sorted([p for p in Path(seg_dir).glob("*.mp4") if p.is_file()]) if os.path.isdir(seg_dir) else []
+        scene_names, scene_stems = self._pipeline_collect_seg_scene_names_and_stems(seg_dir)
         scene_csv_path = self._scene_csv_path()
         scene_csv_present = self._scene_csv_exists(scene_csv_path)
         scene_entries, scene_csv_err = self._load_scene_csv_entries(scene_csv_path)
@@ -8644,7 +8901,7 @@ class PipelineMasterGUI:
         split_expected_count = len(expected_outputs)
         split_missing_count = len(missing_split_outputs)
 
-        if (not seg_files) and (not scene_csv_present):
+        if (not scene_names) and (not scene_csv_present):
             self.pipeline_checked_files_var.set("Check Files: missing scene CSV and split files")
             if show_popup:
                 messagebox.showwarning(
@@ -8658,22 +8915,43 @@ class PipelineMasterGUI:
 
         incomplete: list[str] = []
         completed: list[str] = []
-        if os.path.isdir(out_dir):
-            for p in seg_files:
-                stem = p.stem
-                patt = str(Path(out_dir) / f"{stem}_*_merged_*.*")
-                if glob.glob(patt):
-                    completed.append(p.name)
-                else:
-                    incomplete.append(p.name)
-        else:
-            incomplete = [p.name for p in seg_files]
+        merged_covered_stems = self._pipeline_collect_scene_coverage_stems(
+            out_dir,
+            scene_stems,
+            self.VERIFY_VIDEO_PATTERNS,
+            must_contain="_merged_",
+        )
+        for name in scene_names:
+            stem = self._pipeline_scene_stem_from_name(name)
+            if stem in merged_covered_stems:
+                completed.append(name)
+            else:
+                incomplete.append(name)
 
-        seg_count = len(seg_files)
-        depth_count = self._count_video_files(self.depth_output_var.get().strip())
-        depth_upscaled_count = self._count_video_files(self.depth_upscaled_var.get().strip())
-        splat_count = self._count_video_files(self._resolve_splat_hires_dir())
-        inpaint_count = self._count_video_files(self.inpaint_output_var.get().strip())
+        seg_count = len(scene_names)
+        seg_ref_count = len(scene_stems)
+        depth_count = self._pipeline_count_scene_output_coverage(
+            self.depth_output_var.get().strip(),
+            scene_stems,
+            self.VERIFY_VIDEO_PATTERNS,
+        )
+        depth_upscaled_count = self._pipeline_count_scene_output_coverage(
+            self.depth_upscaled_var.get().strip(),
+            scene_stems,
+            self.VERIFY_VIDEO_PATTERNS,
+        )
+        splat_count = self._pipeline_count_scene_output_coverage(
+            self._resolve_splat_hires_dir(),
+            scene_stems,
+            self.VERIFY_VIDEO_PATTERNS,
+            must_contain="_splatted",
+        )
+        inpaint_count = self._pipeline_count_scene_output_coverage(
+            self.inpaint_output_var.get().strip(),
+            scene_stems,
+            ["*_inpainted_right_eye.mp4", "*_inpainted_sbs.mp4"],
+            must_contain="_inpainted_",
+        )
         sharpen_expected, sharpen_err = self._collect_expected_sharpen_outputs(
             self.inpaint_input_var.get().strip(),
             self.inpaint_sharpness_csv_var.get().strip(),
@@ -8682,8 +8960,13 @@ class PipelineMasterGUI:
             self.inpaint_sharpen_output_var.get().strip(),
             sharpen_expected,
         )
-        mask_formerge_count = self._count_video_files(self.merge_mask_formerge_var.get().strip())
-        merge_count = self._count_video_files(self.merge_output_var.get().strip())
+        mask_formerge_count = self._pipeline_count_scene_output_coverage(
+            self.merge_mask_formerge_var.get().strip(),
+            scene_stems,
+            self.VERIFY_REPLACE_MASK_PATTERNS,
+            must_contain="_replace_mask",
+        )
+        merge_count = len(merged_covered_stems)
         mono_to_sbs_ok, _mono_msg, _mono_broken_output, _mono_broken_reference = (
             self._verify_join_mono_outputs_coverage(cleanup_incomplete=False)
         )
@@ -8692,54 +8975,76 @@ class PipelineMasterGUI:
         sharp_done = Path(self.inpaint_sharpness_csv_var.get().strip()).is_file()
         autoct_done = Path(self.merge_autoct_csv_var.get().strip()).is_file()
         split_ok = bool(split_csv_ok and split_expected_count > 0 and split_missing_count == 0 and not split_cov_err)
-        split_ref_count = split_expected_count if split_expected_count > 0 else seg_count
-
-        self._pipeline_set_completed("scenedetect", bool(scene_csv_present))
-        self._pipeline_set_completed("split_scenes", split_ok)
-        self._pipeline_set_completed(
-            "depthcrafter", split_ok and split_ref_count > 0 and depth_count >= split_ref_count
-        )
-        self._pipeline_set_completed(
-            "depth_upscale",
-            (
-                split_ok and split_ref_count > 0 and depth_upscaled_count >= split_ref_count
+        split_ref_count = split_expected_count if split_expected_count > 0 else seg_ref_count
+        prev_state = self._pipeline_step_state
+        prev_scene_done = bool((prev_state.get("scenedetect") or {}).get("completed", False))
+        prev_split_done = bool((prev_state.get("split_scenes") or {}).get("completed", False))
+        scene_ref_ready = seg_ref_count > 0
+        completed_map: dict[str, bool] = {
+            "scenedetect": bool(prev_scene_done or scene_csv_present),
+            "split_scenes": bool(prev_split_done or split_ok),
+            "depthcrafter": bool(scene_ref_ready and depth_count >= seg_ref_count),
+            "depth_upscale": (
+                bool(scene_ref_ready and depth_upscaled_count >= seg_ref_count)
                 if self._is_pipeline_step_required("depth_upscale")
                 else False
             ),
-        )
-        self._pipeline_set_completed(
-            "splatting", split_ok and split_ref_count > 0 and splat_count >= split_ref_count
-        )
-        self._pipeline_set_completed("sharpness_csv", sharp_done)
-        self._pipeline_set_completed(
-            "inpaint", split_ok and split_ref_count > 0 and inpaint_count >= split_ref_count
-        )
-        self._pipeline_set_completed(
-            "sharpen",
-            (
-                not sharpen_err
-                and (
-                    len(sharpen_expected) == 0
-                    or sharpen_count >= len(sharpen_expected)
+            "splatting": bool(scene_ref_ready and splat_count >= seg_ref_count),
+            "inpaint": bool(scene_ref_ready and inpaint_count >= seg_ref_count),
+            "sharpen": (
+                bool(
+                    not sharpen_err
+                    and (
+                        len(sharpen_expected) == 0
+                        or sharpen_count >= len(sharpen_expected)
+                    )
                 )
-            )
-            if self._is_pipeline_step_required("sharpen")
-            else False,
+                if self._is_pipeline_step_required("sharpen")
+                else False
+            ),
+            "mask_for_merge": bool(scene_ref_ready and mask_formerge_count >= seg_ref_count),
+            "merging": bool(scene_ref_ready and merge_count >= seg_ref_count),
+            "mono_to_sbs": bool(mono_to_sbs_ok),
+            "join": bool(join_done),
+            "remux": bool(remux_done),
+        }
+
+        sharpness_csv_idx = next(
+            idx for idx, (step_name, _label) in enumerate(self.PIPELINE_STEPS) if step_name == "sharpness_csv"
         )
-        self._pipeline_set_completed("autoct_csv", autoct_done)
-        self._pipeline_set_completed(
-            "mask_for_merge", split_ok and split_ref_count > 0 and mask_formerge_count >= split_ref_count
+        autoct_csv_idx = next(
+            idx for idx, (step_name, _label) in enumerate(self.PIPELINE_STEPS) if step_name == "autoct_csv"
         )
-        self._pipeline_set_completed(
-            "merging", split_ok and split_ref_count > 0 and merge_count >= split_ref_count
+
+        def _upstream_steps_completed(limit_idx: int) -> bool:
+            for step_name, _label in self.PIPELINE_STEPS[:limit_idx]:
+                if not self._is_pipeline_step_required(step_name):
+                    continue
+                if not completed_map.get(step_name, False):
+                    return False
+            return True
+
+        prev_sharp_done = bool((prev_state.get("sharpness_csv") or {}).get("completed", False))
+        prev_autoct_done = bool((prev_state.get("autoct_csv") or {}).get("completed", False))
+        completed_map["sharpness_csv"] = (
+            bool(prev_sharp_done or sharp_done)
+            if self._is_pipeline_step_required("sharpness_csv") and _upstream_steps_completed(sharpness_csv_idx)
+            else False
         )
-        self._pipeline_set_completed("mono_to_sbs", bool(mono_to_sbs_ok))
-        self._pipeline_set_completed("join", bool(join_done))
-        self._pipeline_set_completed("remux", bool(remux_done))
+        completed_map["autoct_csv"] = (
+            bool(prev_autoct_done or autoct_done)
+            if self._is_pipeline_step_required("autoct_csv") and _upstream_steps_completed(autoct_csv_idx)
+            else False
+        )
+
+        for step_name, _label in self.PIPELINE_STEPS:
+            self._pipeline_set_completed(step_name, completed_map.get(step_name, False))
 
         self._pipeline_file_scan = {
             "seg_total": seg_count,
             "seg_expected": split_ref_count,
+            "seg_scene_stems": list(scene_stems),
+            "split_ok_actual": bool(split_ok),
             "split_missing": [str(Path(p).name) for p in missing_split_outputs],
             "completed_final": completed,
             "incomplete_final": incomplete,
@@ -8785,17 +9090,14 @@ class PipelineMasterGUI:
             messagebox.showinfo("Test Run", "Stop running tasks before starting a test run.")
             self._pipeline_sync_noninteractive_mode()
             return
-        if not self._pipeline_check_files_done:
-            if not self._pipeline_check_files(show_popup=False):
-                self._pipeline_sync_noninteractive_mode()
-                return
-        split_state = self._pipeline_step_state.get(
-            "split_scenes", {"completed": False, "verified": "none"}
-        )
-        if not bool(split_state.get("completed", False)):
+        if not self._pipeline_check_files(show_popup=False):
+            self._pipeline_sync_noninteractive_mode()
+            return
+        split_state = self._pipeline_step_state.get("split_scenes", {"verified": "none"})
+        if int(self._pipeline_file_scan.get("seg_total") or 0) < 1:
             messagebox.showwarning(
                 "Test Run",
-                "Complete Split Scenes first. Test Run requires scene clips.",
+                "No scene clips found in seg. Test Run requires split scene files.",
             )
             self._pipeline_sync_noninteractive_mode()
             return
@@ -8839,6 +9141,7 @@ class PipelineMasterGUI:
             "Non-interactive mode enabled: popups are suppressed and auto-accepted.",
         )
         self.pipeline_run_status_var.set("Test run active (isolated subset)")
+        self._pipeline_reset_skip_notices()
         self._pipeline_autorun = True
         self._pipeline_stop_requested = False
         self._pipeline_pending_action = None
@@ -9031,7 +9334,19 @@ class PipelineMasterGUI:
         self._pipeline_test_source_dir = str(source_seg)
         self._pipeline_test_dir = str(test_root)
         self._pipeline_test_prev_paths = dict(prev_paths)
-        self._pipeline_test_step_state = self._default_pipeline_step_state()
+        self._pipeline_test_step_state = {
+            key: {
+                "completed": bool((self._pipeline_step_state.get(key) or {}).get("completed", False)),
+                "verified": (
+                    str((self._pipeline_step_state.get(key) or {}).get("verified", "none")).strip().lower()
+                    if str((self._pipeline_step_state.get(key) or {}).get("verified", "none")).strip().lower()
+                    in {"none", "quick", "deep"}
+                    else "none"
+                ),
+            }
+            for key, _label in self.PIPELINE_STEPS
+        }
+        self._save_pipeline_test_resume_state(test_root)
         self._pipeline_recompute_test_step_state()
 
         self._preview_depth_command()
@@ -9381,6 +9696,7 @@ class PipelineMasterGUI:
             "Start/Resume",
             "Non-interactive mode enabled: popups are suppressed and routed to this log.",
         )
+        self._pipeline_reset_skip_notices()
         self._pipeline_autorun = True
         self._pipeline_pending_action = None
         self.pipeline_run_status_var.set("Start/Resume running...")
@@ -9397,6 +9713,38 @@ class PipelineMasterGUI:
         if verify_mode == "deep":
             return verified != "deep"
         return False
+
+    def _pipeline_reset_skip_notices(self) -> None:
+        self._pipeline_skip_notice_steps.clear()
+
+    def _pipeline_maybe_log_completed_autoct_skip(self, next_step: str) -> None:
+        if "autoct_csv" in self._pipeline_skip_notice_steps:
+            return
+        if not self._is_pipeline_step_required("autoct_csv"):
+            return
+        step_state = (
+            self._pipeline_test_step_state
+            if self._pipeline_test_active
+            else self._pipeline_step_state
+        )
+        if not bool((step_state.get("autoct_csv") or {}).get("completed", False)):
+            return
+        step_order = [name for name, _label in self.PIPELINE_STEPS]
+        try:
+            next_idx = step_order.index(str(next_step).strip())
+            autoct_idx = step_order.index("autoct_csv")
+        except ValueError:
+            return
+        if next_idx <= autoct_idx:
+            return
+        msg = (
+            "[AUTOCT] Existing CSV already valid for current test subset. "
+            "Skipping AutoCT CSV step."
+            if self._pipeline_test_active
+            else "[AUTOCT] Existing CSV already marked complete. Skipping AutoCT CSV step."
+        )
+        self._append_merge_log(msg)
+        self._pipeline_skip_notice_steps.add("autoct_csv")
 
     def _show_pipeline_force_info(self, title: str, message: str) -> None:
         fn = self._messagebox_originals.get("showinfo")
@@ -9428,6 +9776,7 @@ class PipelineMasterGUI:
             return
 
         step, act, mode = action
+        self._pipeline_maybe_log_completed_autoct_skip(step)
         self._pipeline_pending_action = (step, act, mode)
         started = False
         if act == "run":

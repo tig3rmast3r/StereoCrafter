@@ -994,6 +994,7 @@ CT_CSV_BLEND_OSC_ALPHA = 0.80
 CT_CSV_BLEND_OSC_WINDOW = 6
 CT_CSV_BLEND_MAX_ACTIVE_PRESETS = 4
 CT_CSV_BLEND_PRUNE_EPS = 1e-3
+CT_MIN_MASK_PIXELS = 64
 
 
 def _resolve_ct_auto_mode_label(value: Any) -> str:
@@ -4303,6 +4304,7 @@ class MergingGUI(ThemedTk):
                 # 4. Loop through chunks
                 chunk_size = settings.get("batch_chunk_size", 32)
                 ct_usage_counts = {int(p["id"]): 0.0 for p in CT_PRESETS}
+                ct_low_mask_frames = 0
                 selected_label = _resolve_ct_preset_label(
                     settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL)
                 )
@@ -4550,6 +4552,12 @@ class MergingGUI(ThemedTk):
                                 original_left_3 = original_left[frame_idx].cpu()
                                 warped_3 = warped_original[frame_idx].cpu()
                                 mask_bin_1hw = mask_bin[frame_idx].cpu()
+                                mask_pixels = int((mask_bin_1hw > 0.5).sum().item())
+
+                                if mask_pixels < CT_MIN_MASK_PIXELS:
+                                    ct_low_mask_frames += 1
+                                    adjusted_frames.append(inpainted_3.to(device))
+                                    continue
 
                                 if eval_candidate_ids is not None:
                                     best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
@@ -4853,6 +4861,14 @@ class MergingGUI(ThemedTk):
                                     t
                                 ),
                             )
+                    elif ct_low_mask_frames > 0:
+                        self.after(
+                            0,
+                            lambda t=(
+                                f"Auto CT skipped: low mask "
+                                f"(<{CT_MIN_MASK_PIXELS}px)"
+                            ): self.auto_ct_best_var.set(t),
+                        )
 
                 if ffmpeg_process.stdin:
                     ffmpeg_process.stdin.close()
@@ -5713,76 +5729,113 @@ class MergingGUI(ThemedTk):
                     else right_eye_original.cpu()
                 )
                 mask_bin_1hw = mask_bin[0].cpu() if mask_bin.dim() == 4 else mask_bin.cpu()
+                mask_pixels = int((mask_bin_1hw > 0.5).sum().item())
 
-                if ct_auto_mode == CT_AUTO_MODE_ON:
-                    candidate_ids = list(CT_PRESET_AUTO_EVAL_ORDER)
-                    with ThreadPoolExecutor(max_workers=CT_AUTO_EVAL_MAX_WORKERS) as ct_eval_executor:
-                        best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
-                            inpainted_3=inpainted_3,
-                            original_left_3=original_left_3,
-                            warped_3=warped_3,
-                            mask_bin_1hw=mask_bin_1hw,
-                            settings=params,
-                            fallback_preset_id=int(selected_preset["id"]),
-                            candidate_preset_ids=candidate_ids,
-                            executor=ct_eval_executor,
-                        )
-                    out_3 = best_frame.to(device)
-                    self.auto_ct_best_var.set(f"Auto CT best: #{best_preset_id} (preview)")
+                if mask_pixels < CT_MIN_MASK_PIXELS:
+                    out_3 = inpainted_3.to(device)
+                    self.auto_ct_best_var.set(
+                        f"Auto CT skipped: low mask ({mask_pixels}px)"
+                    )
                 else:
-                    if ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
-                        show_blend_preview = bool(
-                            params.get("show_blend_in_preview", True)
-                        )
-                        weights_sorted = sorted(
-                            csv_blend_weights_for_frame.items(),
-                            key=lambda kv: kv[1],
-                            reverse=True,
-                        )
-                        if weights_sorted:
-                            main_pid = int(weights_sorted[0][0])
-                            main_pct = float(weights_sorted[0][1]) * 100.0
-                        else:
-                            main_pid = int(selected_preset["id"])
-                            main_pct = 100.0
-                        apply_weights = (
-                            dict(csv_blend_weights_for_frame)
-                            if show_blend_preview
-                            else {int(csv_detected_preset_for_frame): 1.0}
-                        )
-                        stats_valid_cache: Dict[str, torch.Tensor] = {}
-                        warped_ref_cache: Dict[str, torch.Tensor] = {}
-                        out_mix: Optional[torch.Tensor] = None
-                        for pid_i, weight_i in sorted(
-                            apply_weights.items(),
-                            key=lambda kv: kv[1],
-                            reverse=True,
-                        ):
-                            pid = int(pid_i)
-                            w = float(max(0.0, min(1.0, float(weight_i))))
-                            if w <= 0.0:
-                                continue
-                            preset_i = CT_PRESET_BY_ID.get(pid, selected_preset)
-                            adjusted_3 = _apply_ct_preset_frame(
-                                preset=preset_i,
+                    if ct_auto_mode == CT_AUTO_MODE_ON:
+                        candidate_ids = list(CT_PRESET_AUTO_EVAL_ORDER)
+                        with ThreadPoolExecutor(max_workers=CT_AUTO_EVAL_MAX_WORKERS) as ct_eval_executor:
+                            best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
                                 inpainted_3=inpainted_3,
                                 original_left_3=original_left_3,
                                 warped_3=warped_3,
                                 mask_bin_1hw=mask_bin_1hw,
                                 settings=params,
-                                stats_valid_cache=stats_valid_cache,
-                                warped_ref_cache=warped_ref_cache,
+                                fallback_preset_id=int(selected_preset["id"]),
+                                candidate_preset_ids=candidate_ids,
+                                executor=ct_eval_executor,
                             )
-                            if out_mix is None:
-                                out_mix = adjusted_3 * w
+                        out_3 = best_frame.to(device)
+                        self.auto_ct_best_var.set(f"Auto CT best: #{best_preset_id} (preview)")
+                    else:
+                        if ct_auto_mode == CT_AUTO_MODE_CSV_BLEND:
+                            show_blend_preview = bool(
+                                params.get("show_blend_in_preview", True)
+                            )
+                            weights_sorted = sorted(
+                                csv_blend_weights_for_frame.items(),
+                                key=lambda kv: kv[1],
+                                reverse=True,
+                            )
+                            if weights_sorted:
+                                main_pid = int(weights_sorted[0][0])
+                                main_pct = float(weights_sorted[0][1]) * 100.0
                             else:
-                                out_mix = out_mix + (adjusted_3 * w)
-                        if out_mix is None:
-                            fallback_selected_id = int(selected_preset["id"])
+                                main_pid = int(selected_preset["id"])
+                                main_pct = 100.0
+                            apply_weights = (
+                                dict(csv_blend_weights_for_frame)
+                                if show_blend_preview
+                                else {int(csv_detected_preset_for_frame): 1.0}
+                            )
+                            stats_valid_cache: Dict[str, torch.Tensor] = {}
+                            warped_ref_cache: Dict[str, torch.Tensor] = {}
+                            out_mix: Optional[torch.Tensor] = None
+                            for pid_i, weight_i in sorted(
+                                apply_weights.items(),
+                                key=lambda kv: kv[1],
+                                reverse=True,
+                            ):
+                                pid = int(pid_i)
+                                w = float(max(0.0, min(1.0, float(weight_i))))
+                                if w <= 0.0:
+                                    continue
+                                preset_i = CT_PRESET_BY_ID.get(pid, selected_preset)
+                                adjusted_3 = _apply_ct_preset_frame(
+                                    preset=preset_i,
+                                    inpainted_3=inpainted_3,
+                                    original_left_3=original_left_3,
+                                    warped_3=warped_3,
+                                    mask_bin_1hw=mask_bin_1hw,
+                                    settings=params,
+                                    stats_valid_cache=stats_valid_cache,
+                                    warped_ref_cache=warped_ref_cache,
+                                )
+                                if out_mix is None:
+                                    out_mix = adjusted_3 * w
+                                else:
+                                    out_mix = out_mix + (adjusted_3 * w)
+                            if out_mix is None:
+                                fallback_selected_id = int(selected_preset["id"])
+                                stats_valid_cache = {}
+                                warped_ref_cache = {}
+                                out_mix = _apply_ct_preset_frame(
+                                    preset=CT_PRESET_BY_ID[fallback_selected_id],
+                                    inpainted_3=inpainted_3,
+                                    original_left_3=original_left_3,
+                                    warped_3=warped_3,
+                                    mask_bin_1hw=mask_bin_1hw,
+                                    settings=params,
+                                    stats_valid_cache=stats_valid_cache,
+                                    warped_ref_cache=warped_ref_cache,
+                                )
+                            out_3 = torch.clamp(out_mix, 0.0, 1.0).to(device)
+                            blend_txt = ", ".join(
+                                [
+                                    f"#{int(pid)}:{(100.0 * float(w)):.0f}%"
+                                    for pid, w in weights_sorted[:4]
+                                ]
+                            ) or f"#{main_pid}:100%"
+                            if show_blend_preview:
+                                self.auto_ct_best_var.set(
+                                    f"Auto CT CSV preview BLEND | main=#{main_pid} ({main_pct:.0f}%) | detected=#{int(csv_detected_preset_for_frame)} | {blend_txt}"
+                                )
+                            else:
+                                self.auto_ct_best_var.set(
+                                    f"Auto CT CSV preview DETECTED | #{int(csv_detected_preset_for_frame)} (blend off) | planned {blend_txt}"
+                                )
+                        else:
                             stats_valid_cache = {}
                             warped_ref_cache = {}
-                            out_mix = _apply_ct_preset_frame(
-                                preset=CT_PRESET_BY_ID[fallback_selected_id],
+                            selected_id_for_frame = int(selected_preset["id"])
+                            selected_preset_for_frame = selected_preset
+                            out_3 = _apply_ct_preset_frame(
+                                preset=selected_preset_for_frame,
                                 inpainted_3=inpainted_3,
                                 original_left_3=original_left_3,
                                 warped_3=warped_3,
@@ -5790,40 +5843,10 @@ class MergingGUI(ThemedTk):
                                 settings=params,
                                 stats_valid_cache=stats_valid_cache,
                                 warped_ref_cache=warped_ref_cache,
-                            )
-                        out_3 = torch.clamp(out_mix, 0.0, 1.0).to(device)
-                        blend_txt = ", ".join(
-                            [
-                                f"#{int(pid)}:{(100.0 * float(w)):.0f}%"
-                                for pid, w in weights_sorted[:4]
-                            ]
-                        ) or f"#{main_pid}:100%"
-                        if show_blend_preview:
+                            ).to(device)
                             self.auto_ct_best_var.set(
-                                f"Auto CT CSV preview BLEND | main=#{main_pid} ({main_pct:.0f}%) | detected=#{int(csv_detected_preset_for_frame)} | {blend_txt}"
+                                f"Auto CT best: #{selected_id_for_frame} (manual)"
                             )
-                        else:
-                            self.auto_ct_best_var.set(
-                                f"Auto CT CSV preview DETECTED | #{int(csv_detected_preset_for_frame)} (blend off) | planned {blend_txt}"
-                            )
-                    else:
-                        selected_id_for_frame = int(selected_preset["id"])
-                        selected_preset_for_frame = selected_preset
-                        stats_valid_cache = {}
-                        warped_ref_cache = {}
-                        out_3 = _apply_ct_preset_frame(
-                            preset=selected_preset_for_frame,
-                            inpainted_3=inpainted_3,
-                            original_left_3=original_left_3,
-                            warped_3=warped_3,
-                            mask_bin_1hw=mask_bin_1hw,
-                            settings=params,
-                            stats_valid_cache=stats_valid_cache,
-                            warped_ref_cache=warped_ref_cache,
-                        ).to(device)
-                        self.auto_ct_best_var.set(
-                            f"Auto CT best: #{selected_id_for_frame} (manual)"
-                        )
 
                 if inpainted.dim() == 4:
                     inpainted = out_3.unsqueeze(0)

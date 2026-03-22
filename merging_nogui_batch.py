@@ -539,6 +539,7 @@ CT_CSV_BLEND_OSC_ALPHA = 0.80
 CT_CSV_BLEND_OSC_WINDOW = 6
 CT_CSV_BLEND_MAX_ACTIVE_PRESETS = 4
 CT_CSV_BLEND_PRUNE_EPS = 1e-3
+CT_MIN_MASK_PIXELS = 64
 
 
 def _resolve_ct_auto_mode_label(value: Any) -> str:
@@ -2173,6 +2174,7 @@ def process_one_job(
     device = torch.device("cuda" if use_gpu else "cpu")
     use_gpu_mask_ops = bool(settings.get("use_gpu_mask_ops", use_gpu)) and use_gpu
     ct_usage_counts = {int(p["id"]): 0.0 for p in CT_PRESETS}
+    ct_low_mask_frames = 0
     selected_ct_label = _resolve_ct_preset_label(
         str(settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL))
     )
@@ -2401,6 +2403,12 @@ def process_one_job(
                         original_left_3 = original_left[fi].cpu()
                         warped_3 = warped_original[fi].cpu()
                         mask_bin_1hw = mask_bin[fi].cpu()
+                        mask_pixels = int((mask_bin_1hw > 0.5).sum().item())
+
+                        if mask_pixels < CT_MIN_MASK_PIXELS:
+                            ct_low_mask_frames += 1
+                            adjusted_frames.append(inpainted_3.to(device))
+                            continue
 
                         if ct_auto_mode == CT_AUTO_MODE_ON:
                             best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
@@ -2566,6 +2574,11 @@ def process_one_job(
                     ]
                 )
                 LOG.info(f"CT usage [{inpainted_base_name}] {ct_line}")
+            elif ct_low_mask_frames > 0:
+                LOG.info(
+                    f"CT skipped on low-mask frames [{inpainted_base_name}] "
+                    f"frames={ct_low_mask_frames} min_mask_pixels={CT_MIN_MASK_PIXELS}"
+                )
 
         # 6) Finalize ffmpeg
         try:

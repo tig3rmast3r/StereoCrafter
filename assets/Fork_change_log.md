@@ -114,7 +114,7 @@ Long live to 3D!!
 - [fix] wrong progress feedback for merging script on errors/restarts
 - [fix] verifyscenes will also delete apparently good files but with wrong length
 
-2026-04-16 (New Scenes requeue utility, better "Stop" and fixes)
+2026-03-16 (New Scenes requeue utility, better "Stop" and fixes)
 - [new] New Utility that will automatically move/delete selected scenes from the project in order to re-process them again. It accepts annotations csv from Utilities/run_sbs_left_click_logger_player.sh or manual names on the specified TextBox (file name in this case will automatically set the step)
 - [new] Start/resume will now become "Stop" when running, in order to stop the run even during verifyscenes
 - [new] Verifyscenes buttons will become "Stop" when is running, allowing to stop it
@@ -132,3 +132,8 @@ Long live to 3D!!
 - [changed] Fine tuned several defaults for auto mode according to the above change and to new tests with other sources, defaults are now tuned for a standard 1920*800 window as input
 - [fix] depthcrafter automatic download was loading an older model for img2vid
 
+2026-03-21
+- [fix] updated numpy in vast requirements
+- [fix] check files/test run behaviour
+- [fix] auto resume if pipeline_master_gui crashes duting a test run
+- [fix] existing sharpness.csv was not honored on test runs

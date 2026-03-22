@@ -35,6 +35,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from merging_nogui_batch import (
+    CT_AUTO_EVAL_MAX_WORKERS,
     _select_best_auto_ct_preset_frame,
     collect_jobs,
     find_replace_mask_for_splatted,
@@ -56,6 +57,7 @@ DEFAULT_CT_SETTINGS: Dict[str, object] = {
     "ct_exclude_black_in_target": True,
     "ct_ring_width": 20,
 }
+CT_MIN_MASK_PIXELS = 64
 
 def _safe_uint(v: int) -> int:
     try:
@@ -307,7 +309,7 @@ def _process_video_job(
 
     rows: List[Dict[str, object]] = []
     total_frames = len(frame_idx_all)
-    min_mask_pixels = max(1, int(args.min_mask_pixels))
+    min_mask_pixels = CT_MIN_MASK_PIXELS
     sample_chunk_size = max(1, int(args.sample_chunk_size))
     reload_every_chunks = max(0, int(args.reload_readers_every_chunks))
     chunks_since_reload = 0
@@ -325,170 +327,177 @@ def _process_video_job(
 
     pending_progress_total = 0
     pending_progress_complete = 0
+    progress_flush_every = 8 if progress_queue is not None else 32
 
-    for chunk_start in range(0, total_frames, sample_chunk_size):
-        if (
-            reload_every_chunks > 0
-            and chunk_start > 0
-            and chunks_since_reload >= reload_every_chunks
-        ):
-            _dbg(
-                args,
-                f"{inpainted_name}: reloading readers after {chunks_since_reload} chunks",
-            )
-            try:
-                del inpainted_reader, splatted_reader, original_reader
-                if replace_mask_reader is not None:
-                    del replace_mask_reader
-                gc.collect()
-                (
-                    inpainted_reader,
-                    splatted_reader,
-                    original_reader,
-                    replace_mask_reader,
-                ) = _open_all_readers()
-                chunks_since_reload = 0
-            except Exception as e:
-                print(f"[WARN] reader reload failed for {inpainted_name}: {e}")
-                break
-
-        chunk_idx = frame_idx_all[chunk_start : chunk_start + sample_chunk_size]
-        if not chunk_idx:
-            continue
-        chunk_tag = (
-            f"{inpainted_name} chunk {chunk_start // sample_chunk_size + 1}/"
-            f"{(total_frames + sample_chunk_size - 1) // sample_chunk_size} "
-            f"(frames {chunk_idx[0]}..{chunk_idx[-1]}, n={len(chunk_idx)})"
-        )
-        _dbg(args, f"read {chunk_tag}")
-
-        try:
-            inpainted_np = inpainted_reader.get_batch(chunk_idx).asnumpy()
-            splatted_np = splatted_reader.get_batch(chunk_idx).asnumpy()
-            original_np = original_reader.get_batch(chunk_idx).asnumpy()
-            replace_mask_np = None
-            if replace_mask_reader is not None:
-                replace_mask_np = replace_mask_reader.get_batch(chunk_idx).asnumpy()
-        except Exception as e:
-            print(f"[WARN] read failed for {chunk_tag}: {e}")
-            _dbg(args, f"skip {chunk_tag} due to read failure")
-            continue
-
-        inpainted_t = torch.from_numpy(inpainted_np).permute(0, 3, 1, 2).float() / 255.0
-        splatted_t = torch.from_numpy(splatted_np).permute(0, 3, 1, 2).float() / 255.0
-        original_left_t = torch.from_numpy(original_np).permute(0, 3, 1, 2).float() / 255.0
-
-        if is_sbs_input:
-            inpainted_t = inpainted_t[:, :, :, inpainted_t.shape[3] // 2 :]
-
-        _, _, h_splat, w_splat = splatted_t.shape
-        if is_single_input:
-            mask_raw = torch.zeros_like(splatted_t)
-            warped_t = splatted_t
-        elif is_dual_input:
-            mask_raw = splatted_t[:, :, :, : w_splat // 2]
-            warped_t = splatted_t[:, :, :, w_splat // 2 :]
-        else:
-            original_left_t = splatted_t[:, :, : h_splat // 2, : w_splat // 2]
-            mask_raw = splatted_t[:, :, h_splat // 2 :, : w_splat // 2]
-            warped_t = splatted_t[:, :, h_splat // 2 :, w_splat // 2 :]
-
-        if replace_mask_np is not None:
-            if replace_mask_np.ndim == 4 and replace_mask_np.shape[3] >= 1:
-                rm_gray = replace_mask_np[..., :3].mean(axis=3)
-            elif replace_mask_np.ndim == 3:
-                rm_gray = replace_mask_np
-            else:
-                rm_gray = np.squeeze(replace_mask_np)
-            rm_gray = rm_gray.astype(np.float32)
-            if rm_gray.size > 0 and float(np.nanmax(rm_gray)) > 1.5:
-                rm_gray = rm_gray / 255.0
-            rm_t = torch.from_numpy(rm_gray).float().unsqueeze(1)
-            if rm_t.shape[2:] != mask_raw.shape[2:]:
-                rm_t = torch.nn.functional.interpolate(
-                    rm_t, size=mask_raw.shape[2:], mode="nearest"
+    ct_eval_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, int(CT_AUTO_EVAL_MAX_WORKERS))
+    )
+    try:
+        for chunk_start in range(0, total_frames, sample_chunk_size):
+            if (
+                reload_every_chunks > 0
+                and chunk_start > 0
+                and chunks_since_reload >= reload_every_chunks
+            ):
+                _dbg(
+                    args,
+                    f"{inpainted_name}: reloading readers after {chunks_since_reload} chunks",
                 )
-            mask_raw = rm_t.repeat(1, 3, 1, 1)
-
-        mask_clean = mask_raw[:, 0:1, :, :].float()
-        bin_thr = float(args.mask_binarize_threshold)
-        if bin_thr >= 0.0:
-            mask_bin_clean = (mask_clean > bin_thr).float()
-        else:
-            mask_bin_clean = (mask_clean > 0.5).float()
-        mask_bin = (mask_bin_clean > float(args.mask_threshold)).float()
-
-        for fi in range(inpainted_t.shape[0]):
-            frame_no = int(chunk_idx[fi])
-            inpainted_3 = inpainted_t[fi].cpu()
-            original_3 = original_left_t[fi].cpu()
-            warped_3 = warped_t[fi].cpu()
-            mask_1hw = mask_bin[fi].cpu()
-
-            mask_pixels = int((mask_1hw.squeeze(0).numpy() > 0.5).sum())
-            valid_mask = int(mask_pixels >= min_mask_pixels)
-            best_preset_id = 1
-            status = "ok"
-
-            if valid_mask:
                 try:
-                    _best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
-                        inpainted_3=inpainted_3,
-                        original_left_3=original_3,
-                        warped_3=warped_3,
-                        mask_bin_1hw=mask_1hw,
-                        settings=DEFAULT_CT_SETTINGS,
-                        fallback_preset_id=1,
-                        executor=None,
-                    )
-                    best_preset_id = int(best_preset_id)
+                    del inpainted_reader, splatted_reader, original_reader
+                    if replace_mask_reader is not None:
+                        del replace_mask_reader
+                    gc.collect()
+                    (
+                        inpainted_reader,
+                        splatted_reader,
+                        original_reader,
+                        replace_mask_reader,
+                    ) = _open_all_readers()
+                    chunks_since_reload = 0
                 except Exception as e:
-                    print(
-                        f"[WARN] auto-ct selection failed for {inpainted_name} "
-                        f"frame#{frame_no}: {e}"
-                    )
-                    _dbg(
-                        args,
-                        f"{inpainted_name} frame#{frame_no} failed (mask_px={mask_pixels})",
-                    )
-                    status = "selector_error"
-                    best_preset_id = 1
-            else:
-                status = "low_mask"
+                    print(f"[WARN] reader reload failed for {inpainted_name}: {e}")
+                    break
 
-            rows.append(
-                {
-                    "video": inpainted_name,
-                    "frame": _safe_uint(frame_no),
-                    "best_preset": _safe_uint(best_preset_id),
-                    "valid_mask": _safe_uint(valid_mask),
-                    "mask_pixels": _safe_uint(mask_pixels),
-                    "status": status,
-                }
+            chunk_idx = frame_idx_all[chunk_start : chunk_start + sample_chunk_size]
+            if not chunk_idx:
+                continue
+            chunk_tag = (
+                f"{inpainted_name} chunk {chunk_start // sample_chunk_size + 1}/"
+                f"{(total_frames + sample_chunk_size - 1) // sample_chunk_size} "
+                f"(frames {chunk_idx[0]}..{chunk_idx[-1]}, n={len(chunk_idx)})"
             )
-            is_complete = int(status == "ok")
-            if progress_queue is not None:
-                pending_progress_total += 1
-                pending_progress_complete += is_complete
-                if pending_progress_total >= 32:
-                    try:
-                        progress_queue.put_nowait(
-                            (pending_progress_total, pending_progress_complete)
-                        )
-                    except Exception:
-                        pass
-                    pending_progress_total = 0
-                    pending_progress_complete = 0
-            elif progress is not None:
-                progress.bump(n_total=1, n_complete=is_complete)
+            _dbg(args, f"read {chunk_tag}")
 
-        del inpainted_np, splatted_np, original_np
-        del inpainted_t, splatted_t, original_left_t
-        del mask_raw, mask_clean, mask_bin_clean, mask_bin, warped_t
-        if replace_mask_reader is not None:
-            del replace_mask_np
-        _dbg(args, f"done {chunk_tag}")
-        chunks_since_reload += 1
+            try:
+                inpainted_np = inpainted_reader.get_batch(chunk_idx).asnumpy()
+                splatted_np = splatted_reader.get_batch(chunk_idx).asnumpy()
+                original_np = original_reader.get_batch(chunk_idx).asnumpy()
+                replace_mask_np = None
+                if replace_mask_reader is not None:
+                    replace_mask_np = replace_mask_reader.get_batch(chunk_idx).asnumpy()
+            except Exception as e:
+                print(f"[WARN] read failed for {chunk_tag}: {e}")
+                _dbg(args, f"skip {chunk_tag} due to read failure")
+                continue
+
+            inpainted_t = torch.from_numpy(inpainted_np).permute(0, 3, 1, 2).float() / 255.0
+            splatted_t = torch.from_numpy(splatted_np).permute(0, 3, 1, 2).float() / 255.0
+            original_left_t = torch.from_numpy(original_np).permute(0, 3, 1, 2).float() / 255.0
+
+            if is_sbs_input:
+                inpainted_t = inpainted_t[:, :, :, inpainted_t.shape[3] // 2 :]
+
+            _, _, h_splat, w_splat = splatted_t.shape
+            if is_single_input:
+                mask_raw = torch.zeros_like(splatted_t)
+                warped_t = splatted_t
+            elif is_dual_input:
+                mask_raw = splatted_t[:, :, :, : w_splat // 2]
+                warped_t = splatted_t[:, :, :, w_splat // 2 :]
+            else:
+                original_left_t = splatted_t[:, :, : h_splat // 2, : w_splat // 2]
+                mask_raw = splatted_t[:, :, h_splat // 2 :, : w_splat // 2]
+                warped_t = splatted_t[:, :, h_splat // 2 :, w_splat // 2 :]
+
+            if replace_mask_np is not None:
+                if replace_mask_np.ndim == 4 and replace_mask_np.shape[3] >= 1:
+                    rm_gray = replace_mask_np[..., :3].mean(axis=3)
+                elif replace_mask_np.ndim == 3:
+                    rm_gray = replace_mask_np
+                else:
+                    rm_gray = np.squeeze(replace_mask_np)
+                rm_gray = rm_gray.astype(np.float32)
+                if rm_gray.size > 0 and float(np.nanmax(rm_gray)) > 1.5:
+                    rm_gray = rm_gray / 255.0
+                rm_t = torch.from_numpy(rm_gray).float().unsqueeze(1)
+                if rm_t.shape[2:] != mask_raw.shape[2:]:
+                    rm_t = torch.nn.functional.interpolate(
+                        rm_t, size=mask_raw.shape[2:], mode="nearest"
+                    )
+                mask_raw = rm_t.repeat(1, 3, 1, 1)
+
+            mask_clean = mask_raw[:, 0:1, :, :].float()
+            bin_thr = float(args.mask_binarize_threshold)
+            if bin_thr >= 0.0:
+                mask_bin_clean = (mask_clean > bin_thr).float()
+            else:
+                mask_bin_clean = (mask_clean > 0.5).float()
+            mask_bin = (mask_bin_clean > float(args.mask_threshold)).float()
+
+            for fi in range(inpainted_t.shape[0]):
+                frame_no = int(chunk_idx[fi])
+                inpainted_3 = inpainted_t[fi].cpu()
+                original_3 = original_left_t[fi].cpu()
+                warped_3 = warped_t[fi].cpu()
+                mask_1hw = mask_bin[fi].cpu()
+
+                mask_pixels = int((mask_1hw > 0.5).sum().item())
+                valid_mask = int(mask_pixels >= min_mask_pixels)
+                best_preset_id = 1
+                status = "ok"
+
+                if valid_mask:
+                    try:
+                        _best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
+                            inpainted_3=inpainted_3,
+                            original_left_3=original_3,
+                            warped_3=warped_3,
+                            mask_bin_1hw=mask_1hw,
+                            settings=DEFAULT_CT_SETTINGS,
+                            fallback_preset_id=1,
+                            executor=ct_eval_executor,
+                        )
+                        best_preset_id = int(best_preset_id)
+                    except Exception as e:
+                        print(
+                            f"[WARN] auto-ct selection failed for {inpainted_name} "
+                            f"frame#{frame_no}: {e}"
+                        )
+                        _dbg(
+                            args,
+                            f"{inpainted_name} frame#{frame_no} failed (mask_px={mask_pixels})",
+                        )
+                        status = "selector_error"
+                        best_preset_id = 1
+                else:
+                    status = "low_mask"
+
+                rows.append(
+                    {
+                        "video": inpainted_name,
+                        "frame": _safe_uint(frame_no),
+                        "best_preset": _safe_uint(best_preset_id),
+                        "valid_mask": _safe_uint(valid_mask),
+                        "mask_pixels": _safe_uint(mask_pixels),
+                        "status": status,
+                    }
+                )
+                is_complete = int(status == "ok")
+                if progress_queue is not None:
+                    pending_progress_total += 1
+                    pending_progress_complete += is_complete
+                    if pending_progress_total >= progress_flush_every:
+                        try:
+                            progress_queue.put_nowait(
+                                (pending_progress_total, pending_progress_complete)
+                            )
+                        except Exception:
+                            pass
+                        pending_progress_total = 0
+                        pending_progress_complete = 0
+                elif progress is not None:
+                    progress.bump(n_total=1, n_complete=is_complete)
+
+            del inpainted_np, splatted_np, original_np
+            del inpainted_t, splatted_t, original_left_t
+            del mask_raw, mask_clean, mask_bin_clean, mask_bin, warped_t
+            if replace_mask_reader is not None:
+                del replace_mask_np
+            _dbg(args, f"done {chunk_tag}")
+            chunks_since_reload += 1
+    finally:
+        ct_eval_executor.shutdown(wait=True)
 
     if pending_progress_total > 0:
         if progress_queue is not None:
@@ -515,9 +524,9 @@ def _process_video_job(
 
 
 def _process_video_job_mp(
-    payload: Tuple[str, str, Set[int], argparse.Namespace]
+    payload: Tuple[str, str, Set[int], Optional[Any], argparse.Namespace]
 ) -> Tuple[str, Optional[List[Dict[str, object]]], Optional[str]]:
-    inpainted_path, splatted_path, done_frames, args = payload
+    inpainted_path, splatted_path, done_frames, progress_queue, args = payload
     name = os.path.basename(inpainted_path)
     try:
         rows = _process_video_job(
@@ -525,7 +534,7 @@ def _process_video_job_mp(
             splatted_path=splatted_path,
             done_frames=done_frames,
             progress=None,
-            progress_queue=None,
+            progress_queue=progress_queue,
             args=args,
         )
         return name, rows, None
@@ -562,7 +571,15 @@ def main() -> int:
     ap.add_argument("--replace-mask-folder", default="")
     ap.add_argument("--mask-threshold", type=float, default=0.5)
     ap.add_argument("--mask-binarize-threshold", type=float, default=-0.01)
-    ap.add_argument("--min-mask-pixels", type=int, default=64)
+    ap.add_argument(
+        "--min-mask-pixels",
+        type=int,
+        default=CT_MIN_MASK_PIXELS,
+        help=(
+            f"Deprecated compatibility arg; Auto CT now uses a fixed "
+            f"minimum of {CT_MIN_MASK_PIXELS} mask pixels."
+        ),
+    )
     ap.add_argument(
         "--resume-validate-packets",
         dest="resume_validate_packets",
@@ -782,37 +799,74 @@ def main() -> int:
                     _append_rows(rows)
         elif args.process_per_file:
             assert process_ctx is not None
+            progress_manager = mp.Manager()
+            progress_queue = progress_manager.Queue()
+
+            def _drain_progress_queue() -> None:
+                while True:
+                    try:
+                        item = progress_queue.get(timeout=0.5)
+                    except Exception:
+                        continue
+                    if item is None:
+                        break
+                    try:
+                        n_total, n_complete = item
+                    except Exception:
+                        continue
+                    try:
+                        progress.bump(n_total=int(n_total), n_complete=int(n_complete))
+                    except Exception:
+                        continue
+
+            progress_thread = threading.Thread(
+                target=_drain_progress_queue,
+                name="autoct-progress-drain",
+                daemon=True,
+            )
+            progress_thread.start()
             payloads = [
                 (
                     inpainted_path,
                     splatted_path,
                     set(existing_frames_by_video.get(os.path.basename(inpainted_path), set())),
+                    progress_queue,
                     args,
                 )
                 for (inpainted_path, splatted_path) in jobs
             ]
             # Hard reset of the worker chain after each file.
             # maxtasksperchild=1 guarantees a fresh process per scene.
-            with process_ctx.Pool(
-                processes=workers,
-                maxtasksperchild=1,
-            ) as pool:
-                done_count = 0
-                for name, rows, err in pool.imap_unordered(_process_video_job_mp, payloads):
-                    done_count += 1
-                    if err:
-                        print(f"[WARN] worker failed for {name}: {err}")
-                    if rows is not None:
-                        _append_rows(rows)
-                        progress.bump(
-                            n_total=len(rows),
-                            n_complete=sum(
-                                1
-                                for row in rows
-                                if str(row.get("status", "")).strip() == "ok"
-                            ),
-                        )
-                    print(f"[DONE] {done_count}/{len(jobs)} {name}")
+            try:
+                with process_ctx.Pool(
+                    processes=workers,
+                    maxtasksperchild=1,
+                ) as pool:
+                    done_count = 0
+                    for name, rows, err in pool.imap_unordered(_process_video_job_mp, payloads):
+                        done_count += 1
+                        if err:
+                            print(f"[WARN] worker failed for {name}: {err}")
+                        if rows is not None:
+                            _append_rows(rows)
+                        print(f"[DONE] {done_count}/{len(jobs)} {name}")
+            finally:
+                try:
+                    progress_queue.put_nowait(None)
+                except Exception:
+                    pass
+                try:
+                    progress_thread.join(timeout=2.0)
+                except Exception:
+                    pass
+                try:
+                    progress_queue.close()
+                except Exception:
+                    pass
+                try:
+                    progress_manager.shutdown()
+                except Exception:
+                    pass
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
                 fut_to_name: Dict[concurrent.futures.Future, str] = {}

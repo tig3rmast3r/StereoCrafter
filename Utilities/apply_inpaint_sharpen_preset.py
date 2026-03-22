@@ -55,6 +55,17 @@ DEFAULT_PRESET = "slow"
 DEFAULT_CRF = "0"
 
 
+def partial_output_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}.part{output_path.suffix}")
+
+
+def cleanup_partial_output(output_path: Path) -> None:
+    try:
+        partial_output_path(output_path).unlink()
+    except FileNotFoundError:
+        pass
+
+
 @dataclass
 class PresetResult:
     file: str
@@ -202,6 +213,8 @@ def apply_sharpen_clip(
     gain: float = DEFAULT_GAIN,
 ) -> int:
     width, height, _frames, fps = probe_video_meta(input_path)
+    partial_path = partial_output_path(output_path)
+    cleanup_partial_output(output_path)
     cap = cv2.VideoCapture(str(input_path))
     mcap = cv2.VideoCapture(str(mask_path))
     if not cap.isOpened():
@@ -210,7 +223,7 @@ def apply_sharpen_clip(
         cap.release()
         raise RuntimeError(f"could not open mask video: {mask_path}")
 
-    writer = open_ffmpeg_writer(output_path, width, height, fps, processing_args)
+    writer = open_ffmpeg_writer(partial_path, width, height, fps, processing_args)
     frames_written = 0
     try:
         while True:
@@ -244,13 +257,30 @@ def apply_sharpen_clip(
         except Exception:
             pass
         writer.kill()
+        cleanup_partial_output(output_path)
         raise
     finally:
         cap.release()
         mcap.release()
 
-    finalize_ffmpeg(writer, output_path)
+    finalize_ffmpeg(writer, partial_path)
+    partial_path.replace(output_path)
     return frames_written
+
+
+def existing_output_is_valid(input_path: Path, output_path: Path) -> bool:
+    try:
+        in_w, in_h, in_frames, _in_fps = probe_video_meta(input_path)
+        out_w, out_h, out_frames, _out_fps = probe_video_meta(output_path)
+    except Exception:
+        return False
+    if in_w <= 0 or in_h <= 0 or out_w <= 0 or out_h <= 0:
+        return False
+    if out_w != in_w or out_h != in_h:
+        return False
+    if in_frames > 0 and out_frames > 0 and out_frames != in_frames:
+        return False
+    return bool(out_frames > 0 or in_frames <= 0)
 
 
 def process_video(
@@ -289,17 +319,23 @@ def process_video(
         )
 
     output_path = output_dir / input_path.name
+    cleanup_partial_output(output_path)
     if bool(skip_existing) and output_path.is_file():
-        return PresetResult(
-            file=input_path.name,
-            output_file=output_path.name,
-            status="skipped",
-            reason="existing_output",
-            sharpness_raw=float(sharpness_raw),
-            sharpness_level=int(sharpness_level),
-            mask_path=str(mask_path),
-            frames_written=0,
-        )
+        if existing_output_is_valid(input_path, output_path):
+            return PresetResult(
+                file=input_path.name,
+                output_file=output_path.name,
+                status="skipped",
+                reason="existing_output",
+                sharpness_raw=float(sharpness_raw),
+                sharpness_level=int(sharpness_level),
+                mask_path=str(mask_path),
+                frames_written=0,
+            )
+        try:
+            output_path.unlink()
+        except FileNotFoundError:
+            pass
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     frames_written = apply_sharpen_clip(
