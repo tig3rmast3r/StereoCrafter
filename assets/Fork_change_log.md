@@ -2,9 +2,9 @@
 
 This fork is tested only with Linux (ubuntu 22.04 and 24.04 in my case), Windows "should" work for gui versions but pipeline_master_gui and all auto batches uses bash scripts that needs to be reimplemented using powershell <br>
 Aim to this Fork is to create a full sbs 1080p 3d content as result with a one-click solution but keeping ways to customize it.<br>
-Supports only 8 bit format (inpainting is 8 bit anyway so it's actually impossible to get 10 bit hdr end to end) with the following pix formats yuv420p, yuv422p and yuv444p (latest 2 can be achieved downscaling from 4k, no chroma upscaling)
-All runner scripts are tuned for intel 265k, 48GB ram and RTX 4090<br>
-Most of the job is done by VIBE CODING using VS code + Codex 5.3<br>
+Supports only 8 bit format (inpainting is 8 bit anyway so it's actually impossible to get 10 bit hdr end to end) with hardcoded yuv444p during all steps to preserve colors transitions.
+All runner scripts are tuned for intel 265k, 48GB ram and RTX 4090 and specifically for 1920*800 content<br>
+Most of the job is done by VIBE CODING using VS code + Codex 5.3/5.4<br>
 All the extra scripts are made multithreading/parallel when possible, helping reducing time (but is still a very very slow process)
 
 ## Summarized Changes
@@ -23,6 +23,7 @@ All the extra scripts are made multithreading/parallel when possible, helping re
 - runners for no_gui version, will autostart/retry from errors, skip if done already and supports ctrl-c graceful stop
 - small changes to depthcrafter script to reduce Vram spikes during load
 - auto routine for depthcrafter running at lower resolution and then upscaled with REALesrgan (build included in this project)
+- alternate script (stream based) will allow depthcrafting from any length source with some compromises
 
 ### Splatting
 - no_gui wrapper to run gui version headlessly (not a pure headless), it doesn't support sidecars/borders at this time
@@ -41,7 +42,7 @@ All the extra scripts are made multithreading/parallel when possible, helping re
 - Cherry picked chunk overlap from commit https://github.com/Billynom8/StereoCrafter/commit/708bdba3cb86b30ccaa7c6e281e650ec09a7f7ea adapted for my workflow
 - Tail-pad will create extra frames for every chunk and at the end of file and then discard them, last generated frame(s) from chunks suffer from terrible color mismatch, with tail pad those frames are discarded and not used for overlap, greatly decreasing color "flashes" on chunk junctions and on the last frame of each scene. Will increase inpaint time a bit but totally worth it
 - Option to use Replace Mask as source
-- in this Fork version mask is not Pre-Processed and used "as is" for the inference.
+- in this Fork mask is not Pre-Processed and used "as is" for the inference.
 - Optional (but recommended) scene analysis, will predict inpaint sharpness to csv and it will be used to regulate inpaint steps automatically, it will basically increase steps only when needed, result are still far from being perfect in some cases, but is a good tradeoff (based on my tests to get near perfect quality you should inpaint at double size, basically MONTHS of encoding with current tech, it's already quite slow as it is).
 
 ### Merging
@@ -67,6 +68,7 @@ All the extra scripts are made multithreading/parallel when possible, helping re
 - verifyscenes to check for files integrity and length, comparing with reference clips
 - mpv player script with ability to click on screen and save annotations to csv (useful for testing/analysis)
 - seg mono to sbs, will simply make mono sbs (you may not want to make ending titles in 3d but need that to be sbs before rejoin)
+- requeue annotated scenes will delete/create subset/replace/join using annotations from the csv
 
 ### pipeline master GUI
 - made a GUI that will do all the above steps automatically and sequentially, from start to finish with a few clicks, auto presets should be fine in most cases but is quality aimed (slow)
@@ -76,6 +78,7 @@ All the extra scripts are made multithreading/parallel when possible, helping re
 - tracking of current state + flags (done/verified) and resume
 - auto verify for each step and auto delete/retry bad files
 - Test run support with a few clips (selectable)
+- Extra Sharpen step to sharpen inpainted zone selectively
 
 ### "legacy" fork
 - i moved some stuff into legacy folder mainly to cleanup the repo root
@@ -148,18 +151,18 @@ Long live to 3D!!
 - [fix] Sharpen clips had incorrect fps causing join step to fail
 - [fix] seg-mono to flat sbs clips was not identical to merged clips
 
-2026-03-25 (Encoding steps refactor, requeue script improvements + fixes)
+2026-04-01 (lof of stuff)
 - [new] the old crf/qp 1 preset is too lossy if the content is already on the 10mps compress range, so from now on the default preset is lossless for all intermediate steps, with fixed yuv444p, there is now a global preset under "Options and run", the old crf/qp is still available with value 0 and 1, but with hardcoded yuv444p so it will be better than before.
 - [new] there is now a global unified script for intermediate steps encoding (dependency/ffmpeg_encoding_profiles.py)
 - [new] "Codec Validation" button will test all codec combinations used in the script, run this check to make sure your system ffmpeg will work for every step.
 - [new] requeue_annotates_scenes_gui improvements: optional delete and optional create subset with selected clips + final replace into main work folder
 - [new] new options for requeue annotaed scenes gui: rejoin in-place, will make the join step preferring the sbs outputs in the subset. Compare join will make a joined sbs with old-new-old-new pattern for a quick compare
 - [new] Alternate script (stream based) for Depthcrafter, it will work with files from any size but results will be a bit different, so avoid it until is strictly necessary (it will basically miss the latents_all calculation on the entire clip, results can be more unstable chunk by chunk and have a narrower contrast range), i have included it as last retry (4th attempt).
-- [new] new auto preset according to new changes, depthcrafter step will take longer but is crucial to get good results on all the following ones.
-- [change] removed pix_fmt option everywhere, it will always use yuv444p to maintain better colors transitions during the steps.
+- [change] auto preset according to new changes, depthcrafter step will take longer but is crucial to get good results on all the following ones.
+- [change] removed pix_fmt option everywhere (except last join step), it will always use yuv444p to maintain better colors transitions during the steps.
 - [change] Included window,overlap and script selection under the depthcrafter retry policy
 - [change] Removed "inherited" flag for cpu offload on inpaint menus retry and modified it on depthcrafter menu to include all parameters and not just cpu offload
-- [change] vast_stage2 script will now download only required moel instead of the full repo, with option for specific steps (inpaint,depthcrafter,all)
+- [change] vast_stage2 script will now download only required model instead of the full repo, with option for specific steps (inpaint,depthcrafter,all)
 - [change] depthcrafter max resolution slider increased to 1x
 - [change] "join scenes" step will now join an incomplete set with pop-up warning
 - [change] removed VerifyScenes (deep) buttons, the current quick verify is enough, there is still verifyscenes.py script to launch manually.
@@ -168,3 +171,4 @@ Long live to 3D!!
 - [fix] sharpen step was missing in requeue scenes script
 - [fix] Scene names are back with 4 digits to avoid incorrect clip sequence during steps
 - [fix] Some fields on Merge step was resetting to default on GUI reload
+- [fix] Several other minor fixes
