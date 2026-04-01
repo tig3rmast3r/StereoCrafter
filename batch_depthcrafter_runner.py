@@ -25,18 +25,23 @@ Features:
                to avoid immediate cascade failures on the next file.
 
 Requires ffmpeg and ffprobe in PATH.
-Tries NVENC first; falls back to libx264 if NVENC fails.
 """
 import gc
 import importlib.util
+import inspect
 import json
 import os
-import shlex
 import subprocess
 import sys
 import time
 import traceback
 from pathlib import Path
+
+from dependency.ffmpeg_encoding_profiles import (
+    normalize_codec_strict,
+    resolve_depth_final_grayscale_profile,
+    resolve_depth_preprocess_profile,
+)
 
 
 def _load_worker_module(worker_script: str):
@@ -49,6 +54,16 @@ def _load_worker_module(worker_script: str):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore
     return mod
+
+
+def _resolve_worker_class(mod):
+    for attr_name in ("DepthCrafterDepthOnly", "DepthCrafterDepthOnlyStream"):
+        cls = getattr(mod, attr_name, None)
+        if cls is not None:
+            return cls
+    raise AttributeError(
+        "worker_script must expose class DepthCrafterDepthOnly or DepthCrafterDepthOnlyStream"
+    )
 
 
 def _is_oom(exc: BaseException) -> bool:
@@ -178,30 +193,6 @@ def _ffprobe_wh_fps(path: Path):
     return w, h, fps_str
 
 
-def _try_nvenc_encode(nvenc_cmd, x264_cmd):
-    try:
-        p = _run(nvenc_cmd, log_prefix="[FFMPEG-NVENC]", check=True)
-        return True, p
-    except subprocess.CalledProcessError as e:
-        print("[WARN] NVENC encode failed, fallback to x264.")
-        if e.stderr:
-            tail = e.stderr.splitlines()[-6:]
-            print("[WARN] NVENC stderr tail:")
-            for line in tail:
-                print("   ", line)
-        p2 = _run(x264_cmd, log_prefix="[FFMPEG-X264]", check=True)
-        return False, p2
-
-
-def _set_arg_value(cmd: list[str], key: str, value: str) -> None:
-    try:
-        idx = cmd.index(key)
-        if idx + 1 < len(cmd):
-            cmd[idx + 1] = str(value)
-    except ValueError:
-        pass
-
-
 def _round_up(n: int, m: int) -> int:
     return ((n + m - 1) // m) * m
 
@@ -229,14 +220,9 @@ def _preprocess_video(
     src_crop_top: int = 0,
     src_crop_bottom: int = 0,
     ffmpeg_codec: str = "",
-    ffmpeg_crf: int = -1,
-    ffmpeg_preset: str = "",
-    ffmpeg_pix_fmt: str = "",
-    ffmpeg_extra_args: str = "",
 ):
     # Scale always to content_w x content_h, then pad ONLY if needed.
     # Important: pad placement is explicit (pad_x/pad_y) so caller can anchor content.
-    pix_fmt = (ffmpeg_pix_fmt or "yuv420p").strip()
     crop_top = max(0, int(src_crop_top))
     crop_bottom = max(0, int(src_crop_bottom))
     vf_parts = []
@@ -245,68 +231,23 @@ def _preprocess_video(
     vf_parts.append(f"scale={content_w}:{content_h}:flags=lanczos")
     if pad_w != content_w or pad_h != content_h:
         vf_parts.append(f"pad={pad_w}:{pad_h}:{int(pad_x)}:{int(pad_y)}:black")
-    vf_parts.append(f"format={pix_fmt}")
+    vf_parts.append("format=yuv444p")
     vf = ",".join(vf_parts)
-
-    nvenc = [
+    selected_codec = str(ffmpeg_codec or "").strip() or "libx264"
+    normalize_codec_strict(selected_codec)
+    profile = resolve_depth_preprocess_profile(selected_codec)
+    cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(src),
         "-an",
         "-vf", vf,
-        "-c:v", "h264_nvenc",
-        "-preset", "medium",
-        "-rc", "constqp",
-        "-qp", "0",                # lossless-ish preprocess
-        "-profile:v", "main",
-        "-pix_fmt", pix_fmt,
         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
         "-color_range", "tv",
         "-movflags", "+write_colr",
-        str(dst),
     ]
-
-    x264 = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(src),
-        "-an",
-        "-vf", vf,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "0",
-        "-pix_fmt", pix_fmt,
-        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-        "-color_range", "tv",
-        "-movflags", "+write_colr",
-        str(dst),
-    ]
-
-    preset = (ffmpeg_preset or "").strip()
-    if preset:
-        _set_arg_value(nvenc, "-preset", preset)
-        _set_arg_value(x264, "-preset", preset)
-    if int(ffmpeg_crf) >= 0:
-        _set_arg_value(nvenc, "-qp", str(int(ffmpeg_crf)))
-        _set_arg_value(x264, "-crf", str(int(ffmpeg_crf)))
-
-    extra = (ffmpeg_extra_args or "").strip()
-    if extra:
-        extra_tokens = shlex.split(extra)
-        nvenc = nvenc[:-1] + extra_tokens + [nvenc[-1]]
-        x264 = x264[:-1] + extra_tokens + [x264[-1]]
-
-    codec = (ffmpeg_codec or "").strip().lower()
-    if codec:
-        if "nvenc" in codec:
-            _set_arg_value(nvenc, "-c:v", ffmpeg_codec.strip())
-            _run(nvenc, log_prefix="[FFMPEG-NVENC]", check=True)
-            return
-        if codec.startswith("libx"):
-            _set_arg_value(x264, "-c:v", ffmpeg_codec.strip())
-            _run(x264, log_prefix="[FFMPEG-X264]", check=True)
-            return
-        print(f"[WARN] unsupported ffmpeg_codec override for preprocess: {ffmpeg_codec} (using auto fallback)")
-
-    _try_nvenc_encode(nvenc, x264)
+    cmd.extend(profile.generated_args)
+    cmd.append(str(dst))
+    _run(cmd, log_prefix="[FFMPEG-PREPROCESS]", check=True)
 
 
 def _postprocess_depth(
@@ -323,14 +264,8 @@ def _postprocess_depth(
     recenter_pad_top: int = 0,
     final_upscale: bool = True,
     padded: bool = True,
-    ffmpeg_codec: str = "",
-    ffmpeg_crf: int = -1,
-    ffmpeg_preset: str = "",
-    ffmpeg_pix_fmt: str = "",
-    ffmpeg_extra_args: str = "",
 ):
     # If padded is True, remove pad using explicit crop offsets before optional upscale.
-    pix_fmt = (ffmpeg_pix_fmt or "yuv420p").strip()
     vf_parts = []
     if padded:
         vf_parts.append(f"crop={crop_w}:{crop_h}:{int(crop_x)}:{int(crop_y)}")
@@ -339,68 +274,21 @@ def _postprocess_depth(
     if int(recenter_w) > 0 and int(recenter_h) > 0:
         pad_top = max(0, int(recenter_pad_top))
         vf_parts.append(f"pad={int(recenter_w)}:{int(recenter_h)}:0:{pad_top}:black")
-    vf_parts.append(f"format={pix_fmt}")
+    vf_parts.append("format=yuv444p")
     vf = ",".join(vf_parts)
-
-    nvenc = [
+    profile = resolve_depth_final_grayscale_profile()
+    cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(src_depth),
         "-an",
         "-vf", vf,
-        "-c:v", "h264_nvenc",
-        "-preset", "medium",
-        "-rc", "constqp",
-        "-qp", "0",                # depthmap: preserve max precision
-        "-profile:v", "main",
-        "-pix_fmt", pix_fmt,
         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
         "-color_range", "tv",
         "-movflags", "+write_colr",
-        str(dst_final),
     ]
-
-    x264 = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(src_depth),
-        "-an",
-        "-vf", vf,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "0",
-        "-pix_fmt", pix_fmt,
-        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-        "-color_range", "tv",
-        "-movflags", "+write_colr",
-        str(dst_final),
-    ]
-
-    preset = (ffmpeg_preset or "").strip()
-    if preset:
-        _set_arg_value(nvenc, "-preset", preset)
-        _set_arg_value(x264, "-preset", preset)
-    if int(ffmpeg_crf) >= 0:
-        _set_arg_value(nvenc, "-qp", str(int(ffmpeg_crf)))
-        _set_arg_value(x264, "-crf", str(int(ffmpeg_crf)))
-
-    extra = (ffmpeg_extra_args or "").strip()
-    if extra:
-        extra_tokens = shlex.split(extra)
-        nvenc = nvenc[:-1] + extra_tokens + [nvenc[-1]]
-        x264 = x264[:-1] + extra_tokens + [x264[-1]]
-
-    codec = (ffmpeg_codec or "").strip().lower()
-    if codec:
-        if "nvenc" in codec:
-            _set_arg_value(nvenc, "-c:v", ffmpeg_codec.strip())
-            _run(nvenc, log_prefix="[FFMPEG-NVENC]", check=True)
-            return
-        if codec.startswith("libx"):
-            _set_arg_value(x264, "-c:v", ffmpeg_codec.strip())
-            _run(x264, log_prefix="[FFMPEG-X264]", check=True)
-            return
-        print(f"[WARN] unsupported ffmpeg_codec override for postprocess: {ffmpeg_codec} (using auto fallback)")
-
-    _try_nvenc_encode(nvenc, x264)
+    cmd.extend(profile.generated_args)
+    cmd.append(str(dst_final))
+    _run(cmd, log_prefix="[FFMPEG-POSTPROCESS]", check=True)
 
 
 def run(
@@ -422,8 +310,6 @@ def run(
     target_fps: float = -1.0,
     max_res: int = 1920,
     far_black: bool = True,
-    crf: int = 0,
-    preset: str = "medium",
     debug_mem: bool = False,
     # Pre/post sizes (used only if auto_sizes=False)
     auto_sizes: bool = True,
@@ -445,13 +331,8 @@ def run(
     # Strip initial scene pad (top/bottom) before DepthCrafter, then re-center at output.
     scene_strip_pad_top: int = 0,
     scene_strip_pad_bottom: int = 0,
-    # Optional ffmpeg overrides applied to preprocess + worker output + postprocess.
-    # Keep empty / -1 to preserve existing behavior.
+    # Depth preprocess codec only. Temporary/final grayscale outputs are fixed.
     ffmpeg_codec: str = "",
-    ffmpeg_crf: int = -1,
-    ffmpeg_preset: str = "",
-    ffmpeg_pix_fmt: str = "",
-    ffmpeg_extra_args: str = "",
     retry_policy_json: str = "",
     retry_process_restart_alloc_mb: int = 1024,
 ):
@@ -462,26 +343,26 @@ def run(
     temp_dir = output_dir_p / ".tmp_depthcrafter"
     _ensure_dir(temp_dir)
 
-    mod = _load_worker_module(worker_script)
-    if not hasattr(mod, "DepthCrafterDepthOnly"):
-        raise AttributeError("worker_script must expose class DepthCrafterDepthOnly")
-
     # weights relative to StereoCrafter root
     unet_path = "./weights/DepthCrafter"
     pre_trained_path = "./weights/stable-video-diffusion-img2vid-xt-1-1"
 
-    def make_runner(mode: str):
-        r = mod.DepthCrafterDepthOnly(
+    def make_runner(mode: str, worker_script_path: str):
+        mod = _load_worker_module(worker_script_path)
+        worker_cls = _resolve_worker_class(mod)
+        r = worker_cls(
             unet_path=unet_path,
             pre_trained_path=pre_trained_path,
             cpu_offload_mode=mode,
         )
         setattr(r, "_batch_mode", mode)
+        setattr(r, "_batch_worker_script", str(Path(worker_script_path).resolve()))
         return r
 
-    runner = make_runner(cpu_offload_mode)
+    worker_script_base = str(worker_script)
+    runner = make_runner(cpu_offload_mode, worker_script_base)
 
-    def hard_reset_runner(mode: str):
+    def hard_reset_runner(mode: str, worker_script_path: str | None = None):
         """Hard reset pipeline after a failure (OOM can poison CUDA state)."""
         nonlocal runner
         try:
@@ -490,7 +371,7 @@ def run(
             pass
         _cuda_cleanup()
         time.sleep(1.0)
-        runner = make_runner(mode)
+        runner = make_runner(mode, worker_script_path or worker_script_base)
 
     files = sorted(input_dir_p.glob(glob))
     if not files:
@@ -499,15 +380,16 @@ def run(
 
     total = len(files)
     ok = skipped = failed = 0
+    stream_success_files: list[str] = []
     processed_non_skip = 0
     try:
         scale_factor_f = float(scale_factor)
     except Exception:
         scale_factor_f = 0.5
-    scale_factor_f = max(0.5, min(0.8, scale_factor_f))
+    scale_factor_f = max(0.5, scale_factor_f)
 
     print(f"[INFO] Inputs: {total} | input_dir={input_dir_p} | output_dir={output_dir_p}")
-    print(f"[INFO] Worker: {Path(worker_script).resolve()}")
+    print(f"[INFO] Worker: {Path(worker_script_base).resolve()}")
     print(
         f"[INFO] Sizes: auto_sizes={auto_sizes} scale_factor={scale_factor_f:.2f} "
         f"| fixed_pad={pad_w}x{pad_h} fixed_content={content_w}x{content_h}"
@@ -519,16 +401,18 @@ def run(
         f"bottom={max(0, int(scene_strip_pad_bottom))}"
     )
     print(
-        "[INFO] ffmpeg overrides: "
-        f"codec={ffmpeg_codec or 'default'} "
-        f"crf={ffmpeg_crf if int(ffmpeg_crf) >= 0 else 'default'} "
-        f"preset={ffmpeg_preset or 'default'} "
-        f"pix_fmt={ffmpeg_pix_fmt or 'default'} "
-        f"extra={'set' if str(ffmpeg_extra_args).strip() else 'none'}"
+        "[INFO] ffmpeg policy: "
+        f"depth_preprocess_codec={(str(ffmpeg_codec).strip() or 'libx264')} "
+        "depth_preprocess_mode=lossless "
+        "depth_temp_gray=libx264 qp0 yuv444p "
+        "depth_final=libx264 qp0 yuv444p"
     )
     retry_profiles, policy_was_explicit = _parse_retry_policy_profiles(
         retry_policy_json,
         cpu_offload_mode,
+        worker_script_base,
+        window_size,
+        overlap,
     )
     retry_resume_state_file = output_dir_p / ".depth_retry_resume_state.json"
     retry_skip_manifest_file = output_dir_p / ".depth_retry_skipped.txt"
@@ -550,7 +434,9 @@ def run(
         alloc = _allocator_conf_from_profile(prof) or "default"
         print(
             "[INFO] retry profile "
-            f"{prof['name']}: offload={prof['cpu_offload_mode']} alloc={alloc}"
+            f"{prof['name']}: offload={prof['cpu_offload_mode']} alloc={alloc} "
+            f"script={Path(str(prof['worker_script'])).name} "
+            f"window={int(prof['window_size'])} overlap={int(prof['overlap'])}"
         )
     retry_skipped: list[str] = []
 
@@ -659,10 +545,14 @@ def run(
         )
         t0 = time.perf_counter()
 
-        def attempt(mode: str, dcs: int):
+        def attempt(mode: str, dcs: int, worker_script_path: str, window_size_value: int, overlap_value: int):
             nonlocal runner
-            if mode != getattr(runner, "_batch_mode", mode):
-                hard_reset_runner(mode)
+            target_script = str(Path(worker_script_path).resolve())
+            if (
+                mode != getattr(runner, "_batch_mode", mode)
+                or target_script != getattr(runner, "_batch_worker_script", target_script)
+            ):
+                hard_reset_runner(mode, worker_script_path)
 
             _preprocess_video(
                 in_path,
@@ -676,35 +566,28 @@ def run(
                 src_crop_top=strip_top,
                 src_crop_bottom=strip_bottom,
                 ffmpeg_codec=ffmpeg_codec,
-                ffmpeg_crf=int(ffmpeg_crf),
-                ffmpeg_preset=ffmpeg_preset,
-                ffmpeg_pix_fmt=ffmpeg_pix_fmt,
-                ffmpeg_extra_args=ffmpeg_extra_args,
             )
-
-            runner.infer_to_gray_video(
+            worker_kwargs = dict(
                 input_video_path=str(tmp_pre),
                 output_video_path=str(tmp_depth),
                 guidance_scale=float(guidance_scale),
                 inference_steps=int(inference_steps),
                 target_width=int(pw),
                 target_height=int(ph),
-                window_size=int(window_size),
-                overlap=int(overlap),
+                window_size=int(window_size_value),
+                overlap=int(overlap_value),
                 seed=int(seed),
                 cpu_offload_mode=str(mode),
                 process_length=int(process_length),
                 target_fps=float(target_fps),
                 max_res=int(max_res),
                 far_black=bool(far_black),
-                crf=int(ffmpeg_crf) if int(ffmpeg_crf) >= 0 else int(crf),
-                preset=(str(ffmpeg_preset).strip() or str(preset)),
                 debug_mem=bool(debug_mem),
                 decode_chunk_size=int(dcs),
-                codec=(str(ffmpeg_codec).strip() or "h264_nvenc"),
-                pix_fmt=(str(ffmpeg_pix_fmt).strip() or "yuv420p"),
-                ffmpeg_extra_args=str(ffmpeg_extra_args or ""),
             )
+            sig = inspect.signature(runner.infer_to_gray_video)
+            worker_kwargs = {k: v for k, v in worker_kwargs.items() if k in sig.parameters}
+            runner.infer_to_gray_video(**worker_kwargs)
 
             _postprocess_depth(
                 tmp_depth,
@@ -720,11 +603,6 @@ def run(
                 recenter_pad_top=(recenter_pad_top if recenter_enabled else 0),
                 final_upscale=bool(final_upscale),
                 padded=bool(padded),
-                ffmpeg_codec=ffmpeg_codec,
-                ffmpeg_crf=int(ffmpeg_crf),
-                ffmpeg_preset=ffmpeg_preset,
-                ffmpeg_pix_fmt=ffmpeg_pix_fmt,
-                ffmpeg_extra_args=ffmpeg_extra_args,
             )
 
         def _cleanup_local_temps():
@@ -756,6 +634,9 @@ def run(
                     prof = retry_profiles[attempt_idx - 1]
                     alloc_conf = _allocator_conf_from_profile(prof)
                     offload_mode = str(prof["cpu_offload_mode"])
+                    profile_worker_script = str(prof["worker_script"])
+                    profile_window_size = int(prof["window_size"])
+                    profile_overlap = int(prof["overlap"])
                     _save_retry_resume_state(
                         retry_resume_state_file,
                         in_path.name,
@@ -765,17 +646,27 @@ def run(
                     print(
                         f"[RETRY] {i}/{total} attempt {attempt_idx}/{len(retry_profiles)} "
                         f"profile={prof['name']} offload={offload_mode} "
-                        f"alloc={alloc_conf or 'default'}"
+                        f"alloc={alloc_conf or 'default'} "
+                        f"script={Path(profile_worker_script).name} "
+                        f"window={profile_window_size} overlap={profile_overlap}"
                     )
                     _apply_allocator_conf(alloc_conf)
                     _cuda_cleanup()
                     t_attempt = time.perf_counter()
                     try:
-                        attempt(offload_mode, decode_chunk_size)
+                        attempt(
+                            offload_mode,
+                            decode_chunk_size,
+                            profile_worker_script,
+                            profile_window_size,
+                            profile_overlap,
+                        )
                         success = True
                         ok += 1
                         dt = time.perf_counter() - t0
                         dta = time.perf_counter() - t_attempt
+                        if "stream" in Path(profile_worker_script).name.lower():
+                            stream_success_files.append(in_path.name)
                         print(
                             f"[OK  ] {i}/{total} done in {dt:.1f}s "
                             f"(attempt={attempt_idx} profile={prof['name']} attempt_time={dta:.1f}s)"
@@ -826,7 +717,7 @@ def run(
                                 pass
                             raise SystemExit(124)
                         # Soft reset even when no process restart is needed.
-                        hard_reset_runner(offload_mode)
+                        hard_reset_runner(offload_mode, profile_worker_script)
 
                 if not success:
                     failed += 1
@@ -846,16 +737,24 @@ def run(
                         )
                     _clear_retry_resume_state(retry_resume_state_file)
                     retry_resume_state = None
-                    hard_reset_runner(cpu_offload_mode)
+                    hard_reset_runner(cpu_offload_mode, worker_script_base)
             finally:
                 _cleanup_local_temps()
                 _cuda_cleanup()
             continue
 
         try:
-            attempt(cpu_offload_mode, decode_chunk_size)
+            attempt(
+                cpu_offload_mode,
+                decode_chunk_size,
+                worker_script_base,
+                int(window_size),
+                int(overlap),
+            )
             dt = time.perf_counter() - t0
             ok += 1
+            if "stream" in Path(worker_script_base).name.lower():
+                stream_success_files.append(in_path.name)
             print(f"[OK  ] {i}/{total} done in {dt:.1f}s")
 
         except Exception as e:
@@ -868,8 +767,10 @@ def run(
                 try:
                     print("[RETRY] OOM -> cpu_offload_mode=sequential")
                     dcs2 = 1 if retry_decode_chunk_size_1 else decode_chunk_size
-                    attempt("sequential", dcs2)
+                    attempt("sequential", dcs2, worker_script_base, int(window_size), int(overlap))
                     ok += 1
+                    if "stream" in Path(worker_script_base).name.lower():
+                        stream_success_files.append(in_path.name)
                     retried = True
                     print("[OK  ] retry sequential done")
                 except Exception as e2:
@@ -879,8 +780,10 @@ def run(
             if (not retried) and retry_decode_chunk_size_1 and _is_oom(e) and int(decode_chunk_size) != 1:
                 try:
                     print("[RETRY] OOM -> decode_chunk_size=1 (same offload)")
-                    attempt(cpu_offload_mode, 1)
+                    attempt(cpu_offload_mode, 1, worker_script_base, int(window_size), int(overlap))
                     ok += 1
+                    if "stream" in Path(worker_script_base).name.lower():
+                        stream_success_files.append(in_path.name)
                     retried = True
                     print("[OK  ] retry dcs=1 done")
                 except Exception as e2:
@@ -913,6 +816,11 @@ def run(
         preview = ", ".join(retry_skipped[:10])
         more = "" if len(retry_skipped) <= 10 else f", ... (+{len(retry_skipped) - 10} more)"
         print(f"[DONE] retry-skip files ({len(retry_skipped)}): {preview}{more}")
+    if stream_success_files:
+        stream_success_unique = list(dict.fromkeys(stream_success_files))
+        print(f"[DONE] stream output files ({len(stream_success_unique)}):")
+        for name in stream_success_unique:
+            print(f"  - {name}")
     print(f"[DIR ] output_dir={output_dir_p}")
     print(f"[DIR ] temp_dir={temp_dir} (kept={keep_temps})")
 
@@ -977,7 +885,33 @@ def _norm_max_split(value: object) -> int | None:
     return None
 
 
-def _default_retry_profiles(base_offload: str) -> list[dict[str, object]]:
+def _norm_retry_worker_script(value: object, fallback: str) -> str:
+    txt = str(value or "").strip()
+    return txt if txt else str(fallback)
+
+
+def _norm_retry_window_size(value: object, fallback: int) -> int:
+    try:
+        parsed = int(float(value))
+    except Exception:
+        parsed = int(fallback)
+    return max(1, parsed)
+
+
+def _norm_retry_overlap(value: object, fallback: int) -> int:
+    try:
+        parsed = int(float(value))
+    except Exception:
+        parsed = int(fallback)
+    return max(0, parsed)
+
+
+def _default_retry_profiles(
+    base_offload: str,
+    base_worker_script: str,
+    base_window_size: int,
+    base_overlap: int,
+) -> list[dict[str, object]]:
     inherited = _norm_offload_mode(base_offload, "model")
     return [
         {
@@ -986,6 +920,9 @@ def _default_retry_profiles(base_offload: str) -> list[dict[str, object]]:
             "expandable_segments": True,
             "max_split_size_mb": None,
             "cpu_offload_mode": inherited,
+            "worker_script": str(base_worker_script),
+            "window_size": int(base_window_size),
+            "overlap": int(base_overlap),
         },
         {
             "name": "retry1",
@@ -993,6 +930,9 @@ def _default_retry_profiles(base_offload: str) -> list[dict[str, object]]:
             "expandable_segments": True,
             "max_split_size_mb": 512,
             "cpu_offload_mode": inherited,
+            "worker_script": str(base_worker_script),
+            "window_size": int(base_window_size),
+            "overlap": int(base_overlap),
         },
         {
             "name": "retry2",
@@ -1000,6 +940,9 @@ def _default_retry_profiles(base_offload: str) -> list[dict[str, object]]:
             "expandable_segments": True,
             "max_split_size_mb": 64,
             "cpu_offload_mode": inherited,
+            "worker_script": str(base_worker_script),
+            "window_size": int(base_window_size),
+            "overlap": int(base_overlap),
         },
         {
             "name": "retry3",
@@ -1007,6 +950,9 @@ def _default_retry_profiles(base_offload: str) -> list[dict[str, object]]:
             "expandable_segments": True,
             "max_split_size_mb": 64,
             "cpu_offload_mode": "sequential",
+            "worker_script": str(base_worker_script),
+            "window_size": int(base_window_size),
+            "overlap": int(base_overlap),
         },
     ]
 
@@ -1014,8 +960,16 @@ def _default_retry_profiles(base_offload: str) -> list[dict[str, object]]:
 def _parse_retry_policy_profiles(
     policy_json: str,
     base_offload: str,
+    base_worker_script: str,
+    base_window_size: int,
+    base_overlap: int,
 ) -> tuple[list[dict[str, object]], bool]:
-    defaults = _default_retry_profiles(base_offload)
+    defaults = _default_retry_profiles(
+        base_offload,
+        base_worker_script,
+        base_window_size,
+        base_overlap,
+    )
     txt = str(policy_json or "").strip()
     if not txt:
         return defaults, False
@@ -1054,6 +1008,18 @@ def _parse_retry_policy_profiles(
                 "cpu_offload_mode": _norm_offload_mode(
                     node.get("cpu_offload_mode", base["cpu_offload_mode"]),
                     str(base["cpu_offload_mode"]),
+                ),
+                "worker_script": _norm_retry_worker_script(
+                    node.get("worker_script", base["worker_script"]),
+                    str(base["worker_script"]),
+                ),
+                "window_size": _norm_retry_window_size(
+                    node.get("window_size", base["window_size"]),
+                    int(base["window_size"]),
+                ),
+                "overlap": _norm_retry_overlap(
+                    node.get("overlap", base["overlap"]),
+                    int(base["overlap"]),
                 ),
             }
         )
@@ -1113,8 +1079,6 @@ def main():
     ap.add_argument("--target_fps", type=float, default=-1.0)
     ap.add_argument("--max_res", type=int, default=1920)
     ap.add_argument("--far_black", type=_bool, default=True)
-    ap.add_argument("--crf", type=int, default=0)
-    ap.add_argument("--preset", default="medium")
     ap.add_argument("--debug_mem", type=_bool, default=False)
 
     ap.add_argument("--auto_sizes", type=_bool, default=True)
@@ -1137,12 +1101,8 @@ def main():
     ap.add_argument("--scene_strip_pad_top", type=int, default=0)
     ap.add_argument("--scene_strip_pad_bottom", type=int, default=0)
 
-    # Optional ffmpeg overrides (empty/-1 keeps legacy behavior).
+    # Depth preprocess codec only; grayscale outputs are fixed.
     ap.add_argument("--ffmpeg_codec", default="")
-    ap.add_argument("--ffmpeg_crf", type=int, default=-1)
-    ap.add_argument("--ffmpeg_preset", default="")
-    ap.add_argument("--ffmpeg_pix_fmt", default="")
-    ap.add_argument("--ffmpeg_extra_args", default="")
     ap.add_argument("--retry_policy_json", default="")
     ap.add_argument("--retry_process_restart_alloc_mb", type=int, default=1024)
 

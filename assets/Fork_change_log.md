@@ -84,7 +84,7 @@ All the extra scripts are made multithreading/parallel when possible, helping re
 Long live to 3D!!
 
 ### Time to encode
-- in linux with intel 265k 48GB Ram + RTX 4090 total time is 0.01x, that means 1h->100h required time. 80% of this time is taken by the inpainting step. A full power RTX 5090 (575+ Watts) is around 20% faster
+- in linux with intel 265k 48GB Ram + RTX 4090 total time is 0.0125x, that means 1h->80h required time. 75% of this time is taken by the inpainting step. A full power RTX 5090 (575+ Watts) is around 20% faster
 
 # CHANGE LOG
 
@@ -147,3 +147,24 @@ Long live to 3D!!
 - [change] merging step will auto restart workers after each file to prevent RAM buildup
 - [fix] Sharpen clips had incorrect fps causing join step to fail
 - [fix] seg-mono to flat sbs clips was not identical to merged clips
+
+2026-03-25 (Encoding steps refactor, requeue script improvements + fixes)
+- [new] the old crf/qp 1 preset is too lossy if the content is already on the 10mps compress range, so from now on the default preset is lossless for all intermediate steps, with fixed yuv444p, there is now a global preset under "Options and run", the old crf/qp is still available with value 0 and 1, but with hardcoded yuv444p so it will be better than before.
+- [new] there is now a global unified script for intermediate steps encoding (dependency/ffmpeg_encoding_profiles.py)
+- [new] "Codec Validation" button will test all codec combinations used in the script, run this check to make sure your system ffmpeg will work for every step.
+- [new] requeue_annotates_scenes_gui improvements: optional delete and optional create subset with selected clips + final replace into main work folder
+- [new] new options for requeue annotaed scenes gui: rejoin in-place, will make the join step preferring the sbs outputs in the subset. Compare join will make a joined sbs with old-new-old-new pattern for a quick compare
+- [new] Alternate script (stream based) for Depthcrafter, it will work with files from any size but results will be a bit different, so avoid it until is strictly necessary (it will basically miss the latents_all calculation on the entire clip, results can be more unstable chunk by chunk and have a narrower contrast range), i have included it as last retry (4th attempt).
+- [new] new auto preset according to new changes, depthcrafter step will take longer but is crucial to get good results on all the following ones.
+- [change] removed pix_fmt option everywhere, it will always use yuv444p to maintain better colors transitions during the steps.
+- [change] Included window,overlap and script selection under the depthcrafter retry policy
+- [change] Removed "inherited" flag for cpu offload on inpaint menus retry and modified it on depthcrafter menu to include all parameters and not just cpu offload
+- [change] vast_stage2 script will now download only required moel instead of the full repo, with option for specific steps (inpaint,depthcrafter,all)
+- [change] depthcrafter max resolution slider increased to 1x
+- [change] "join scenes" step will now join an incomplete set with pop-up warning
+- [change] removed VerifyScenes (deep) buttons, the current quick verify is enough, there is still verifyscenes.py script to launch manually.
+- [change] requeue script now support both clicks on the final merged file and clicks on the sbs folder
+- [fix] Requeue will delete/move according to the selected step non from the one after it
+- [fix] sharpen step was missing in requeue scenes script
+- [fix] Scene names are back with 4 digits to avoid incorrect clip sequence during steps
+- [fix] Some fields on Merge step was resetting to default on GUI reload

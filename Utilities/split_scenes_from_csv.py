@@ -129,7 +129,7 @@ def parse_intish(value: str) -> int | None:
 
 def output_name_from_scene(source_path: str, scene_number: int) -> str:
     stem = Path(source_path).stem or "source"
-    return f"{stem}-Scene-{int(scene_number):03d}.mp4"
+    return f"{stem}-Scene-{int(scene_number):04d}.mp4"
 
 
 def probe_source_fps(source_path: str) -> Fraction | None:

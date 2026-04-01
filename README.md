@@ -1,9 +1,9 @@
 # Fork Info
 
-This fork is tested only with Linux (ubuntu 22.04 and 24.04 in my case) <br>
+This fork is tested only with Linux (ubuntu 22.04 and 24.04 in my case), Windows "should" work for gui versions but pipeline_master_gui and all auto batches uses bash scripts that needs to be reimplemented using powershell <br>
 Aim to this Fork is to create a full sbs 1080p 3d content as result with a one-click solution but keeping ways to customize it.<br>
-Supports only 8 bit format (inpainting is 8 bit anyway so it's actually impossible to get 10 bit hdr end to end) with the following pix formats yuv420p, yuv422p and yuv444p (latest 2 can be achieved downscaling from 4k, no chroma upscaling)<br>
-All runner scripts are tuned for intel 265k, 48GB ram and RTX 4090<br>
+Supports only 8 bit format (inpainting is 8 bit anyway so it's actually impossible to get 10 bit hdr end to end) with hardcoded yuv444p during all steps to preserve colors transitions.
+All runner scripts are tuned for intel 265k, 48GB ram and RTX 4090 and specifically for 1920*800 content<br>
 Most of the job is done by VIBE CODING using VS code + Codex 5.3/5.4<br>
 All the extra scripts are made multithreading/parallel when possible, helping reducing time (but is still a very very slow process)
 
@@ -18,7 +18,6 @@ python pipeline_master_gui.py
 ```
 just run scenedetect TAB manually and Verify(quick) then try a test run on the last tab, it will pick the first 5 unfinished clips and do all the steps, if everything went well press the run/resume button and go on vacation, when you are back it should have finished :)<br>
 <br>
-VERY IMPORTANT: most of the crashes/errors i'm getting are because of unstable ffmpeg, in my case h264_nvenc is much more stable, i switch to x264 only for the inpainting job to keep vram usage as low as possible.<br>
 
 NOTE about PYTORCH_ALLOC_CONF max_split_size_mb:xx, while this command can save from VRAM OOM be warned that a low value such as 64 can increase inference times by up to 200%, i have implemented those exports to be enabled only when there are fails. <br>
 garbage_collection_threshold:0.8 and expandable_segments:True are very light so i kept them on as default for depthcrafting and inpainting steps.
@@ -51,12 +50,14 @@ python Utilities/prepare_seg_mono_to_sbs.py # if you have mono files on seg-mono
 ./Utilities/Rejoin_HEVC_NVENC.sh
 ./Utilities/remux_replace_video_mkvtoolnix.sh
 ```
-
-
+<br>
 
 ## More info and fork changelog
 
 [Fork changelog](assets/Fork_change_log.md)
+
+<br>
+<br>
 
 # StereoCrafter GUI + DepthCrafter GUI Seg
 

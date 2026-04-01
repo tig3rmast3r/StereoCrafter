@@ -19,10 +19,8 @@ FRAMES_CHUNK="${FRAMES_CHUNK:-50}"
 OVERLAP="${OVERLAP:-3}"
 TAIL_PAD="${TAIL_PAD:-2}"
 ORIGINAL_INPUT_BLEND_STRENGTH="${ORIGINAL_INPUT_BLEND_STRENGTH:-0}"
-OUTPUT_CRF="${OUTPUT_CRF:-1}"
 OUTPUT_CODEC="${OUTPUT_CODEC:-}"                       # optional override (e.g. libx264, h264_nvenc, hevc_nvenc)
-OUTPUT_PRESET="${OUTPUT_PRESET:-}"                     # optional override (e.g. fast, p7)
-OUTPUT_PIX_FMT="${OUTPUT_PIX_FMT:-}"                   # optional override (e.g. yuv420p, yuv420p10le)
+OUTPUT_ENCODING_MODE="${OUTPUT_ENCODING_MODE:-}"       # shared encoder mode for color outputs
 OUTPUT_EXTRA_ARGS="${OUTPUT_EXTRA_ARGS:-}"             # optional extra ffmpeg args
 PROCESS_LENGTH="${PROCESS_LENGTH:--1}"
 
@@ -69,7 +67,6 @@ CMD+=(--output_dir "$OUTPUT_DIR"
      --overlap "$OVERLAP"
      --tail_pad "$TAIL_PAD"
      --original_input_blend_strength "$ORIGINAL_INPUT_BLEND_STRENGTH"
-     --output_crf "$OUTPUT_CRF"
      --process_length "$PROCESS_LENGTH"
      --offload_type "$OFFLOAD_TYPE"
      --hires_blend_folder "$HIRES_BLEND_FOLDER"
@@ -96,8 +93,7 @@ if [[ "$ENABLE_POST_INPAINTING_BLEND" == "1" ]]; then CMD+=(--enable_post_inpain
 if [[ "$USE_REPLACE_MASK" == "1" ]]; then CMD+=(--use_replace_mask); fi
 if [[ "$DISABLE_COLOR_TRANSFER" == "1" ]]; then CMD+=(--disable_color_transfer); fi
 if [[ -n "$OUTPUT_CODEC" ]]; then CMD+=(--output_codec "$OUTPUT_CODEC"); fi
-if [[ -n "$OUTPUT_PRESET" ]]; then CMD+=(--output_preset "$OUTPUT_PRESET"); fi
-if [[ -n "$OUTPUT_PIX_FMT" ]]; then CMD+=(--output_pix_fmt "$OUTPUT_PIX_FMT"); fi
+if [[ -n "$OUTPUT_ENCODING_MODE" ]]; then CMD+=(--output_encoding_mode "$OUTPUT_ENCODING_MODE"); fi
 if [[ -n "$OUTPUT_EXTRA_ARGS" ]]; then CMD+=(--output_extra_args "$OUTPUT_EXTRA_ARGS"); fi
 if [[ "$SKIP_EXISTING" == "1" ]]; then CMD+=(--skip_existing); fi
 if [[ "$MOVE_FINISHED" == "1" ]]; then CMD+=(--move_finished); fi

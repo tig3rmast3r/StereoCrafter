@@ -63,13 +63,11 @@ DUAL_OUTPUT = True      # legacy fallback if OUTPUT_LAYOUT is invalid
 ENABLE_GLOBAL_NORM = False
 MATCH_DEPTH_RES = True
 
-# Output encode quality value (CRF for libx, QP for NVENC)
+# Output encode quality values kept only for the underlying splatting code paths.
 OUTPUT_CRF_FULL = 1
 OUTPUT_CRF_LOW  = 23
 FFMPEG_CODEC = ""
-FFMPEG_CRF = OUTPUT_CRF_FULL
-FFMPEG_PRESET = ""
-FFMPEG_PIX_FMT = ""
+ENCODER_MODE = ""
 FFMPEG_EXTRA_ARGS = ""
 
 # Depth pre-processing
@@ -230,10 +228,8 @@ def _parse_args():
     )
     p.add_argument("--replace_mask_codec", default=REPLACE_MASK_CODEC, help="Replace-mask codec.")
     p.add_argument("--ffmpeg_codec", default=FFMPEG_CODEC, help="Force output codec (optional).")
-    p.add_argument("--ffmpeg_crf", type=int, default=FFMPEG_CRF, help="Quality value for splat output (CRF for libx, QP for NVENC).")
-    p.add_argument("--ffmpeg_preset", default=FFMPEG_PRESET, help="Reserved (not used by runner yet).")
-    p.add_argument("--ffmpeg_pix_fmt", default=FFMPEG_PIX_FMT, help="Reserved (not used by runner yet).")
-    p.add_argument("--ffmpeg_extra_args", default=FFMPEG_EXTRA_ARGS, help="Reserved (not used by runner yet).")
+    p.add_argument("--encoder_mode", default=ENCODER_MODE, help="Shared encoder mode (lossless, crf/qp 0, crf/qp 1).")
+    p.add_argument("--ffmpeg_extra_args", default=FFMPEG_EXTRA_ARGS, help="Append-only extra ffmpeg args.")
     p.add_argument("--stop_marker", default=STOP_MARKER, help="Graceful stop marker file.")
     p.add_argument(
         "--log-verbose",
@@ -516,7 +512,7 @@ def main():
     global DEPTH_DILATE_X, DEPTH_DILATE_Y, DEPTH_BLUR_X, DEPTH_BLUR_Y, DEPTH_DILATE_LEFT, DEPTH_GAMMA
     global SPLAT_STAIR_SMOOTH_ENABLED, SPLAT_BLUR_KERNEL, SPLAT_STAIR_EDGE_X_OFFSET, SPLAT_STAIR_STRIP_PX, SPLAT_STAIR_STRENGTH
     global REPLACE_MASK_ENABLED, REPLACE_MASK_SCALE, REPLACE_MASK_MIN_PX, REPLACE_MASK_MAX_PX, REPLACE_MASK_GAP_TOL, REPLACE_MASK_DRAW_EDGE, REPLACE_MASK_CODEC
-    global OUTPUT_CRF_FULL, FFMPEG_CODEC, FFMPEG_PRESET, FFMPEG_PIX_FMT, FFMPEG_EXTRA_ARGS, STOP_MARKER
+    global FFMPEG_CODEC, ENCODER_MODE, FFMPEG_EXTRA_ARGS, STOP_MARKER
     SPLAT_GUI_PY = args.gui_script
     INPUT_SOURCE_CLIPS = args.input_source_clips
     INPUT_DEPTH_MAPS = args.input_depth_maps
@@ -553,25 +549,15 @@ def main():
     REPLACE_MASK_DRAW_EDGE = bool(args.replace_mask_edge)
     REPLACE_MASK_CODEC = str(args.replace_mask_codec).strip() or "ffv1"
     FFMPEG_CODEC = str(args.ffmpeg_codec).strip().lower()
-    FFMPEG_PRESET = str(args.ffmpeg_preset).strip()
-    FFMPEG_PIX_FMT = str(args.ffmpeg_pix_fmt).strip()
+    ENCODER_MODE = str(args.encoder_mode).strip()
     FFMPEG_EXTRA_ARGS = str(args.ffmpeg_extra_args).strip()
     STOP_MARKER = str(args.stop_marker).strip()
-    OUTPUT_CRF_FULL = int(args.ffmpeg_crf) if int(args.ffmpeg_crf) >= 0 else int(OUTPUT_CRF_FULL)
 
-    if (
-        FFMPEG_CODEC
-        or int(args.ffmpeg_crf) >= 0
-        or FFMPEG_PRESET
-        or FFMPEG_PIX_FMT
-        or FFMPEG_EXTRA_ARGS
-    ):
+    if FFMPEG_CODEC or ENCODER_MODE or FFMPEG_EXTRA_ARGS:
         print(
-            "[INFO] ffmpeg output overrides: "
+            "[INFO] ffmpeg output policy: "
             f"codec={FFMPEG_CODEC or 'default'} "
-            f"quality={int(args.ffmpeg_crf) if int(args.ffmpeg_crf) >= 0 else 'default'} "
-            f"preset={FFMPEG_PRESET or 'default'} "
-            f"pix_fmt={FFMPEG_PIX_FMT or 'default'} "
+            f"mode={ENCODER_MODE or 'default'} "
             f"extra={'set' if FFMPEG_EXTRA_ARGS else 'none'}"
         )
     gui_path = Path(SPLAT_GUI_PY).resolve()
@@ -640,10 +626,8 @@ def main():
     def _start_ffmpeg_pipe_process_wrapper(*ff_args, **ff_kwargs):
         if FFMPEG_CODEC and not ff_kwargs.get("force_output_codec"):
             ff_kwargs["force_output_codec"] = FFMPEG_CODEC
-        if FFMPEG_PIX_FMT and not ff_kwargs.get("force_output_pix_fmt"):
-            ff_kwargs["force_output_pix_fmt"] = FFMPEG_PIX_FMT
-        if FFMPEG_PRESET and not ff_kwargs.get("force_output_preset"):
-            ff_kwargs["force_output_preset"] = FFMPEG_PRESET
+        if ENCODER_MODE and not ff_kwargs.get("encoding_mode"):
+            ff_kwargs["encoding_mode"] = ENCODER_MODE
         if FFMPEG_EXTRA_ARGS and not ff_kwargs.get("ffmpeg_extra_output_args"):
             ff_kwargs["ffmpeg_extra_output_args"] = FFMPEG_EXTRA_ARGS
         return _orig_start_ffmpeg(*ff_args, **ff_kwargs)
@@ -856,7 +840,7 @@ def main():
         enable_global_norm=bool(ENABLE_GLOBAL_NORM),
         match_depth_res=bool(MATCH_DEPTH_RES),
         move_to_finished=bool(MOVE_TO_FINISHED),
-        output_crf=int(OUTPUT_CRF_FULL),  # legacy
+        output_crf=int(OUTPUT_CRF_FULL),
         output_crf_full=int(OUTPUT_CRF_FULL),
         output_crf_low=int(OUTPUT_CRF_LOW),
         depth_gamma=float(DEPTH_GAMMA),

@@ -26,6 +26,10 @@ from dependency.stereocrafter_util import (
     release_cuda_memory, set_util_logger_level,
     encode_frames_to_mp4, read_video_frames_decord
 )
+from dependency.ffmpeg_encoding_profiles import (
+    append_ffmpeg_extra_args,
+    resolve_color_encoding_profile,
+)
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
     tensor2vid,
@@ -55,6 +59,7 @@ def _start_ffmpeg_rawvideo_writer(
     fps: float,
     crf: int,
     codec: str = "libx264",
+    encoding_mode: str = "",
     preset: str = "veryfast",
     pix_fmt: str = "yuv420p",
     extra_output_args: str = "",
@@ -64,7 +69,6 @@ def _start_ffmpeg_rawvideo_writer(
     out_codec = (codec or "libx264").strip()
     out_preset = (preset or "veryfast").strip()
     out_pix_fmt = (pix_fmt or "yuv420p").strip()
-    quality_flag = "-qp" if "nvenc" in out_codec.lower() else "-crf"
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -72,15 +76,23 @@ def _start_ffmpeg_rawvideo_writer(
         "-r", f"{fps}",
         "-i", "pipe:0",
         "-an",
-        "-c:v", out_codec,
-        "-preset", out_preset,
-        quality_flag, str(crf),
-        "-pix_fmt", out_pix_fmt,
     ]
+    resolved_mode = str(encoding_mode or "").strip()
+    if resolved_mode:
+        profile = resolve_color_encoding_profile(out_codec, resolved_mode)
+        cmd.extend(profile.generated_args)
+    else:
+        quality_flag = "-qp" if "nvenc" in out_codec.lower() else "-crf"
+        cmd.extend([
+            "-c:v", out_codec,
+            "-preset", out_preset,
+            quality_flag, str(crf),
+            "-pix_fmt", out_pix_fmt,
+        ])
     extra = (extra_output_args or "").strip()
     if extra:
         try:
-            cmd.extend(shlex.split(extra))
+            cmd = append_ffmpeg_extra_args(cmd, extra)
         except Exception as ex:
             logger.warning(f"Invalid streaming ffmpeg extra args ignored: {ex}")
     cmd.append(output_path)
@@ -1967,6 +1979,7 @@ class InpaintingGUI(ThemedTk):
         original_input_blend_strength: float = 0.8,
         output_crf: int = 23,
         output_codec: str = "",
+        output_encoding_mode: str = "",
         output_preset: str = "",
         output_pix_fmt: str = "",
         output_extra_args: str = "",
@@ -2120,6 +2133,7 @@ class InpaintingGUI(ThemedTk):
                     fps=fps,
                     crf=output_crf,
                     codec=output_codec or "libx264",
+                    encoding_mode=output_encoding_mode or "",
                     preset=output_preset or "veryfast",
                     pix_fmt=output_pix_fmt or "yuv420p",
                     extra_output_args=output_extra_args or "",
@@ -2509,6 +2523,7 @@ class InpaintingGUI(ThemedTk):
                 stop_event=stop_event_non_optional, sidecar_json_data=None, user_output_crf=output_crf,
                 output_sidecar_ext=".spsidecar",
                 force_output_codec=output_codec or None,
+                encoding_mode=output_encoding_mode or None,
                 force_output_preset=output_preset or None,
                 force_output_pix_fmt=output_pix_fmt or None,
                 ffmpeg_extra_output_args=output_extra_args or None,

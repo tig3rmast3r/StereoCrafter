@@ -27,12 +27,8 @@ PAD_ALIGN_BOTTOM="${PAD_ALIGN_BOTTOM:-True}"
 SCENE_STRIP_PAD_TOP="${SCENE_STRIP_PAD_TOP:-0}"
 SCENE_STRIP_PAD_BOTTOM="${SCENE_STRIP_PAD_BOTTOM:-0}"
 
-# Optional ffmpeg overrides (leave empty/default to keep legacy behavior)
+# Depth preprocess codec override. Temporary/final grayscale outputs are fixed.
 FFMPEG_CODEC="${FFMPEG_CODEC:-}"
-FFMPEG_CRF="${FFMPEG_CRF:--1}"
-FFMPEG_PRESET="${FFMPEG_PRESET:-}"
-FFMPEG_PIX_FMT="${FFMPEG_PIX_FMT:-}"
-FFMPEG_EXTRA_ARGS="${FFMPEG_EXTRA_ARGS:-}"
 RETRY_POLICY_JSON="${RETRY_POLICY_JSON:-}"
 RETRY_PROCESS_RESTART_ALLOC_MB="${RETRY_PROCESS_RESTART_ALLOC_MB:-1024}"
 
@@ -101,18 +97,6 @@ CMD=(
 
 if [[ -n "${FFMPEG_CODEC// }" ]]; then
   CMD+=(--ffmpeg_codec "$FFMPEG_CODEC")
-fi
-if [[ "$FFMPEG_CRF" =~ ^-?[0-9]+$ ]] && [[ "$FFMPEG_CRF" -ge 0 ]]; then
-  CMD+=(--ffmpeg_crf "$FFMPEG_CRF")
-fi
-if [[ -n "${FFMPEG_PRESET// }" ]]; then
-  CMD+=(--ffmpeg_preset "$FFMPEG_PRESET")
-fi
-if [[ -n "${FFMPEG_PIX_FMT// }" ]]; then
-  CMD+=(--ffmpeg_pix_fmt "$FFMPEG_PIX_FMT")
-fi
-if [[ -n "${FFMPEG_EXTRA_ARGS// }" ]]; then
-  CMD+=(--ffmpeg_extra_args "$FFMPEG_EXTRA_ARGS")
 fi
 if [[ -n "${RETRY_POLICY_JSON// }" ]]; then
   CMD+=(--retry_policy_json "$RETRY_POLICY_JSON")

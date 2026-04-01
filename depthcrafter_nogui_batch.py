@@ -18,6 +18,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from dependency.ffmpeg_encoding_profiles import resolve_depth_final_grayscale_profile
+
 def _mb(x: int) -> float:
     return float(x) / (1024.0 * 1024.0)
 
@@ -108,6 +110,7 @@ def _start_ffmpeg_gray_writer(
     crf=0 is lossless for libx264.
     """
     timescale = _pick_timescale(_fps_str_to_float(fps_str) or 0.0)
+    profile = resolve_depth_final_grayscale_profile()
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", loglevel, "-y",
         "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{w}x{h}", "-r", fps_str, "-i", "-",
@@ -117,28 +120,7 @@ def _start_ffmpeg_gray_writer(
     ]
     if vf:
         cmd.extend(["-vf", vf])
-    codec_l = str(codec or "h264_nvenc").strip().lower()
-    if "nvenc" in codec_l:
-        cmd.extend([
-            "-c:v", str(codec).strip() or "h264_nvenc",
-            "-preset", preset,
-            "-qp", str(crf),
-        ])
-    elif codec_l.startswith("libx"):
-        cmd.extend([
-            "-c:v", str(codec).strip(),
-            "-preset", preset,
-            "-crf", str(crf),
-        ])
-    else:
-        cmd.extend([
-            "-c:v", str(codec).strip(),
-            "-crf", str(crf),
-        ])
-
-    cmd.extend(["-pix_fmt", pix_out])
-    if str(ffmpeg_extra_args).strip():
-        cmd.extend(shlex.split(str(ffmpeg_extra_args).strip()))
+    cmd.extend(profile.generated_args)
     cmd.append(path)
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 

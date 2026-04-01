@@ -10,10 +10,18 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from dependency.ffmpeg_encoding_profiles import (  # noqa: E402
+    append_ffmpeg_extra_args,
+    resolve_color_encoding_profile,
+)
 
 
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
@@ -32,10 +40,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ffmpeg-bin", default="ffmpeg", help="ffmpeg binary.")
     p.add_argument("--ffprobe-bin", default="ffprobe", help="ffprobe binary.")
     p.add_argument("--codec", default="libx264", help="Encoder codec for generated clips.")
-    p.add_argument("--quality-flag", default="crf", help="Quality flag without dash (crf/cq/qp).")
-    p.add_argument("--quality", default="1", help="Quality value.")
-    p.add_argument("--preset", default="fast", help="Encoder preset.")
-    p.add_argument("--pix-fmt", default="yuv420p", help="Pixel format.")
+    p.add_argument(
+        "--encoder-mode",
+        default="lossless",
+        help="Shared encoder mode (lossless, crf/qp 0, crf/qp 1).",
+    )
     p.add_argument("--extra-ffmpeg-args", default="", help="Extra ffmpeg args.")
     p.add_argument("--overwrite", action="store_true", help="Overwrite already existing outputs.")
     return p.parse_args()
@@ -213,13 +222,11 @@ def _run_ffmpeg(
     dst: Path,
     filter_graph: str,
     codec: str,
-    quality_flag: str,
-    quality: str,
-    preset: str,
-    pix_fmt: str,
+    encoder_mode: str,
     extra_ffmpeg_args: str,
     overwrite: bool,
 ) -> tuple[int, str]:
+    profile = resolve_color_encoding_profile(codec, encoder_mode)
     cmd: list[str] = [
         ffmpeg_bin,
         "-hide_banner",
@@ -239,15 +246,8 @@ def _run_ffmpeg(
         "-an",
         "-sn",
         "-dn",
-        "-c:v",
-        codec,
     ]
-    if preset:
-        cmd.extend(["-preset", preset])
-    if quality_flag and quality:
-        cmd.extend([f"-{quality_flag}", quality])
-    if pix_fmt:
-        cmd.extend(["-pix_fmt", pix_fmt])
+    cmd.extend(profile.generated_args)
     cmd.extend(
         [
             "-color_primaries",
@@ -261,7 +261,7 @@ def _run_ffmpeg(
         ]
     )
     if extra_ffmpeg_args.strip():
-        cmd.extend(shlex.split(extra_ffmpeg_args.strip()))
+        cmd = append_ffmpeg_extra_args(cmd, extra_ffmpeg_args.strip())
     cmd.append(str(dst))
 
     p = subprocess.run(
@@ -340,10 +340,7 @@ def main() -> int:
             dst=dst,
             filter_graph=filter_graph,
             codec=args.codec,
-            quality_flag=(args.quality_flag or "").strip().lower(),
-            quality=args.quality.strip(),
-            preset=args.preset.strip(),
-            pix_fmt=args.pix_fmt.strip(),
+            encoder_mode=(args.encoder_mode or "lossless").strip(),
             extra_ffmpeg_args=args.extra_ffmpeg_args,
             overwrite=args.overwrite,
         )

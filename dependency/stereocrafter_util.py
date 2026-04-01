@@ -17,6 +17,12 @@ import time
 import re
 import shlex
 
+from dependency.ffmpeg_encoding_profiles import (
+    append_ffmpeg_extra_args,
+    normalize_codec_strict,
+    resolve_color_encoding_profile,
+)
+
 VERSION = "26-01-30.0"
 
 # --- Configure Logging ---
@@ -1197,6 +1203,7 @@ def encode_frames_to_mp4(
     user_output_crf: Optional[int] = None,  # NEW: Add this parameter
     output_sidecar_ext: str = ".json",
     force_output_codec: Optional[str] = None,
+    encoding_mode: Optional[str] = None,
     force_output_preset: Optional[str] = None,
     force_output_pix_fmt: Optional[str] = None,
     ffmpeg_extra_output_args: Optional[str] = None,
@@ -1322,68 +1329,73 @@ def encode_frames_to_mp4(
         output_profile = "main"
 
     forced_codec = (force_output_codec or "").strip().lower()
-    if forced_codec and forced_codec != "auto":
-        valid_forced = {"libx264", "libx265", "h264_nvenc", "hevc_nvenc"}
-        if forced_codec in valid_forced:
-            output_codec = forced_codec
+    cpu_preset = None
+    if encoding_mode is not None:
+        if not forced_codec or forced_codec == "auto":
+            raise RuntimeError(
+                "encoding_mode requires an explicit force_output_codec for encode_frames_to_mp4"
+            )
+        profile = resolve_color_encoding_profile(forced_codec, str(encoding_mode))
+        output_codec = profile.codec
+        generated = list(profile.generated_args)
+        if "-pix_fmt" in generated:
+            try:
+                output_pix_fmt = generated[generated.index("-pix_fmt") + 1]
+            except Exception:
+                output_pix_fmt = "yuv444p"
+        output_profile = ""
+        ffmpeg_cmd.extend(generated)
+    else:
+        if forced_codec and forced_codec != "auto":
+            normalized_forced = normalize_codec_strict(forced_codec)
+            output_codec = normalized_forced
             if forced_codec in ("libx264", "h264_nvenc"):
                 output_pix_fmt = "yuv420p"
                 output_profile = "main"
             elif forced_codec in ("libx265", "hevc_nvenc"):
                 output_profile = "main10" if is_original_10bit_or_higher or is_hdr_source else "main"
                 output_pix_fmt = "yuv420p10le" if output_profile == "main10" else "yuv420p"
+
+        if not _ffmpeg_encoder_available(output_codec):
+            raise RuntimeError(f"ffmpeg encoder not available: {output_codec}")
+
+        forced_preset = (force_output_preset or "").strip()
+        if forced_preset and forced_preset.lower() != "auto":
+            nvenc_preset = forced_preset
+            cpu_preset = forced_preset
+
+        forced_pix_fmt = (force_output_pix_fmt or "").strip().lower()
+        if forced_pix_fmt and forced_pix_fmt != "auto":
+            output_pix_fmt = forced_pix_fmt
+            if re.search(r"(10|12|16)", forced_pix_fmt):
+                output_profile = "main10"
+                if output_codec in ("libx264", "h264_nvenc"):
+                    logger.warning(
+                        f"Forced pix_fmt '{forced_pix_fmt}' may be incompatible with codec '{output_codec}'."
+                    )
+            else:
+                if forced_pix_fmt.startswith("yuv420") or forced_pix_fmt.startswith("nv12"):
+                    output_profile = "main"
+                else:
+                    output_profile = ""
+
+        logger.debug(f"default_cpu_crf = {default_cpu_crf}")
+        ffmpeg_cmd.extend(["-c:v", output_codec])
+        if "nvenc" in output_codec:
+            ffmpeg_cmd.extend(["-preset", nvenc_preset])
+            ffmpeg_cmd.extend(["-qp", default_nvenc_cq])  # NVENC intermediates use QP, not CRF
         else:
-            logger.warning(
-                f"Unknown force_output_codec='{force_output_codec}', using auto selection."
-            )
+            if cpu_preset:
+                ffmpeg_cmd.extend(["-preset", cpu_preset])
+            ffmpeg_cmd.extend(["-crf", default_cpu_crf])
 
-    if output_codec == "h264_nvenc" and not _ffmpeg_encoder_available("h264_nvenc"):
-        logger.warning("h264_nvenc not available in ffmpeg, falling back to libx264.")
-        output_codec = "libx264"
-        output_pix_fmt = "yuv420p"
-        output_profile = "main"
-    if output_codec == "hevc_nvenc" and not _ffmpeg_encoder_available("hevc_nvenc"):
-        logger.warning("hevc_nvenc not available in ffmpeg, falling back to libx265.")
-        output_codec = "libx265"
-        output_profile = "main10" if is_original_10bit_or_higher or is_hdr_source else "main"
-        output_pix_fmt = "yuv420p10le" if output_profile == "main10" else "yuv420p"
+        ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
+        if output_profile:
+            ffmpeg_cmd.extend(["-profile:v", output_profile])
 
-    forced_preset = (force_output_preset or "").strip()
-    cpu_preset = None
-    if forced_preset and forced_preset.lower() != "auto":
-        nvenc_preset = forced_preset
-        cpu_preset = forced_preset
-
-    forced_pix_fmt = (force_output_pix_fmt or "").strip().lower()
-    if forced_pix_fmt and forced_pix_fmt != "auto":
-        output_pix_fmt = forced_pix_fmt
-        if re.search(r"(10|12|16)", forced_pix_fmt):
-            output_profile = "main10"
-            if output_codec in ("libx264", "h264_nvenc"):
-                logger.warning(
-                    f"Forced pix_fmt '{forced_pix_fmt}' may be incompatible with codec '{output_codec}'."
-                )
-        else:
-            output_profile = "main"
-
-    logger.debug(f"default_cpu_crf = {default_cpu_crf}")
-    # Add codec, profile, pix_fmt
-    ffmpeg_cmd.extend(["-c:v", output_codec])
-    if "nvenc" in output_codec:
-        ffmpeg_cmd.extend(["-preset", nvenc_preset])
-        ffmpeg_cmd.extend(["-qp", default_nvenc_cq])  # NVENC intermediates use QP, not CRF
-    else:
-        if cpu_preset:
-            ffmpeg_cmd.extend(["-preset", cpu_preset])
-        ffmpeg_cmd.extend(["-crf", default_cpu_crf])
-
-    ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
-    if output_profile:
-        ffmpeg_cmd.extend(["-profile:v", output_profile])
-
-    # Add x265-params if using libx265 and params are available
-    if output_codec == "libx265" and x265_params:
-        ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
+        # Add x265-params if using libx265 and params are available
+        if output_codec == "libx265" and x265_params:
+            ffmpeg_cmd.extend(["-x265-params", ":".join(x265_params)])
 
     # Add general color flags if present in source info
     if video_stream_info:
@@ -1410,7 +1422,7 @@ def encode_frames_to_mp4(
     extra_output_args = (ffmpeg_extra_output_args or "").strip()
     if extra_output_args:
         try:
-            ffmpeg_cmd.extend(shlex.split(extra_output_args))
+            ffmpeg_cmd = append_ffmpeg_extra_args(ffmpeg_cmd, extra_output_args)
         except Exception as ex:
             logger.warning(f"Invalid ffmpeg_extra_output_args ignored: {ex}")
 
@@ -1852,6 +1864,7 @@ def start_ffmpeg_pipe_process(
     pad_to_16_9: bool = False,
     debug_label: Optional[str] = None,
     force_output_codec: Optional[str] = None,
+    encoding_mode: Optional[str] = None,
     ffmpeg_threads: Optional[int] = None,
     force_output_pix_fmt: Optional[str] = None,
     force_output_preset: Optional[str] = None,
@@ -1997,10 +2010,26 @@ def start_ffmpeg_pipe_process(
         output_profile = "main"
 
     forced_codec = (force_output_codec or "").strip().lower()
-    if forced_codec and forced_codec != "auto":
-        valid_forced = {"libx264", "h264_nvenc", "libx265", "hevc_nvenc"}
-        if forced_codec in valid_forced:
-            output_codec = forced_codec
+    profile_summary = ""
+    if encoding_mode is not None:
+        if not forced_codec or forced_codec == "auto":
+            raise RuntimeError(
+                "encoding_mode requires an explicit force_output_codec for start_ffmpeg_pipe_process"
+            )
+        shared_profile = resolve_color_encoding_profile(forced_codec, str(encoding_mode))
+        output_codec = shared_profile.codec
+        output_profile = ""
+        generated_args = list(shared_profile.generated_args)
+        if "-pix_fmt" in generated_args:
+            try:
+                output_pix_fmt = generated_args[generated_args.index("-pix_fmt") + 1]
+            except Exception:
+                output_pix_fmt = "yuv444p"
+        profile_summary = shared_profile.summary
+    else:
+        if forced_codec and forced_codec != "auto":
+            normalized_forced = normalize_codec_strict(forced_codec)
+            output_codec = normalized_forced
             if forced_codec in ("libx264", "h264_nvenc"):
                 output_pix_fmt = "yuv420p"
                 output_profile = "main"
@@ -2011,45 +2040,29 @@ def start_ffmpeg_pipe_process(
                 else:
                     output_pix_fmt = "yuv420p"
                     output_profile = "main"
-        else:
-            logger.warning(
-                f"Unknown force_output_codec='{force_output_codec}', using auto selection."
-            )
 
-    if output_codec == "h264_nvenc" and not _ffmpeg_encoder_available("h264_nvenc"):
-        logger.warning("h264_nvenc not available in ffmpeg, falling back to libx264.")
-        output_codec = "libx264"
-        output_pix_fmt = "yuv420p"
-        output_profile = "main"
-    if output_codec == "hevc_nvenc" and not _ffmpeg_encoder_available("hevc_nvenc"):
-        logger.warning("hevc_nvenc not available in ffmpeg, falling back to libx265.")
-        output_codec = "libx265"
-        if is_hdr_source or is_original_10bit_or_higher:
-            output_pix_fmt = "yuv420p10le"
-            output_profile = "main10"
-        else:
-            output_pix_fmt = "yuv420p"
-            output_profile = "main"
+        if not _ffmpeg_encoder_available(output_codec):
+            raise RuntimeError(f"ffmpeg encoder not available: {output_codec}")
 
-    forced_preset = (force_output_preset or "").strip()
-    if forced_preset and forced_preset.lower() != "auto":
-        nvenc_preset = forced_preset
-        cpu_preset = forced_preset
+        forced_preset = (force_output_preset or "").strip()
+        if forced_preset and forced_preset.lower() != "auto":
+            nvenc_preset = forced_preset
+            cpu_preset = forced_preset
 
-    forced_pix_fmt = (force_output_pix_fmt or "").strip().lower()
-    if forced_pix_fmt and forced_pix_fmt != "auto":
-        output_pix_fmt = forced_pix_fmt
-        if re.search(r"(10|12|16)", forced_pix_fmt):
-            if output_codec in ("libx264", "h264_nvenc"):
-                output_profile = "high10"
+        forced_pix_fmt = (force_output_pix_fmt or "").strip().lower()
+        if forced_pix_fmt and forced_pix_fmt != "auto":
+            output_pix_fmt = forced_pix_fmt
+            if re.search(r"(10|12|16)", forced_pix_fmt):
+                if output_codec in ("libx264", "h264_nvenc"):
+                    output_profile = "high10"
+                else:
+                    output_profile = "main10"
             else:
-                output_profile = "main10"
-        else:
-            if forced_pix_fmt.startswith("yuv420") or forced_pix_fmt.startswith("nv12"):
-                output_profile = "main"
-            else:
-                # Avoid invalid profile constraints for non-420 forced pixel formats.
-                output_profile = ""
+                if forced_pix_fmt.startswith("yuv420") or forced_pix_fmt.startswith("nv12"):
+                    output_profile = "main"
+                else:
+                    # Avoid invalid profile constraints for non-420 forced pixel formats.
+                    output_profile = ""
 
     threads_num: Optional[int] = None
     if ffmpeg_threads is not None:
@@ -2059,17 +2072,20 @@ def start_ffmpeg_pipe_process(
             logger.warning(f"Invalid ffmpeg_threads='{ffmpeg_threads}', using auto.")
             threads_num = None
 
-    ffmpeg_cmd.extend(["-c:v", output_codec])
-    if "nvenc" in output_codec:
-        ffmpeg_cmd.extend(["-preset", nvenc_preset, "-qp", default_nvenc_cq])
+    if encoding_mode is not None:
+        ffmpeg_cmd.extend(generated_args)
     else:
-        if cpu_preset:
-            ffmpeg_cmd.extend(["-preset", cpu_preset])
-        ffmpeg_cmd.extend(["-crf", default_cpu_crf])
+        ffmpeg_cmd.extend(["-c:v", output_codec])
+        if "nvenc" in output_codec:
+            ffmpeg_cmd.extend(["-preset", nvenc_preset, "-qp", default_nvenc_cq])
+        else:
+            if cpu_preset:
+                ffmpeg_cmd.extend(["-preset", cpu_preset])
+            ffmpeg_cmd.extend(["-crf", default_cpu_crf])
 
-    ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
-    if output_profile:
-        ffmpeg_cmd.extend(["-profile:v", output_profile])
+        ffmpeg_cmd.extend(["-pix_fmt", output_pix_fmt])
+        if output_profile:
+            ffmpeg_cmd.extend(["-profile:v", output_profile])
     if threads_num is not None and threads_num > 0:
         ffmpeg_cmd.extend(["-threads", str(threads_num)])
 
@@ -2114,6 +2130,9 @@ def start_ffmpeg_pipe_process(
 
     quality_mode = "qp" if "nvenc" in output_codec else "crf"
     quality_value = default_nvenc_cq if "nvenc" in output_codec else default_cpu_crf
+    if encoding_mode is not None:
+        quality_mode = "profile"
+        quality_value = str(encoding_mode)
     threads_value = str(threads_num) if threads_num is not None and threads_num > 0 else "auto"
 
     sc_encode_flags = {
@@ -2132,6 +2151,7 @@ def start_ffmpeg_pipe_process(
         "src_colorspace": src_matrix,
         "quality_mode": quality_mode,
         "quality_value": quality_value,
+        "profile_summary": profile_summary,
     }
 
     logger.info(
@@ -2169,7 +2189,7 @@ def start_ffmpeg_pipe_process(
     extra_output_args = (ffmpeg_extra_output_args or "").strip()
     if extra_output_args:
         try:
-            ffmpeg_cmd.extend(shlex.split(extra_output_args))
+            ffmpeg_cmd = append_ffmpeg_extra_args(ffmpeg_cmd, extra_output_args)
         except Exception as ex:
             logger.warning(f"Invalid ffmpeg_extra_output_args ignored: {ex}")
 

@@ -46,9 +46,7 @@ ENABLE_LOW_RES="${ENABLE_LOW_RES:-False}"
 PROCESS_LENGTH="${PROCESS_LENGTH:--1}"
 
 FFMPEG_CODEC="${FFMPEG_CODEC:-}"
-FFMPEG_CRF="${FFMPEG_CRF:-1}"
-FFMPEG_PRESET="${FFMPEG_PRESET:-}"
-FFMPEG_PIX_FMT="${FFMPEG_PIX_FMT:-}"
+ENCODER_MODE="${ENCODER_MODE:-}"
 FFMPEG_EXTRA_ARGS="${FFMPEG_EXTRA_ARGS:-}"
 
 # Retry/stop policy
@@ -99,13 +97,18 @@ CMD=(
   --replace_mask_gap "$REPLACE_MASK_GAP"
   --replace_mask_edge "$REPLACE_MASK_EDGE"
   --replace_mask_codec "$REPLACE_MASK_CODEC"
-  --ffmpeg_codec "$FFMPEG_CODEC"
-  --ffmpeg_crf "$FFMPEG_CRF"
-  --ffmpeg_preset "$FFMPEG_PRESET"
-  --ffmpeg_pix_fmt "$FFMPEG_PIX_FMT"
-  --ffmpeg_extra_args "$FFMPEG_EXTRA_ARGS"
   --stop_marker "$STOP_MARKER"
 )
+
+if [[ -n "${FFMPEG_CODEC// }" ]]; then
+  CMD+=(--ffmpeg_codec "$FFMPEG_CODEC")
+fi
+if [[ -n "${ENCODER_MODE// }" ]]; then
+  CMD+=(--encoder_mode "$ENCODER_MODE")
+fi
+if [[ -n "${FFMPEG_EXTRA_ARGS// }" ]]; then
+  CMD+=(--ffmpeg_extra_args "$FFMPEG_EXTRA_ARGS")
+fi
 
 echo "[CMD] ${CMD[*]}"
 

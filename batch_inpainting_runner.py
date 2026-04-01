@@ -973,10 +973,8 @@ def run_batch(args):
                         stop_event=stop_event,
                         update_info_callback=None,
                         original_input_blend_strength=args.original_input_blend_strength,
-                        output_crf=args.output_crf,
                         output_codec=args.output_codec,
-                        output_preset=args.output_preset,
-                        output_pix_fmt=args.output_pix_fmt,
+                        output_encoding_mode=args.output_encoding_mode,
                         output_extra_args=args.output_extra_args,
                         process_length=args.process_length,
                     )
@@ -1112,7 +1110,6 @@ def main():
     p.add_argument("--tail_pad", type=int, default=3,
                    help="Guard frames used for both non-last chunk handoff and last-chunk duplication.")
     p.add_argument("--original_input_blend_strength", type=float, default=0.0)
-    p.add_argument("--output_crf", type=int, default=1)
     p.add_argument("--process_length", type=int, default=-1)
 
     p.add_argument("--offload_type", type=str, default="model", choices=["none", "model", "sequential"],
@@ -1120,8 +1117,7 @@ def main():
     p.add_argument("--retry_policy_json", type=str, default="",
                    help="Optional JSON policy for per-file retries (run/retry1/retry2/retry3).")
     p.add_argument("--output_codec", type=str, default="", help="Optional ffmpeg output codec override")
-    p.add_argument("--output_preset", type=str, default="", help="Optional ffmpeg preset override")
-    p.add_argument("--output_pix_fmt", type=str, default="", help="Optional ffmpeg pixel format override")
+    p.add_argument("--output_encoding_mode", type=str, default="", help="Shared encoder mode (lossless, crf/qp 0, crf/qp 1).")
     p.add_argument("--output_extra_args", type=str, default="", help="Optional extra ffmpeg args")
 
     p.add_argument("--hires_blend_folder", type=str, default="", help="Optional hires folder (same as GUI)")

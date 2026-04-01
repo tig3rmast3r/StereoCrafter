@@ -20,12 +20,25 @@ from collections import Counter
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from dependency.ffmpeg_encoding_profiles import (
+    FFMPEG_CODEC_CHOICES as SHARED_FFMPEG_CODEC_CHOICES,
+    GLOBAL_ENCODER_MODE_CHOICES,
+    build_validation_command,
+    normalize_global_encoder_mode,
+    profile_preview_line,
+    resolve_color_encoding_profile,
+    resolve_depth_final_grayscale_profile,
+    resolve_depth_preprocess_profile,
+    resolve_mask_for_merge_grayscale_profile,
+    resolve_replace_mask_binary_profile,
+)
+
 try:
     from ttkthemes import ThemedTk
 except Exception:
     ThemedTk = None
 
-GUI_VERSION = "2026-03-22"
+GUI_VERSION = "2026-04-01"
 
 
 class VerifyStopRequested(Exception):
@@ -37,19 +50,25 @@ class PipelineMasterGUI:
     DEFAULT_SCENE_BACKEND = "OpenCV"
     DEFAULT_SCENE_CODEC = "libx264"
     DEFAULT_WINDOW_GEOMETRY = "1400x1050"
-    FFMPEG_CODEC_CHOICES = ("libx264", "libx265", "h264_nvenc", "hevc_nvenc")
+    FFMPEG_CODEC_CHOICES = SHARED_FFMPEG_CODEC_CHOICES
     FFMPEG_CODEC_ALIASES = {
         "x264": "libx264",
         "x265": "libx265",
         "h265": "libx265",
     }
-    DEFAULT_DEPTH_SCALE_FACTOR = 0.56
+    GLOBAL_ENCODER_MODE_CHOICES = GLOBAL_ENCODER_MODE_CHOICES
+    DEFAULT_DEPTH_SCALE_FACTOR = 0.80
     MIN_DEPTH_SCALE_FACTOR = 0.5
-    MAX_DEPTH_SCALE_FACTOR = 0.8
+    MAX_DEPTH_SCALE_FACTOR = 1.0
     DEFAULT_DEPTH_REALESRGAN_WORKERS = 2
-    DEFAULT_SPLIT_SCENES_WORKERS = 19
+    DEFAULT_SPLIT_SCENES_WORKERS = 8
     DEFAULT_PIPELINE_TEST_RUN_FILES = 5
     DEPTH_REALESRGAN_SCALE_CHOICES = ("2x", "4x")
+    DEPTH_RUNTIME_MODE_CHOICES = ("original", "stream")
+    DEPTH_RUNTIME_MODE_TO_SCRIPT = {
+        "original": "./depthcrafter_nogui_batch.py",
+        "stream": "./depthcrafter_nogui_stream_carry.py",
+    }
     DEPTH_REALESRGAN_MODEL_MAP = {
         "2x": {"scale": "2", "model": "realesr-animevideov3-x2"},
         "4x": {"scale": "4", "model": "realesrgan-x4plus"},
@@ -65,27 +84,39 @@ class PipelineMasterGUI:
             "max_split_size_mb": "off",
             "cpu_offload_inherited": True,
             "cpu_offload_mode": "model",
+            "worker_mode": "original",
+            "window_size": "65",
+            "overlap": "15",
         },
         "retry1": {
             "garbage_collection_threshold": True,
             "expandable_segments": True,
-            "max_split_size_mb": "512",
-            "cpu_offload_inherited": True,
+            "max_split_size_mb": "64",
+            "cpu_offload_inherited": False,
             "cpu_offload_mode": "model",
+            "worker_mode": "original",
+            "window_size": "60",
+            "overlap": "15",
         },
         "retry2": {
             "garbage_collection_threshold": True,
             "expandable_segments": True,
             "max_split_size_mb": "64",
-            "cpu_offload_inherited": True,
-            "cpu_offload_mode": "model",
+            "cpu_offload_inherited": False,
+            "cpu_offload_mode": "sequential",
+            "worker_mode": "original",
+            "window_size": "55",
+            "overlap": "15",
         },
         "retry3": {
             "garbage_collection_threshold": True,
             "expandable_segments": True,
             "max_split_size_mb": "64",
             "cpu_offload_inherited": False,
-            "cpu_offload_mode": "sequential",
+            "cpu_offload_mode": "model",
+            "worker_mode": "stream",
+            "window_size": "70",
+            "overlap": "25",
         },
     }
     INPAINT_RETRY_POLICY_DEFAULT = {
@@ -99,7 +130,7 @@ class PipelineMasterGUI:
         "retry1": {
             "garbage_collection_threshold": True,
             "expandable_segments": True,
-            "max_split_size_mb": "512",
+            "max_split_size_mb": "256",
             "cpu_offload_inherited": False,
             "cpu_offload_mode": "model",
         },
@@ -135,7 +166,7 @@ class PipelineMasterGUI:
         "- Hable: brighter SDR-style look."
     )
     DEPTH_AUTO_INFO = (
-        "Auto mode: source scenes are downscaled with a selectable factor (0.50..0.80)\n"
+        "Auto mode: source scenes are downscaled with a selectable factor (0.50..1.00)\n"
         "and processed directly with DepthCrafter. RealESRGAN is skipped in the auto chain,\n"
         "so the final auto resolution follows the DepthCrafter multiplier.\n"
         "If you want optional ESRGAN 2x/4x restore, switch to Manual mode and enable it there."
@@ -145,6 +176,15 @@ class PipelineMasterGUI:
         "step (bundled 2x anime model or bundled 4x plus model).\n"
         "Segmenting is not supported in this script.\n"
         "If you need segmenting, use depthcrafter_gui_seg.py manually."
+    )
+    DEPTH_STREAM_WARNING = (
+        "Stream mode uses chunked streaming inference and is much less sensitive to total clip length,\n"
+        "so it can often start and finish on files that Original mode cannot open at the same resolution.\n\n"
+        "The output is not identical to Original mode:\n"
+        "- chunk continuity is handled differently\n"
+        "- the overall grayscale range is usually a bit narrower\n"
+        "- the result can drift slightly from standard DepthCrafter output\n\n"
+        "Use Stream when memory limits block Original mode, not when you need the closest possible match."
     )
     DEPTH_OVERRIDE_WARNING = (
         "Depth encoding override enabled.\n\n"
@@ -222,7 +262,7 @@ class PipelineMasterGUI:
         "Default args are tuned for NVENC; if you change encoder/args, verify output carefully."
     )
     JOIN_DEFAULT_ARGS = (
-        "-rc vbr -b:v 0 -multipass fullres -spatial_aq 1 -temporal_aq 1 "
+        "-tune hq -rc vbr -b:v 0 -multipass fullres -spatial_aq 1 -temporal_aq 1 "
         "-aq-strength 12 -rc-lookahead 32 -bf 3"
     )
     PIPELINE_STEPS = [
@@ -255,7 +295,7 @@ class PipelineMasterGUI:
     }
     PIPELINE_CSV_STEPS = {"sharpness_csv", "autoct_csv"}
     PIPELINE_OPTIONAL_STEPS = {"sharpness_csv", "autoct_csv"}
-    PIPELINE_VERIFY_CHOICES = ["Disabled", "Quick", "Deep"]
+    PIPELINE_VERIFY_CHOICES = ["Quick"]
     PIPELINE_STATE_FILENAME = "pipeline_state.json"
     PIPELINE_TEST_STATE_FILENAME = "pipeline_test_state.json"
     VERIFY_VIDEO_PATTERNS = ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"]
@@ -288,6 +328,7 @@ class PipelineMasterGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"StereoCrafter Pipeline GUI {GUI_VERSION}")
+        self._config_save_ready = False
         self._config = self._load_config()
         saved_geometry = str(self._config.get("window_geometry", "")).strip()
         if saved_geometry:
@@ -313,6 +354,8 @@ class PipelineMasterGUI:
         self._verify_processes: set[subprocess.Popen] = set()
         self._verify_processes_lock = threading.Lock()
         self._scene_verify_result_applied = False
+        self._codec_validation_thread: threading.Thread | None = None
+        self._codec_validation_running = False
 
         self._analysis_thread: threading.Thread | None = None
         self._analysis_running = False
@@ -347,6 +390,7 @@ class PipelineMasterGUI:
         self._join_manual_notice_shown = False
         self._join_expected_duration_sec: float | None = None
         self._join_active_output_path: str = ""
+        self._join_mark_completed = True
         self._pipeline_step_state = self._default_pipeline_step_state()
         self._pipeline_step_widgets: dict[str, dict[str, tk.Widget]] = {}
         self._pipeline_autorun = False
@@ -398,6 +442,7 @@ class PipelineMasterGUI:
         self._preview_scene_command()
         self._refresh_pipeline_status_panel()
         self._poll_log_queue()
+        self._config_save_ready = True
         self.root.after(200, self._run_startup_tasks)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -447,22 +492,8 @@ class PipelineMasterGUI:
                 "Mobius (HDR style, available only for 10-bit input source)",
             )
         )
-        self.scene_chroma_var = tk.StringVar(
-            value=self._config.get("scene_chroma", "420")
-        )
-
         self.scene_codec_var = tk.StringVar(
             value=self._config.get("scene_codec", self.DEFAULT_SCENE_CODEC)
-        )
-        self.scene_crf_var = tk.StringVar(value=str(self._config.get("scene_crf", "1")))
-        self.scene_encoder_preset_var = tk.StringVar(
-            value=self._config.get("scene_encoder_preset", "fast")
-        )
-        self.scene_pix_fmt_var = tk.StringVar(
-            value=self._config.get("scene_pix_fmt", "yuv420p")
-        )
-        self.scene_extra_ffmpeg_args_var = tk.StringVar(
-            value=self._config.get("scene_extra_ffmpeg_args", "")
         )
         self.scene_split_threads_var = tk.StringVar(
             value=str(
@@ -504,7 +535,7 @@ class PipelineMasterGUI:
         )
         self.depth_info_text_var = tk.StringVar(value=self.DEPTH_AUTO_INFO)
         self.depth_chunk_size_var = tk.StringVar(
-            value=str(self._config.get("depth_chunk_size", "100"))
+            value=str(self._config.get("depth_chunk_size", "65"))
         )
         self.depth_overlap_var = tk.StringVar(
             value=str(self._config.get("depth_overlap", "15"))
@@ -533,8 +564,11 @@ class PipelineMasterGUI:
         self.depth_glob_var = tk.StringVar(
             value=self._config.get("depth_glob", "*.mp4")
         )
+        self.depth_runtime_mode_var = tk.StringVar(
+            value=self._migrate_depth_runtime_mode_from_legacy()
+        )
         self.depth_worker_script_var = tk.StringVar(
-            value=self._config.get("depth_worker_script", "./depthcrafter_nogui_batch.py")
+            value=self._resolve_depth_worker_script(self.depth_runtime_mode_var.get())
         )
         depth_scale_factor_raw = self._config.get(
             "depth_scale_factor", self.DEFAULT_DEPTH_SCALE_FACTOR
@@ -555,23 +589,8 @@ class PipelineMasterGUI:
             value=str(self._config.get("depth_res_y", "384"))
         )
 
-        self.depth_encode_override_var = tk.BooleanVar(
-            value=bool(self._config.get("depth_encode_override", False))
-        )
         self.depth_codec_var = tk.StringVar(
             value=self._config.get("depth_codec", self.scene_codec_var.get())
-        )
-        self.depth_crf_var = tk.StringVar(
-            value=str(self._config.get("depth_crf", self.scene_crf_var.get()))
-        )
-        self.depth_preset_var = tk.StringVar(
-            value=self._config.get("depth_preset", self.scene_encoder_preset_var.get())
-        )
-        self.depth_pix_fmt_var = tk.StringVar(
-            value=self._config.get("depth_pix_fmt", self.scene_pix_fmt_var.get())
-        )
-        self.depth_extra_ffmpeg_args_var = tk.StringVar(
-            value=self._config.get("depth_extra_ffmpeg_args", "")
         )
         self.depth_realesrgan_source_var = tk.StringVar(
             value=self._config.get(
@@ -610,7 +629,7 @@ class PipelineMasterGUI:
             value=str(self._config.get("splat_batch_size", "50"))
         )
         self.splat_workers_var = tk.StringVar(
-            value=str(self._config.get("splat_workers", "4"))
+            value=str(self._config.get("splat_workers", "8"))
         )
         self.splat_disparity_var = tk.StringVar(
             value=str(self._config.get("splat_disparity", "20"))
@@ -622,10 +641,10 @@ class PipelineMasterGUI:
             value=self._config.get("splat_auto_convergence", "Min Borders")
         )
         self.splat_dilate_x_var = tk.StringVar(
-            value=str(self._config.get("splat_dilate_x", "5"))
+            value=str(self._config.get("splat_dilate_x", "3"))
         )
         self.splat_dilate_y_var = tk.StringVar(
-            value=str(self._config.get("splat_dilate_y", "5"))
+            value=str(self._config.get("splat_dilate_y", "1.5"))
         )
         self.splat_blur_x_var = tk.StringVar(
             value=str(self._config.get("splat_blur_x", "0"))
@@ -634,7 +653,7 @@ class PipelineMasterGUI:
             value=str(self._config.get("splat_blur_y", "0"))
         )
         self.splat_dilate_left_var = tk.StringVar(
-            value=str(self._config.get("splat_dilate_left", "0"))
+            value=str(self._config.get("splat_dilate_left", "1"))
         )
         self.splat_blur_balance_var = tk.StringVar(
             value=str(self._config.get("splat_blur_balance", "0.5"))
@@ -679,23 +698,8 @@ class PipelineMasterGUI:
             value=bool(self._config.get("splat_replace_mask_edge", False))
         )
 
-        self.splat_encode_override_var = tk.BooleanVar(
-            value=bool(self._config.get("splat_encode_override", False))
-        )
         self.splat_codec_var = tk.StringVar(
             value=self._config.get("splat_codec", self.scene_codec_var.get())
-        )
-        self.splat_crf_var = tk.StringVar(
-            value=str(self._config.get("splat_crf", self.scene_crf_var.get()))
-        )
-        self.splat_preset_var = tk.StringVar(
-            value=self._config.get("splat_preset", self.scene_encoder_preset_var.get())
-        )
-        self.splat_pix_fmt_var = tk.StringVar(
-            value=self._config.get("splat_pix_fmt", self.scene_pix_fmt_var.get())
-        )
-        self.splat_extra_ffmpeg_args_var = tk.StringVar(
-            value=self._config.get("splat_extra_ffmpeg_args", "")
         )
         self.splat_cmd_preview_var = tk.StringVar(value="")
         self.splat_status_var = tk.StringVar(value="Ready")
@@ -744,23 +748,8 @@ class PipelineMasterGUI:
         self.inpaint_inference_steps_var = tk.StringVar(
             value=str(self._config.get("inpaint_inference_steps", "8"))
         )
-        self.inpaint_encode_override_var = tk.BooleanVar(
-            value=bool(self._config.get("inpaint_encode_override", False))
-        )
         self.inpaint_codec_var = tk.StringVar(
             value=self._config.get("inpaint_codec", self.scene_codec_var.get())
-        )
-        self.inpaint_crf_var = tk.StringVar(
-            value=str(self._config.get("inpaint_crf", self.scene_crf_var.get()))
-        )
-        self.inpaint_preset_var = tk.StringVar(
-            value=self._config.get("inpaint_preset", self.scene_encoder_preset_var.get())
-        )
-        self.inpaint_pix_fmt_var = tk.StringVar(
-            value=self._config.get("inpaint_pix_fmt", self.scene_pix_fmt_var.get())
-        )
-        self.inpaint_extra_ffmpeg_args_var = tk.StringVar(
-            value=self._config.get("inpaint_extra_ffmpeg_args", "")
         )
         self.inpaint_sharpness_csv_var = tk.StringVar(value="")
         self.inpaint_cmd_preview_var = tk.StringVar(value="")
@@ -794,7 +783,7 @@ class PipelineMasterGUI:
             value=bool(self._config.get("merge_parallel", True))
         )
         self.merge_parallel_workers_var = tk.StringVar(
-            value=str(self._config.get("merge_parallel_workers", "2"))
+            value=str(self._config.get("merge_parallel_workers", "4"))
         )
         self.merge_use_gpu_var = tk.BooleanVar(
             value=bool(self._config.get("merge_use_gpu", False))
@@ -858,23 +847,8 @@ class PipelineMasterGUI:
         self.merge_ct_exclude_black_var = tk.BooleanVar(
             value=bool(self._config.get("merge_ct_exclude_black", True))
         )
-        self.merge_encode_override_var = tk.BooleanVar(
-            value=bool(self._config.get("merge_encode_override", False))
-        )
         self.merge_codec_var = tk.StringVar(
             value=self._config.get("merge_codec", self.scene_codec_var.get())
-        )
-        self.merge_crf_var = tk.StringVar(
-            value=str(self._config.get("merge_crf", self.scene_crf_var.get()))
-        )
-        self.merge_preset_var = tk.StringVar(
-            value=self._config.get("merge_preset", self.scene_encoder_preset_var.get())
-        )
-        self.merge_pix_fmt_var = tk.StringVar(
-            value=self._config.get("merge_pix_fmt", self.scene_pix_fmt_var.get())
-        )
-        self.merge_extra_ffmpeg_args_var = tk.StringVar(
-            value=self._config.get("merge_extra_ffmpeg_args", "")
         )
         self.merge_cmd_preview_var = tk.StringVar(value="")
         self.merge_status_var = tk.StringVar(value="Ready")
@@ -892,16 +866,13 @@ class PipelineMasterGUI:
             value=self._config.get("join_encoder", "hevc_nvenc")
         )
         self.join_crf_var = tk.StringVar(
-            value=str(self._config.get("join_crf", "16"))
+            value=str(self._config.get("join_crf", "12"))
         )
         self.join_preset_var = tk.StringVar(
             value=self._config.get("join_preset", "p7")
         )
-        self.join_pix_fmt_override_var = tk.BooleanVar(
-            value=bool(self._config.get("join_pix_fmt_override", False))
-        )
         self.join_pix_fmt_var = tk.StringVar(
-            value=self._config.get("join_pix_fmt", self.scene_pix_fmt_var.get())
+            value=self._config.get("join_pix_fmt", "yuv420p")
         )
         self.join_extra_args_var = tk.StringVar(
             value=self._config.get("join_extra_args", self.JOIN_DEFAULT_ARGS)
@@ -926,6 +897,13 @@ class PipelineMasterGUI:
                 )
             )
         )
+        self.global_encoder_mode_var = tk.StringVar(
+            value=self._migrate_global_encoder_mode_from_legacy()
+        )
+        self.global_ffmpeg_extra_args_var = tk.StringVar(
+            value=str(self._config.get("global_ffmpeg_extra_args", "")).strip()
+        )
+        self.global_encoder_preview_var = tk.StringVar(value="")
         depth_retry_cfg = self._retry_policy_from_config_key(
             "depth_retry_policy",
             self.DEPTH_RETRY_POLICY_DEFAULT,
@@ -955,6 +933,21 @@ class PipelineMasterGUI:
                 "cpu_offload_mode": tk.StringVar(
                     value=self._normalize_retry_offload_mode(dcfg.get("cpu_offload_mode", "model"))
                 ),
+                "worker_mode": tk.StringVar(
+                    value=self._normalize_depth_runtime_mode(
+                        dcfg.get("worker_mode", self.DEPTH_RETRY_POLICY_DEFAULT[profile].get("worker_mode", "original"))
+                    )
+                ),
+                "window_size": tk.StringVar(
+                    value=self._normalize_depth_retry_window_size(
+                        dcfg.get("window_size", self.DEPTH_RETRY_POLICY_DEFAULT[profile].get("window_size", "65"))
+                    )
+                ),
+                "overlap": tk.StringVar(
+                    value=self._normalize_depth_retry_overlap(
+                        dcfg.get("overlap", self.DEPTH_RETRY_POLICY_DEFAULT[profile].get("overlap", "15"))
+                    )
+                ),
             }
             self.inpaint_retry_policy_vars[profile] = {
                 "garbage_collection_threshold": tk.BooleanVar(
@@ -974,6 +967,10 @@ class PipelineMasterGUI:
                 ),
             }
         self._depth_retry_offload_widgets: dict[str, ttk.Combobox] = {}
+        self._depth_retry_worker_widgets: dict[str, ttk.Combobox] = {}
+        self._depth_retry_window_widgets: dict[str, tk.Widget] = {}
+        self._depth_retry_overlap_widgets: dict[str, tk.Widget] = {}
+        self._depth_retry_inherited_widgets: dict[str, tk.Widget] = {}
         self._inpaint_retry_offload_widgets: dict[str, ttk.Combobox] = {}
         self.pipeline_run_status_var = tk.StringVar(value="Idle")
         self.pipeline_run_progress_var = tk.DoubleVar(value=0.0)
@@ -1002,13 +999,9 @@ class PipelineMasterGUI:
                 self.DEFAULT_SCENE_CODEC,
             )
         )
-        if self.scene_crf_var.get().strip() in {"", "0"}:
-            self.scene_crf_var.set("1")
-        if self.scene_encoder_preset_var.get().strip().lower() in {"", "veryfast"}:
-            self.scene_encoder_preset_var.set("fast")
-        if self.depth_chunk_size_var.get().strip() in {"", "70", "110"}:
-            self.depth_chunk_size_var.set("100")
-        if self.depth_overlap_var.get().strip() in {"", "15", "20", "25"}:
+        if self.depth_chunk_size_var.get().strip() == "":
+            self.depth_chunk_size_var.set("65")
+        if self.depth_overlap_var.get().strip() == "":
             self.depth_overlap_var.set("15")
         if self.depth_inference_steps_var.get().strip() == "":
             self.depth_inference_steps_var.set("5")
@@ -1037,7 +1030,7 @@ class PipelineMasterGUI:
             if int(self.splat_workers_var.get().strip()) < 1:
                 raise ValueError
         except Exception:
-            self.splat_workers_var.set("4")
+            self.splat_workers_var.set("8")
         if self.splat_layout_var.get().strip() not in {"Single Warp", "Dual", "Quad"}:
             self.splat_layout_var.set("Single Warp")
         if self.splat_auto_convergence_var.get().strip() not in {"Min Borders", "Off"}:
@@ -1069,8 +1062,6 @@ class PipelineMasterGUI:
                 self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
             )
         )
-        if self.inpaint_crf_var.get().strip() == "":
-            self.inpaint_crf_var.set(self.scene_crf_var.get().strip() or "1")
         if self.inpaint_codec_var.get().strip() == "":
             self.inpaint_codec_var.set(
                 self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC
@@ -1081,10 +1072,6 @@ class PipelineMasterGUI:
                 self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
             )
         )
-        if self.inpaint_preset_var.get().strip() == "":
-            self.inpaint_preset_var.set(self.scene_encoder_preset_var.get().strip() or "fast")
-        if self.inpaint_pix_fmt_var.get().strip() == "":
-            self.inpaint_pix_fmt_var.set(self.scene_pix_fmt_var.get().strip() or "yuv420p")
         try:
             if int(self.inpaint_sharpness_workers_var.get().strip()) < 1:
                 raise ValueError
@@ -1103,7 +1090,7 @@ class PipelineMasterGUI:
         if self.merge_mask_formerge_workers_var.get().strip() == "":
             self.merge_mask_formerge_workers_var.set("19")
         if self.merge_parallel_workers_var.get().strip() == "":
-            self.merge_parallel_workers_var.set("2")
+            self.merge_parallel_workers_var.set("4")
         if self.merge_chunks_var.get().strip() == "":
             self.merge_chunks_var.set("20")
         if self.merge_mask_binarize_var.get().strip() == "":
@@ -1120,8 +1107,6 @@ class PipelineMasterGUI:
             self.splat_replace_mask_var.set(True)
         if not bool(self.merge_use_replace_mask_var.get()):
             self.merge_use_replace_mask_var.set(True)
-        if self.merge_crf_var.get().strip() == "":
-            self.merge_crf_var.set(self.scene_crf_var.get().strip() or "1")
         if self.merge_codec_var.get().strip() == "":
             self.merge_codec_var.set(
                 self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC
@@ -1132,10 +1117,6 @@ class PipelineMasterGUI:
                 self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
             )
         )
-        if self.merge_preset_var.get().strip() == "":
-            self.merge_preset_var.set(self.scene_encoder_preset_var.get().strip() or "fast")
-        if self.merge_pix_fmt_var.get().strip() == "":
-            self.merge_pix_fmt_var.set(self.scene_pix_fmt_var.get().strip() or "yuv420p")
         if self.join_mode_var.get().strip() not in {"Auto (recommended)", "Manual"}:
             self.join_mode_var.set("Auto (recommended)")
         if self.join_encoder_var.get().strip() == "":
@@ -1147,13 +1128,16 @@ class PipelineMasterGUI:
             )
         )
         if self.join_crf_var.get().strip() == "":
-            self.join_crf_var.set("16")
+            self.join_crf_var.set("12")
         if self.join_preset_var.get().strip() == "":
             self.join_preset_var.set("p7")
         if self.join_pix_fmt_var.get().strip() == "":
-            self.join_pix_fmt_var.set(self.scene_pix_fmt_var.get().strip() or "yuv420p")
+            self.join_pix_fmt_var.set("yuv420p")
         if self.join_extra_args_var.get().strip() == "":
             self.join_extra_args_var.set(self.JOIN_DEFAULT_ARGS)
+        self.global_encoder_mode_var.set(
+            normalize_global_encoder_mode(self.global_encoder_mode_var.get())
+        )
         try:
             if int(self.verify_scenes_workers_var.get().strip()) < 1:
                 raise ValueError
@@ -1172,26 +1156,17 @@ class PipelineMasterGUI:
         if self.pipeline_verify_after_var.get().strip() not in self.PIPELINE_VERIFY_CHOICES:
             self.pipeline_verify_after_var.set("Quick")
 
-        # Keep pix_fmt aligned to chroma at startup.
-        self.scene_pix_fmt_var.set(self._chroma_to_pixfmt(self.scene_chroma_var.get().strip()))
-        if not self.depth_encode_override_var.get():
-            self._sync_depth_encoding_from_scene()
-        if not self.splat_encode_override_var.get():
-            self._sync_splat_encoding_from_scene()
-        if not self.inpaint_encode_override_var.get():
-            self._sync_inpaint_encoding_from_scene()
-        if not self.merge_encode_override_var.get():
-            self._sync_merge_encoding_from_scene()
-        if not self.join_pix_fmt_override_var.get():
-            self._sync_join_encoding_from_scene()
+        if self.join_mode_var.get().strip() != "Manual":
+            self.join_pix_fmt_var.set("yuv420p")
 
-        # Live inherit scene encoding values into depth (when override is off).
-        self.scene_codec_var.trace_add("write", self._on_scene_encode_var_changed)
-        self.scene_crf_var.trace_add("write", self._on_scene_encode_var_changed)
-        self.scene_encoder_preset_var.trace_add("write", self._on_scene_encode_var_changed)
-        self.scene_pix_fmt_var.trace_add("write", self._on_scene_encode_var_changed)
+        self.global_encoder_mode_var.trace_add("write", self._on_global_encoder_settings_changed)
+        self.global_ffmpeg_extra_args_var.trace_add("write", self._on_global_encoder_settings_changed)
         self.scene_crop_target_h_var.trace_add("write", self._on_scene_crop_target_changed)
         self.depth_scale_factor_var.trace_add("write", self._on_depth_scale_factor_changed)
+        self.depth_cpu_offload_var.trace_add("write", self._on_depth_retry_inherited_source_changed)
+        self.depth_runtime_mode_var.trace_add("write", self._on_depth_retry_inherited_source_changed)
+        self.depth_chunk_size_var.trace_add("write", self._on_depth_retry_inherited_source_changed)
+        self.depth_overlap_var.trace_add("write", self._on_depth_retry_inherited_source_changed)
 
     def _build_ui(self) -> None:
         self.root.grid_rowconfigure(0, weight=1)
@@ -1349,41 +1324,13 @@ class PipelineMasterGUI:
             row=1, column=0, columnspan=6, sticky="w", pady=(8, 0)
         )
 
-        ttk.Label(policy_frame, text="Chroma target:").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        chroma_row = ttk.Frame(policy_frame)
-        chroma_row.grid(row=2, column=1, columnspan=4, sticky="w", pady=(8, 0))
-        self.chroma_444_rb = ttk.Radiobutton(
-            chroma_row,
-            text="yuv444p",
-            variable=self.scene_chroma_var,
-            value="444",
-            command=self._on_chroma_changed,
-        )
-        self.chroma_444_rb.grid(row=0, column=0, sticky="w", padx=(0, 18))
-        self.chroma_422_rb = ttk.Radiobutton(
-            chroma_row,
-            text="yuv422p",
-            variable=self.scene_chroma_var,
-            value="422",
-            command=self._on_chroma_changed,
-        )
-        self.chroma_422_rb.grid(row=0, column=1, sticky="w", padx=(0, 18))
-        self.chroma_420_rb = ttk.Radiobutton(
-            chroma_row,
-            text="yuv420p",
-            variable=self.scene_chroma_var,
-            value="420",
-            command=self._on_chroma_changed,
-        )
-        self.chroma_420_rb.grid(row=0, column=2, sticky="w")
-
         ttk.Label(policy_frame, textvariable=self.scene_option_hint_var).grid(
-            row=3, column=0, columnspan=6, sticky="w", pady=(8, 0)
+            row=2, column=0, columnspan=6, sticky="w", pady=(8, 0)
         )
 
         ffmpeg_frame = ttk.LabelFrame(parent, text="Split Encoding Args", padding=8)
         ffmpeg_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
-        ffmpeg_frame.grid_columnconfigure(9, weight=1)
+        ffmpeg_frame.grid_columnconfigure(3, weight=1)
 
         ttk.Label(ffmpeg_frame, text="Codec:").grid(row=0, column=0, sticky="w")
         self.scene_codec_combo = ttk.Combobox(
@@ -1395,25 +1342,10 @@ class PipelineMasterGUI:
         )
         self.scene_codec_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
         self.scene_codec_combo.bind("<<ComboboxSelected>>", lambda _e: self._preview_scene_command())
-        ttk.Label(ffmpeg_frame, text="Quality (CRF/QP):").grid(row=0, column=2, sticky="w")
-        ttk.Entry(ffmpeg_frame, textvariable=self.scene_crf_var, width=6).grid(
-            row=0, column=3, sticky="w", padx=(6, 12)
-        )
-        ttk.Label(ffmpeg_frame, text="Preset:").grid(row=0, column=4, sticky="w")
-        ttk.Entry(ffmpeg_frame, textvariable=self.scene_encoder_preset_var, width=10).grid(
-            row=0, column=5, sticky="w", padx=(6, 12)
-        )
-        ttk.Label(ffmpeg_frame, text="PixFmt (menu-driven):").grid(row=0, column=6, sticky="w")
-        ttk.Entry(ffmpeg_frame, textvariable=self.scene_pix_fmt_var, width=10, state="readonly").grid(
-            row=0, column=7, sticky="w", padx=(6, 12)
-        )
-
-        ttk.Label(ffmpeg_frame, text="Extra ffmpeg args:").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
-        )
-        ttk.Entry(ffmpeg_frame, textvariable=self.scene_extra_ffmpeg_args_var).grid(
-            row=1, column=1, columnspan=9, sticky="ew", padx=(6, 0), pady=(8, 0)
-        )
+        ttk.Label(
+            ffmpeg_frame,
+            text="Quality, pix_fmt and extra ffmpeg args are driven globally from Options and Run.",
+        ).grid(row=0, column=2, columnspan=2, sticky="w")
 
         cmd_frame = ttk.LabelFrame(parent, text="Command Preview", padding=8)
         cmd_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
@@ -1441,19 +1373,15 @@ class PipelineMasterGUI:
         )
         self.scene_split_btn.grid(row=0, column=3, padx=6)
         self.scene_verify_quick_btn = ttk.Button(
-            buttons, text="Verify Scenes (Quick)", command=self._start_verify_quick
+            buttons, text="Verify Scenes", command=self._start_verify_quick
         )
         self.scene_verify_quick_btn.grid(row=0, column=4, padx=6)
-        self.scene_verify_deep_btn = ttk.Button(
-            buttons, text="Verify Scenes (Deep)", command=self._start_verify_deep
-        )
-        self.scene_verify_deep_btn.grid(row=0, column=5, padx=6)
         self.scene_stop_btn = ttk.Button(
             buttons, text="Stop", command=self._stop_scene_detect, state=tk.DISABLED
         )
-        self.scene_stop_btn.grid(row=0, column=6, padx=6)
+        self.scene_stop_btn.grid(row=0, column=5, padx=6)
         ttk.Button(buttons, text="Clear Log", command=self._clear_scene_log).grid(
-            row=0, column=7, padx=6
+            row=0, column=6, padx=6
         )
 
         status_frame = ttk.Frame(parent)
@@ -1576,6 +1504,19 @@ class PipelineMasterGUI:
         self.depth_mode_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
         self.depth_mode_combo.bind("<<ComboboxSelected>>", self._on_depth_mode_changed)
 
+        ttk.Label(mode_frame, text="Runtime:").grid(row=0, column=2, sticky="w")
+        self.depth_runtime_mode_combo = ttk.Combobox(
+            mode_frame,
+            textvariable=self.depth_runtime_mode_var,
+            values=self.DEPTH_RUNTIME_MODE_CHOICES,
+            width=12,
+            state="readonly",
+        )
+        self.depth_runtime_mode_combo.grid(row=0, column=3, sticky="w", padx=(6, 0))
+        self.depth_runtime_mode_combo.bind(
+            "<<ComboboxSelected>>", self._on_depth_runtime_mode_selected
+        )
+
         ttk.Label(
             mode_frame,
             textvariable=self.depth_info_text_var,
@@ -1683,24 +1624,26 @@ class PipelineMasterGUI:
         self.depth_realesrgan_workers_entry.grid(
             row=3, column=5, sticky="w", padx=(6, 12), pady=(8, 0)
         )
-        ttk.Label(
+        ttk.Label(params_frame, text="Runtime:").grid(row=3, column=6, sticky="w", pady=(8, 0))
+        self.depth_realesrgan_source_combo = ttk.Combobox(
             params_frame,
-            text="Manual-only optional step. In Auto it is disabled and skipped.",
-        ).grid(row=3, column=6, columnspan=2, sticky="w", pady=(8, 0))
-
-        encode_frame = ttk.LabelFrame(parent, text="Encoding Args (inherited)", padding=8)
-        encode_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
-        encode_frame.grid_columnconfigure(9, weight=1)
-
-        self.depth_override_check = ttk.Checkbutton(
-            encode_frame,
-            text="Override",
-            variable=self.depth_encode_override_var,
-            command=self._on_depth_override_toggle,
+            textvariable=self.depth_realesrgan_source_var,
+            values=[
+                "Bundled (Utilities/realesrgan)",
+                "Local (system/custom path)",
+            ],
+            state="readonly",
+            width=30,
         )
-        self.depth_override_check.grid(row=0, column=0, sticky="w")
+        self.depth_realesrgan_source_combo.grid(
+            row=3, column=7, sticky="w", padx=(6, 0), pady=(8, 0)
+        )
 
-        ttk.Label(encode_frame, text="Codec:").grid(row=0, column=1, sticky="w", padx=(16, 0))
+        encode_frame = ttk.LabelFrame(parent, text="Encoding", padding=8)
+        encode_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
+        encode_frame.grid_columnconfigure(3, weight=1)
+
+        ttk.Label(encode_frame, text="Codec:").grid(row=0, column=0, sticky="w")
         self.depth_codec_entry = ttk.Combobox(
             encode_frame,
             textvariable=self.depth_codec_var,
@@ -1708,29 +1651,12 @@ class PipelineMasterGUI:
             width=12,
             state="readonly",
         )
-        self.depth_codec_entry.grid(row=0, column=2, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="Quality (CRF/QP):").grid(row=0, column=3, sticky="w")
-        self.depth_crf_entry = ttk.Entry(encode_frame, textvariable=self.depth_crf_var, width=6)
-        self.depth_crf_entry.grid(row=0, column=4, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="Preset:").grid(row=0, column=5, sticky="w")
-        self.depth_preset_entry = ttk.Entry(encode_frame, textvariable=self.depth_preset_var, width=10)
-        self.depth_preset_entry.grid(row=0, column=6, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="PixFmt:").grid(row=0, column=7, sticky="w")
-        self.depth_pixfmt_entry = ttk.Entry(encode_frame, textvariable=self.depth_pix_fmt_var, width=10)
-        self.depth_pixfmt_entry.grid(row=0, column=8, sticky="w", padx=(6, 0))
-
-        ttk.Label(encode_frame, text="Extra ffmpeg args:").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
-        )
-        self.depth_extra_ffmpeg_entry = ttk.Entry(
-            encode_frame, textvariable=self.depth_extra_ffmpeg_args_var
-        )
-        self.depth_extra_ffmpeg_entry.grid(
-            row=1, column=1, columnspan=9, sticky="ew", padx=(6, 0), pady=(8, 0)
-        )
+        self.depth_codec_entry.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        ttk.Label(
+            encode_frame,
+            text="Final depthmap output is fixed grayscale-safe x264. This codec only affects the temporary color preprocess.",
+            justify="left",
+        ).grid(row=0, column=2, columnspan=2, sticky="w")
 
         cmd_frame = ttk.LabelFrame(parent, text="Command Preview", padding=8)
         cmd_frame.grid(row=7, column=0, columnspan=3, sticky="ew", pady=6)
@@ -1754,27 +1680,19 @@ class PipelineMasterGUI:
         )
         self.depth_upscale_btn.grid(row=0, column=2, padx=6)
         self.depth_verify_quick_btn = ttk.Button(
-            buttons, text="Verify Depth (Quick)", command=self._start_depth_verify_quick
+            buttons, text="Verify Depth", command=self._start_depth_verify_quick
         )
         self.depth_verify_quick_btn.grid(row=0, column=3, padx=6)
-        self.depth_verify_deep_btn = ttk.Button(
-            buttons, text="Verify Depth (Deep)", command=self._start_depth_verify_deep
-        )
-        self.depth_verify_deep_btn.grid(row=0, column=4, padx=6)
         self.depth_upscaled_verify_quick_btn = ttk.Button(
-            buttons, text="Verify Upscale (Quick)", command=self._start_depth_upscaled_verify_quick
+            buttons, text="Verify Upscale", command=self._start_depth_upscaled_verify_quick
         )
-        self.depth_upscaled_verify_quick_btn.grid(row=0, column=5, padx=6)
-        self.depth_upscaled_verify_deep_btn = ttk.Button(
-            buttons, text="Verify Upscale (Deep)", command=self._start_depth_upscaled_verify_deep
-        )
-        self.depth_upscaled_verify_deep_btn.grid(row=0, column=6, padx=6)
+        self.depth_upscaled_verify_quick_btn.grid(row=0, column=4, padx=6)
         self.depth_stop_btn = ttk.Button(
             buttons, text="Stop", command=self._stop_depth_placeholder
         )
-        self.depth_stop_btn.grid(row=0, column=7, padx=6)
+        self.depth_stop_btn.grid(row=0, column=5, padx=6)
         ttk.Button(buttons, text="Clear Log", command=self._clear_depth_log).grid(
-            row=0, column=8, padx=6
+            row=0, column=6, padx=6
         )
 
         status_frame = ttk.Frame(parent)
@@ -1806,7 +1724,6 @@ class PipelineMasterGUI:
         self.depth_log_text.configure(yscrollcommand=dscroll.set)
 
         self._on_depth_mode_changed()
-        self._on_depth_override_toggle(initial=True)
         self._preview_depth_command()
         self._set_depth_running(False)
 
@@ -2057,19 +1974,11 @@ class PipelineMasterGUI:
             justify="left",
         ).grid(row=5, column=0, columnspan=12, sticky="w", pady=(6, 0))
 
-        encode_frame = ttk.LabelFrame(parent, text="Encoding Args (inherited)", padding=8)
+        encode_frame = ttk.LabelFrame(parent, text="Encoding", padding=8)
         encode_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
-        encode_frame.grid_columnconfigure(9, weight=1)
+        encode_frame.grid_columnconfigure(3, weight=1)
 
-        self.splat_override_check = ttk.Checkbutton(
-            encode_frame,
-            text="Override",
-            variable=self.splat_encode_override_var,
-            command=self._on_splat_override_toggle,
-        )
-        self.splat_override_check.grid(row=0, column=0, sticky="w")
-
-        ttk.Label(encode_frame, text="Codec:").grid(row=0, column=1, sticky="w", padx=(16, 0))
+        ttk.Label(encode_frame, text="Codec:").grid(row=0, column=0, sticky="w")
         self.splat_codec_entry = ttk.Combobox(
             encode_frame,
             textvariable=self.splat_codec_var,
@@ -2077,29 +1986,11 @@ class PipelineMasterGUI:
             width=12,
             state="readonly",
         )
-        self.splat_codec_entry.grid(row=0, column=2, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="Quality (CRF/QP):").grid(row=0, column=3, sticky="w")
-        self.splat_crf_entry = ttk.Entry(encode_frame, textvariable=self.splat_crf_var, width=6)
-        self.splat_crf_entry.grid(row=0, column=4, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="Preset:").grid(row=0, column=5, sticky="w")
-        self.splat_preset_entry = ttk.Entry(encode_frame, textvariable=self.splat_preset_var, width=10)
-        self.splat_preset_entry.grid(row=0, column=6, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="PixFmt:").grid(row=0, column=7, sticky="w")
-        self.splat_pixfmt_entry = ttk.Entry(encode_frame, textvariable=self.splat_pix_fmt_var, width=10)
-        self.splat_pixfmt_entry.grid(row=0, column=8, sticky="w", padx=(6, 0))
-
-        ttk.Label(encode_frame, text="Extra ffmpeg args:").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
-        )
-        self.splat_extra_ffmpeg_entry = ttk.Entry(
-            encode_frame, textvariable=self.splat_extra_ffmpeg_args_var
-        )
-        self.splat_extra_ffmpeg_entry.grid(
-            row=1, column=1, columnspan=9, sticky="ew", padx=(6, 0), pady=(8, 0)
-        )
+        self.splat_codec_entry.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        ttk.Label(
+            encode_frame,
+            text="Quality and ffmpeg args are driven globally from Options and Run.",
+        ).grid(row=0, column=2, columnspan=2, sticky="w")
 
         cmd_frame = ttk.LabelFrame(parent, text="Command Preview", padding=8)
         cmd_frame.grid(row=7, column=0, columnspan=3, sticky="ew", pady=6)
@@ -2119,19 +2010,15 @@ class PipelineMasterGUI:
         )
         self.splat_run_btn.grid(row=0, column=1, padx=6)
         self.splat_verify_quick_btn = ttk.Button(
-            buttons, text="Verify Scenes (Quick)", command=self._start_splat_verify_quick
+            buttons, text="Verify Scenes", command=self._start_splat_verify_quick
         )
         self.splat_verify_quick_btn.grid(row=0, column=2, padx=6)
-        self.splat_verify_deep_btn = ttk.Button(
-            buttons, text="Verify Scenes (Deep)", command=self._start_splat_verify_deep
-        )
-        self.splat_verify_deep_btn.grid(row=0, column=3, padx=6)
         self.splat_stop_btn = ttk.Button(
             buttons, text="Stop", command=self._stop_splat_placeholder, state=tk.DISABLED
         )
-        self.splat_stop_btn.grid(row=0, column=4, padx=6)
+        self.splat_stop_btn.grid(row=0, column=3, padx=6)
         ttk.Button(buttons, text="Clear Log", command=self._clear_splat_log).grid(
-            row=0, column=5, padx=6
+            row=0, column=4, padx=6
         )
 
         status_frame = ttk.Frame(parent)
@@ -2191,7 +2078,6 @@ class PipelineMasterGUI:
         ]
 
         self._on_splat_mode_changed()
-        self._on_splat_override_toggle(initial=True)
         self._preview_splat_command()
         self._set_splat_running(False)
 
@@ -2356,19 +2242,11 @@ class PipelineMasterGUI:
             row=3, column=3, sticky="w", padx=(6, 12), pady=(8, 0)
         )
 
-        encode_frame = ttk.LabelFrame(parent, text="Encoding Args (inherited)", padding=8)
+        encode_frame = ttk.LabelFrame(parent, text="Encoding", padding=8)
         encode_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
-        encode_frame.grid_columnconfigure(9, weight=1)
+        encode_frame.grid_columnconfigure(3, weight=1)
 
-        self.inpaint_override_check = ttk.Checkbutton(
-            encode_frame,
-            text="Override",
-            variable=self.inpaint_encode_override_var,
-            command=self._on_inpaint_override_toggle,
-        )
-        self.inpaint_override_check.grid(row=0, column=0, sticky="w")
-
-        ttk.Label(encode_frame, text="Codec:").grid(row=0, column=1, sticky="w", padx=(16, 0))
+        ttk.Label(encode_frame, text="Codec:").grid(row=0, column=0, sticky="w")
         self.inpaint_codec_entry = ttk.Combobox(
             encode_frame,
             textvariable=self.inpaint_codec_var,
@@ -2376,29 +2254,11 @@ class PipelineMasterGUI:
             width=12,
             state="readonly",
         )
-        self.inpaint_codec_entry.grid(row=0, column=2, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="Quality (CRF/QP):").grid(row=0, column=3, sticky="w")
-        self.inpaint_crf_entry = ttk.Entry(encode_frame, textvariable=self.inpaint_crf_var, width=6)
-        self.inpaint_crf_entry.grid(row=0, column=4, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="Preset:").grid(row=0, column=5, sticky="w")
-        self.inpaint_preset_entry = ttk.Entry(encode_frame, textvariable=self.inpaint_preset_var, width=10)
-        self.inpaint_preset_entry.grid(row=0, column=6, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="PixFmt:").grid(row=0, column=7, sticky="w")
-        self.inpaint_pixfmt_entry = ttk.Entry(encode_frame, textvariable=self.inpaint_pix_fmt_var, width=10)
-        self.inpaint_pixfmt_entry.grid(row=0, column=8, sticky="w", padx=(6, 0))
-
-        ttk.Label(encode_frame, text="Extra ffmpeg args:").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
-        )
-        self.inpaint_extra_ffmpeg_entry = ttk.Entry(
-            encode_frame, textvariable=self.inpaint_extra_ffmpeg_args_var
-        )
-        self.inpaint_extra_ffmpeg_entry.grid(
-            row=1, column=1, columnspan=9, sticky="ew", padx=(6, 0), pady=(8, 0)
-        )
+        self.inpaint_codec_entry.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        ttk.Label(
+            encode_frame,
+            text="Quality and ffmpeg args are driven globally from Options and Run.",
+        ).grid(row=0, column=2, columnspan=2, sticky="w")
 
         cmd_frame = ttk.LabelFrame(parent, text="Command Preview", padding=8)
         cmd_frame.grid(row=7, column=0, columnspan=3, sticky="ew", pady=6)
@@ -2426,27 +2286,19 @@ class PipelineMasterGUI:
         )
         self.inpaint_sharpen_run_btn.grid(row=0, column=3, padx=6)
         self.inpaint_verify_quick_btn = ttk.Button(
-            buttons, text="Verify Scenes (Quick)", command=self._start_inpaint_verify_quick
+            buttons, text="Verify Scenes", command=self._start_inpaint_verify_quick
         )
         self.inpaint_verify_quick_btn.grid(row=0, column=4, padx=6)
-        self.inpaint_verify_deep_btn = ttk.Button(
-            buttons, text="Verify Scenes (Deep)", command=self._start_inpaint_verify_deep
-        )
-        self.inpaint_verify_deep_btn.grid(row=0, column=5, padx=6)
         self.inpaint_sharpen_verify_quick_btn = ttk.Button(
-            buttons, text="Verify Sharpen (Quick)", command=self._start_inpaint_sharpen_verify_quick
+            buttons, text="Verify Sharpen", command=self._start_inpaint_sharpen_verify_quick
         )
-        self.inpaint_sharpen_verify_quick_btn.grid(row=0, column=6, padx=6)
-        self.inpaint_sharpen_verify_deep_btn = ttk.Button(
-            buttons, text="Verify Sharpen (Deep)", command=self._start_inpaint_sharpen_verify_deep
-        )
-        self.inpaint_sharpen_verify_deep_btn.grid(row=0, column=7, padx=6)
+        self.inpaint_sharpen_verify_quick_btn.grid(row=0, column=5, padx=6)
         self.inpaint_stop_btn = ttk.Button(
             buttons, text="Stop", command=self._stop_inpaint_placeholder, state=tk.DISABLED
         )
-        self.inpaint_stop_btn.grid(row=0, column=8, padx=6)
+        self.inpaint_stop_btn.grid(row=0, column=6, padx=6)
         ttk.Button(buttons, text="Clear Log", command=self._clear_inpaint_log).grid(
-            row=0, column=9, padx=6
+            row=0, column=7, padx=6
         )
 
         status_frame = ttk.Frame(parent)
@@ -2486,7 +2338,6 @@ class PipelineMasterGUI:
         ]
 
         self._on_inpaint_mode_changed()
-        self._on_inpaint_override_toggle(initial=True)
         self._preview_inpaint_command()
         self._set_inpaint_running(False)
 
@@ -2576,41 +2427,10 @@ class PipelineMasterGUI:
         self.inpaint_sharpen_run_btn.configure(state=sharpen_buttons_state)
         if not (self._inpaint_thread and self._inpaint_thread.is_alive()) and not self._verify_running:
             self.inpaint_sharpen_verify_quick_btn.configure(state=sharpen_buttons_state)
-            self.inpaint_sharpen_verify_deep_btn.configure(state=sharpen_buttons_state)
 
         self._update_replace_mask_dependent_controls()
         self._preview_inpaint_command()
         self._refresh_pipeline_status_panel()
-
-    def _sync_inpaint_encoding_from_scene(self) -> None:
-        self.inpaint_codec_var.set(
-            self._normalize_ffmpeg_codec(
-                self.scene_codec_var.get(),
-                self.DEFAULT_SCENE_CODEC,
-            )
-        )
-        self.inpaint_crf_var.set(self.scene_crf_var.get().strip())
-        self.inpaint_preset_var.set(self.scene_encoder_preset_var.get().strip())
-        self.inpaint_pix_fmt_var.set(self.scene_pix_fmt_var.get().strip())
-
-    def _on_inpaint_override_toggle(self, initial: bool = False) -> None:
-        enabled = bool(self.inpaint_encode_override_var.get())
-        if not enabled:
-            self._sync_inpaint_encoding_from_scene()
-        elif not initial and not self._inpaint_override_notice_shown:
-            self._inpaint_override_notice_shown = True
-            messagebox.showwarning("Inpainting Encode Override", self.INPAINT_OVERRIDE_WARNING)
-
-        state = tk.NORMAL if enabled else tk.DISABLED
-        self._set_codec_widget_override_state(self.inpaint_codec_entry, enabled)
-        for widget in (
-            self.inpaint_crf_entry,
-            self.inpaint_preset_entry,
-            self.inpaint_pixfmt_entry,
-            self.inpaint_extra_ffmpeg_entry,
-        ):
-            widget.configure(state=state)
-        self._preview_inpaint_command()
 
     def _build_inpaint_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
         input_dir = self.inpaint_input_var.get().strip()
@@ -2622,7 +2442,7 @@ class PipelineMasterGUI:
         use_sharpness_csv = bool(self.inpaint_use_sharpness_csv_var.get())
         codec_value = self._normalize_ffmpeg_codec(
             self.inpaint_codec_var.get(),
-            self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
+            self.DEFAULT_SCENE_CODEC,
         )
         self.inpaint_codec_var.set(codec_value)
 
@@ -2640,11 +2460,9 @@ class PipelineMasterGUI:
             "OVERLAP": self.inpaint_overlap_var.get().strip() or "3",
             "TAIL_PAD": self.inpaint_tail_pad_var.get().strip() or "2",
             "ORIGINAL_INPUT_BLEND_STRENGTH": self.inpaint_input_bias_var.get().strip() or "0",
-            "OUTPUT_CRF": self.inpaint_crf_var.get().strip() or "1",
             "OUTPUT_CODEC": codec_value,
-            "OUTPUT_PRESET": self.inpaint_preset_var.get().strip(),
-            "OUTPUT_PIX_FMT": self.inpaint_pix_fmt_var.get().strip(),
-            "OUTPUT_EXTRA_ARGS": self.inpaint_extra_ffmpeg_args_var.get().strip(),
+            "OUTPUT_ENCODING_MODE": self._current_global_encoder_mode(),
+            "OUTPUT_EXTRA_ARGS": self._current_global_ffmpeg_extra_args(),
             "NO_SHARPNESS_CSV": "0" if use_sharpness_csv else "1",
             "SHARPNESS_BASE": sharp_base,
             "SHARPNESS_CSV_PATH": sharp_csv_path,
@@ -2990,11 +2808,6 @@ class PipelineMasterGUI:
 
     def _build_inpaint_sharpen_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
         output_dir = self.inpaint_sharpen_output_var.get().strip()
-        codec_value = self._normalize_ffmpeg_codec(
-            self.inpaint_codec_var.get(),
-            self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
-        )
-        self.inpaint_codec_var.set(codec_value)
         env_updates: dict[str, str] = {
             "PYTHON": sys.executable,
             "RUNNER": "batch_inpaint_sharpen_runner.py",
@@ -3012,11 +2825,11 @@ class PipelineMasterGUI:
                 ".stop_after_current",
             ),
             "SKIP_EXISTING": "1",
-            "OUTPUT_CODEC": codec_value,
-            "OUTPUT_PRESET": self.inpaint_preset_var.get().strip(),
-            "OUTPUT_PIX_FMT": self.inpaint_pix_fmt_var.get().strip(),
-            "OUTPUT_CRF": self.inpaint_crf_var.get().strip() or "0",
-            "OUTPUT_EXTRA_ARGS": self.inpaint_extra_ffmpeg_args_var.get().strip(),
+            "OUTPUT_CODEC": "libx264",
+            "OUTPUT_PRESET": "fast",
+            "OUTPUT_PIX_FMT": "yuv444p",
+            "OUTPUT_CRF": "0",
+            "OUTPUT_EXTRA_ARGS": "",
         }
         cmd = ["bash", "run_inpaint_sharpen_runner.sh"]
         preview = " ".join(
@@ -3640,14 +3453,12 @@ class PipelineMasterGUI:
         self.inpaint_stop_btn.configure(state=tk.NORMAL if is_running else tk.DISABLED)
         verify_state = tk.DISABLED if (is_running or self._verify_running) else tk.NORMAL
         self.inpaint_verify_quick_btn.configure(state=verify_state)
-        self.inpaint_verify_deep_btn.configure(state=verify_state)
         sharpen_verify_state = (
             tk.DISABLED
             if (is_running or self._verify_running or not self._sharpen_step_enabled_in_current_mode())
             else tk.NORMAL
         )
         self.inpaint_sharpen_verify_quick_btn.configure(state=sharpen_verify_state)
-        self.inpaint_sharpen_verify_deep_btn.configure(state=sharpen_verify_state)
         if is_running:
             self.inpaint_stop_btn.configure(text="Stop")
         else:
@@ -4182,19 +3993,11 @@ class PipelineMasterGUI:
         )
         self.merge_ct_exclude_black_check.grid(row=2, column=10, sticky="w", padx=(12, 0), pady=(8, 0))
 
-        encode_frame = ttk.LabelFrame(parent, text="Encoding Args (inherited)", padding=8)
+        encode_frame = ttk.LabelFrame(parent, text="Encoding", padding=8)
         encode_frame.grid(row=9, column=0, columnspan=3, sticky="ew", pady=6)
-        encode_frame.grid_columnconfigure(9, weight=1)
+        encode_frame.grid_columnconfigure(3, weight=1)
 
-        self.merge_override_check = ttk.Checkbutton(
-            encode_frame,
-            text="Override",
-            variable=self.merge_encode_override_var,
-            command=self._on_merge_override_toggle,
-        )
-        self.merge_override_check.grid(row=0, column=0, sticky="w")
-
-        ttk.Label(encode_frame, text="Codec:").grid(row=0, column=1, sticky="w", padx=(16, 0))
+        ttk.Label(encode_frame, text="Codec:").grid(row=0, column=0, sticky="w")
         self.merge_codec_entry = ttk.Combobox(
             encode_frame,
             textvariable=self.merge_codec_var,
@@ -4202,29 +4005,12 @@ class PipelineMasterGUI:
             width=12,
             state="readonly",
         )
-        self.merge_codec_entry.grid(row=0, column=2, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="Quality (CRF/QP):").grid(row=0, column=3, sticky="w")
-        self.merge_crf_entry = ttk.Entry(encode_frame, textvariable=self.merge_crf_var, width=6)
-        self.merge_crf_entry.grid(row=0, column=4, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="Preset:").grid(row=0, column=5, sticky="w")
-        self.merge_preset_entry = ttk.Entry(encode_frame, textvariable=self.merge_preset_var, width=10)
-        self.merge_preset_entry.grid(row=0, column=6, sticky="w", padx=(6, 12))
-
-        ttk.Label(encode_frame, text="PixFmt:").grid(row=0, column=7, sticky="w")
-        self.merge_pixfmt_entry = ttk.Entry(encode_frame, textvariable=self.merge_pix_fmt_var, width=10)
-        self.merge_pixfmt_entry.grid(row=0, column=8, sticky="w", padx=(6, 0))
-
-        ttk.Label(encode_frame, text="Extra ffmpeg args:").grid(
-            row=1, column=0, sticky="w", pady=(8, 0)
-        )
-        self.merge_extra_ffmpeg_entry = ttk.Entry(
-            encode_frame, textvariable=self.merge_extra_ffmpeg_args_var
-        )
-        self.merge_extra_ffmpeg_entry.grid(
-            row=1, column=1, columnspan=9, sticky="ew", padx=(6, 0), pady=(8, 0)
-        )
+        self.merge_codec_entry.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        ttk.Label(
+            encode_frame,
+            text="Mask for merge output is fixed grayscale-safe x264. This codec affects only the merged color output.",
+            justify="left",
+        ).grid(row=0, column=2, columnspan=2, sticky="w")
 
         cmd_frame = ttk.LabelFrame(parent, text="Command Preview", padding=8)
         cmd_frame.grid(row=10, column=0, columnspan=3, sticky="ew", pady=6)
@@ -4252,27 +4038,19 @@ class PipelineMasterGUI:
         )
         self.merge_run_btn.grid(row=0, column=3, padx=6)
         self.merge_mask_verify_quick_btn = ttk.Button(
-            buttons, text="Verify Mask (Quick)", command=self._start_merge_mask_verify_quick
+            buttons, text="Verify Mask", command=self._start_merge_mask_verify_quick
         )
         self.merge_mask_verify_quick_btn.grid(row=0, column=4, padx=6)
-        self.merge_mask_verify_deep_btn = ttk.Button(
-            buttons, text="Verify Mask (Deep)", command=self._start_merge_mask_verify_deep
-        )
-        self.merge_mask_verify_deep_btn.grid(row=0, column=5, padx=6)
         self.merge_verify_quick_btn = ttk.Button(
-            buttons, text="Verify Merge (Quick)", command=self._start_merge_verify_quick
+            buttons, text="Verify Merge", command=self._start_merge_verify_quick
         )
-        self.merge_verify_quick_btn.grid(row=0, column=6, padx=6)
-        self.merge_verify_deep_btn = ttk.Button(
-            buttons, text="Verify Merge (Deep)", command=self._start_merge_verify_deep
-        )
-        self.merge_verify_deep_btn.grid(row=0, column=7, padx=6)
+        self.merge_verify_quick_btn.grid(row=0, column=5, padx=6)
         self.merge_stop_btn = ttk.Button(
             buttons, text="Stop", command=self._stop_merge_placeholder, state=tk.DISABLED
         )
-        self.merge_stop_btn.grid(row=0, column=8, padx=6)
+        self.merge_stop_btn.grid(row=0, column=6, padx=6)
         ttk.Button(buttons, text="Clear Log", command=self._clear_merge_log).grid(
-            row=0, column=9, padx=6
+            row=0, column=7, padx=6
         )
 
         status_frame = ttk.Frame(parent)
@@ -4331,7 +4109,6 @@ class PipelineMasterGUI:
 
         self._on_merge_mode_changed()
         self._on_merge_workers_changed()
-        self._on_merge_override_toggle(initial=True)
         self._update_replace_mask_dependent_controls()
         self._preview_merge_command()
         self._set_merge_running(False)
@@ -4393,26 +4170,24 @@ class PipelineMasterGUI:
         else:
             self.merge_mode_var.set("Auto (recommended)")
             self.merge_info_text_var.set(self.MERGE_AUTO_INFO)
-            self.merge_autoct_workers_var.set("8")
-            self.merge_mask_formerge_workers_var.set("19")
-            self.merge_parallel_workers_var.set("2")
-            self.merge_use_gpu_var.set(False)
-            self.merge_output_format_var.set("Full SBS")
-            self.merge_chunks_var.set("20")
-            self.merge_mask_binarize_var.set("0.5")
-            self.merge_mask_dilate_var.set("2")
-            self.merge_mask_blur_var.set("2")
-            self.merge_shadow_length_var.set("15")
-            self.merge_shadow_curve_var.set("0")
-            self.merge_shadow_motion_enabled_var.set(True)
-            self.merge_dynamic_shadow_width_var.set(True)
-            self.merge_use_replace_mask_var.set(True)
-            self.merge_ct_preset_var.set("1")
-            self.merge_ct_auto_mode_var.set("CSV Blend")
-            self.merge_ct_exclude_black_var.set(True)
+            self._reset_merge_auto_locked_defaults()
         self._apply_merge_control_states()
         self._on_merge_workers_changed()
         self._refresh_pipeline_status_panel()
+
+    def _reset_merge_auto_locked_defaults(self) -> None:
+        # Fields disabled in Auto mode.
+        self.merge_mask_binarize_var.set("0.5")
+        self.merge_mask_dilate_var.set("2")
+        self.merge_mask_blur_var.set("2")
+        self.merge_shadow_length_var.set("15")
+        self.merge_shadow_curve_var.set("0")
+        self.merge_shadow_motion_enabled_var.set(True)
+        self.merge_dynamic_shadow_width_var.set(True)
+        self.merge_use_replace_mask_var.set(True)
+        self.merge_ct_preset_var.set("1")
+        self.merge_ct_auto_mode_var.set("CSV Blend")
+        self.merge_ct_exclude_black_var.set(True)
 
     def _on_merge_ct_auto_mode_changed(self, _event=None) -> None:
         self._preview_merge_command()
@@ -4457,36 +4232,6 @@ class PipelineMasterGUI:
         self._preview_merge_command()
         self._refresh_pipeline_status_panel()
 
-    def _sync_merge_encoding_from_scene(self) -> None:
-        self.merge_codec_var.set(
-            self._normalize_ffmpeg_codec(
-                self.scene_codec_var.get(),
-                self.DEFAULT_SCENE_CODEC,
-            )
-        )
-        self.merge_crf_var.set(self.scene_crf_var.get().strip())
-        self.merge_preset_var.set(self.scene_encoder_preset_var.get().strip())
-        self.merge_pix_fmt_var.set(self.scene_pix_fmt_var.get().strip())
-
-    def _on_merge_override_toggle(self, initial: bool = False) -> None:
-        enabled = bool(self.merge_encode_override_var.get())
-        if not enabled:
-            self._sync_merge_encoding_from_scene()
-        elif not initial and not self._merge_override_notice_shown:
-            self._merge_override_notice_shown = True
-            messagebox.showwarning("Merging Encode Override", self.MERGE_OVERRIDE_WARNING)
-
-        state = tk.NORMAL if enabled else tk.DISABLED
-        self._set_codec_widget_override_state(self.merge_codec_entry, enabled)
-        for widget in (
-            self.merge_crf_entry,
-            self.merge_preset_entry,
-            self.merge_pixfmt_entry,
-            self.merge_extra_ffmpeg_entry,
-        ):
-            widget.configure(state=state)
-        self._preview_merge_command()
-
     def _build_merge_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
         output_dir = self.merge_output_var.get().strip()
         workers = self._get_merge_worker_count()
@@ -4501,7 +4246,7 @@ class PipelineMasterGUI:
         )
         codec_value = self._normalize_ffmpeg_codec(
             self.merge_codec_var.get(),
-            self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
+            self.DEFAULT_SCENE_CODEC,
         )
         self.merge_codec_var.set(codec_value)
         env_updates: dict[str, str] = {
@@ -4535,10 +4280,8 @@ class PipelineMasterGUI:
             "STOP_MARKER": os.path.join(output_dir or "./work/sbs", ".stop_after_current"),
             "MERGE_DEBUG": "0",
             "FFMPEG_CODEC": codec_value,
-            "FFMPEG_CRF": self.merge_crf_var.get().strip() or "1",
-            "FFMPEG_PRESET": self.merge_preset_var.get().strip(),
-            "FFMPEG_PIX_FMT": self.merge_pix_fmt_var.get().strip(),
-            "FFMPEG_EXTRA_ARGS": self.merge_extra_ffmpeg_args_var.get().strip(),
+            "ENCODING_MODE": self._current_global_encoder_mode(),
+            "FFMPEG_EXTRA_ARGS": self._current_global_ffmpeg_extra_args(),
             "RESTART_EVERY": "1",
         }
         if use_parallel:
@@ -5198,9 +4941,7 @@ class PipelineMasterGUI:
         self.merge_stop_btn.configure(state=tk.NORMAL if is_running else tk.DISABLED)
         verify_state = tk.DISABLED if (is_running or self._verify_running) else tk.NORMAL
         self.merge_mask_verify_quick_btn.configure(state=verify_state)
-        self.merge_mask_verify_deep_btn.configure(state=verify_state)
         self.merge_verify_quick_btn.configure(state=verify_state)
-        self.merge_verify_deep_btn.configure(state=verify_state)
         if is_running:
             self.merge_stop_btn.configure(text="Stop")
         else:
@@ -6096,26 +5837,18 @@ class PipelineMasterGUI:
         self.join_preset_entry = ttk.Entry(params_frame, textvariable=self.join_preset_var, width=10)
         self.join_preset_entry.grid(row=0, column=5, sticky="w", padx=(6, 12))
 
-        self.join_pixfmt_override_check = ttk.Checkbutton(
-            params_frame,
-            text="Override pix_fmt",
-            variable=self.join_pix_fmt_override_var,
-            command=self._on_join_pixfmt_override_toggle,
-        )
-        self.join_pixfmt_override_check.grid(row=0, column=6, sticky="w")
-
-        ttk.Label(params_frame, text="PixFmt (inherited):").grid(
-            row=0, column=7, sticky="w", padx=(12, 0)
+        ttk.Label(params_frame, text="PixFmt:").grid(
+            row=0, column=6, sticky="w", padx=(12, 0)
         )
         self.join_pixfmt_entry = ttk.Entry(params_frame, textvariable=self.join_pix_fmt_var, width=10)
-        self.join_pixfmt_entry.grid(row=0, column=8, sticky="w", padx=(6, 0))
+        self.join_pixfmt_entry.grid(row=0, column=7, sticky="w", padx=(6, 0))
 
         ttk.Label(params_frame, text="Extra ffmpeg args:").grid(
             row=1, column=0, sticky="w", pady=(8, 0)
         )
         self.join_extra_args_entry = ttk.Entry(params_frame, textvariable=self.join_extra_args_var)
         self.join_extra_args_entry.grid(
-            row=1, column=1, columnspan=8, sticky="ew", padx=(6, 0), pady=(8, 0)
+            row=1, column=1, columnspan=7, sticky="ew", padx=(6, 0), pady=(8, 0)
         )
 
         cmd_frame = ttk.LabelFrame(parent, text="Command Preview", padding=8)
@@ -6188,7 +5921,6 @@ class PipelineMasterGUI:
         self.join_log_text.configure(yscrollcommand=jscroll.set)
 
         self._on_join_mode_changed()
-        self._on_join_pixfmt_override_toggle()
         self._preview_join_command()
         self._set_join_running(False)
 
@@ -6248,24 +5980,15 @@ class PipelineMasterGUI:
         )
         self._apply_join_control_states()
 
-    def _sync_join_encoding_from_scene(self) -> None:
-        self.join_pix_fmt_var.set(self.scene_pix_fmt_var.get().strip() or "yuv420p")
-
-    def _on_join_pixfmt_override_toggle(self) -> None:
-        if not self.join_pix_fmt_override_var.get():
-            self._sync_join_encoding_from_scene()
-            self.join_pixfmt_entry.configure(state=tk.DISABLED)
-        else:
-            self.join_pixfmt_entry.configure(state=tk.NORMAL)
-        self._preview_join_command()
-
     def _apply_join_control_states(self) -> None:
         manual = self.join_mode_var.get().strip() == "Manual"
         self.join_encoder_entry.configure(state="readonly" if manual else tk.DISABLED)
         self.join_crf_entry.configure(state=tk.NORMAL)
         self.join_preset_entry.configure(state=tk.NORMAL if manual else tk.DISABLED)
+        if not manual:
+            self.join_pix_fmt_var.set("yuv420p")
+        self.join_pixfmt_entry.configure(state=tk.NORMAL if manual else tk.DISABLED)
         self.join_extra_args_entry.configure(state=tk.NORMAL if manual else tk.DISABLED)
-        self._on_join_pixfmt_override_toggle()
         self._preview_join_command()
 
     def _quality_flag_for_codec(self, codec: str, fallback: str, nvenc_flag: str) -> str:
@@ -6276,24 +5999,12 @@ class PipelineMasterGUI:
         encoder = self._normalize_ffmpeg_codec(self.join_encoder_var.get(), "hevc_nvenc")
         return self._quality_flag_for_codec(encoder, "hevc_nvenc", "cq")
 
-    def _merge_quality_flag(self) -> str:
-        codec = self._normalize_ffmpeg_codec(
-            self.merge_codec_var.get(),
-            self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
-        )
-        self.merge_codec_var.set(codec)
-        return self._quality_flag_for_codec(
-            codec,
-            self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
-            "qp",
-        )
-
     def _join_layout_for_seg_mono(self) -> str:
         return "half_sbs" if self.merge_output_format_var.get().strip() == "Half SBS" else "full_sbs"
 
     def _build_join_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
         out_path = self.join_output_var.get().strip()
-        quality_value = self.join_crf_var.get().strip() or "16"
+        quality_value = self.join_crf_var.get().strip() or "12"
         encoder = self._normalize_ffmpeg_codec(self.join_encoder_var.get(), "hevc_nvenc")
         self.join_encoder_var.set(encoder)
         preset = self.join_preset_var.get().strip() or "p7"
@@ -6375,16 +6086,10 @@ class PipelineMasterGUI:
             "ffprobe",
             "--codec",
             merge_codec,
-            "--quality-flag",
-            self._merge_quality_flag(),
-            "--quality",
-            self.merge_crf_var.get().strip() or "1",
-            "--preset",
-            self.merge_preset_var.get().strip(),
-            "--pix-fmt",
-            self.merge_pix_fmt_var.get().strip(),
+            "--encoder-mode",
+            self._current_global_encoder_mode(),
             "--extra-ffmpeg-args",
-            self.merge_extra_ffmpeg_args_var.get().strip(),
+            self._current_global_ffmpeg_extra_args(),
         ]
 
     def _preview_join_command(self) -> None:
@@ -6442,31 +6147,25 @@ class PipelineMasterGUI:
         if shutil.which("ffprobe") is None:
             messagebox.showerror("Joining", "ffprobe command not found in PATH.")
             return
-        mono_ok, mono_msg, _broken_targets, broken_reference = self._verify_join_mono_outputs_coverage(
-            cleanup_incomplete=False
-        )
-        if not mono_ok:
-            if not self._pipeline_test_active:
-                self._pipeline_set_completed("mono_to_sbs", False)
-                self._pipeline_set_verified("mono_to_sbs", "none")
-                self._refresh_pipeline_status_panel()
-                self._save_pipeline_state()
-            msg = mono_msg
-            if broken_reference:
-                msg += self._format_corrupted_files_block(
-                    broken_reference,
-                    "Corrupted seg-mono source files",
-                )
-            messagebox.showwarning(
-                "Joining",
-                f"{msg}\n\nRun Mono->SBS and verify it before Join.",
+
+        join_counts = self._collect_join_scene_count_stats()
+        join_counts_match = bool(join_counts.get("counts_match", False))
+        if not join_counts_match:
+            prompt = (
+                "Do you want to run an incomplete merge?\n\n"
+                f"SBS found: {int(join_counts.get('sbs_count', 0))}\n"
+                f"Expected from seg + seg-mono: {int(join_counts.get('expected_total', 0))}\n"
+                f"(seg={int(join_counts.get('seg_count', 0))}, "
+                f"seg-mono={int(join_counts.get('seg_mono_count', 0))})"
             )
-            return
+            if not messagebox.askyesno("Joining", prompt):
+                return
 
         self._join_stop_requested = False
         self._join_stop_clicks = 0
         self._join_expected_duration_sec = None
         self._join_active_output_path = out_path
+        self._join_mark_completed = bool(join_counts_match)
         self.join_status_var.set("Starting...")
         self.join_progress_var.set(0.0)
         self._set_join_running(True)
@@ -6477,6 +6176,14 @@ class PipelineMasterGUI:
         self._append_join_log(
             "ENV: " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
         )
+        if not join_counts_match:
+            self._append_join_log(
+                "[JOIN] Incomplete mode accepted: "
+                f"sbs={int(join_counts.get('sbs_count', 0))} "
+                f"expected={int(join_counts.get('expected_total', 0))} "
+                f"(seg={int(join_counts.get('seg_count', 0))}, "
+                f"seg-mono={int(join_counts.get('seg_mono_count', 0))})"
+            )
         self._join_thread = threading.Thread(
             target=self._run_join_worker,
             args=(cmd, env_updates),
@@ -6837,7 +6544,7 @@ class PipelineMasterGUI:
             return None
 
     def _join_manual_verify_mode(self) -> str:
-        return "deep" if self.pipeline_verify_after_var.get().strip().lower() == "deep" else "quick"
+        return "quick"
 
     def _start_join_mono_verify(self) -> None:
         if self._join_thread and self._join_thread.is_alive():
@@ -6865,27 +6572,12 @@ class PipelineMasterGUI:
         if shutil.which("ffprobe") is None:
             messagebox.showerror("Verify Mono->SBS", "ffprobe not found in PATH.")
             return
-        script_path = ""
-        if mode == "deep":
-            if shutil.which("ffmpeg") is None:
-                messagebox.showerror("Verify Mono->SBS", "ffmpeg not found in PATH.")
-                return
-            script = Path("Utilities/verifyscenes.py").resolve()
-            if not script.is_file():
-                messagebox.showerror("Verify Mono->SBS", f"Script not found:\n{script}")
-                return
-            script_path = str(script)
-
         self._set_verify_running(True, mode=f"join_mono_{mode}")
         self.join_status_var.set(f"Mono->SBS Verify ({mode}) running...")
         self._append_join_log(f"=== Verify Mono->SBS ({mode}) started ===")
         self._verify_thread = threading.Thread(
-            target=(
-                self._run_join_mono_verify_deep_worker
-                if mode == "deep"
-                else self._run_join_mono_verify_quick_worker
-            ),
-            args=((script_path,) if mode == "deep" else ()),
+            target=self._run_join_mono_verify_quick_worker,
+            args=(),
             daemon=True,
         )
         self._verify_thread.start()
@@ -7179,16 +6871,23 @@ class PipelineMasterGUI:
         self,
         default_map: dict[str, dict[str, object]],
     ) -> dict[str, dict[str, object]]:
-        return {
-            key: {
+        out: dict[str, dict[str, object]] = {}
+        for key, cfg in default_map.items():
+            row = {
                 "garbage_collection_threshold": bool(cfg.get("garbage_collection_threshold", True)),
                 "expandable_segments": bool(cfg.get("expandable_segments", True)),
                 "max_split_size_mb": self._normalize_retry_max_split(cfg.get("max_split_size_mb", "off")),
                 "cpu_offload_inherited": bool(cfg.get("cpu_offload_inherited", True)),
                 "cpu_offload_mode": self._normalize_retry_offload_mode(cfg.get("cpu_offload_mode", "model")),
             }
-            for key, cfg in default_map.items()
-        }
+            if "worker_mode" in cfg:
+                row["worker_mode"] = self._normalize_depth_runtime_mode(cfg.get("worker_mode", "original"))
+            if "window_size" in cfg:
+                row["window_size"] = self._normalize_depth_retry_window_size(cfg.get("window_size", "65"))
+            if "overlap" in cfg:
+                row["overlap"] = self._normalize_depth_retry_overlap(cfg.get("overlap", "15"))
+            out[key] = row
+        return out
 
     def _normalize_retry_max_split(self, value: object) -> str:
         s = str(value or "").strip().lower()
@@ -7223,29 +6922,41 @@ class PipelineMasterGUI:
             raw = data.get(profile)
             if not isinstance(raw, dict):
                 continue
-            out[profile] = {
-                "garbage_collection_threshold": bool(
-                    raw.get(
-                        "garbage_collection_threshold",
-                        out[profile]["garbage_collection_threshold"],
-                    )
-                ),
-                "expandable_segments": bool(
-                    raw.get("expandable_segments", out[profile]["expandable_segments"])
-                ),
-                "max_split_size_mb": self._normalize_retry_max_split(
-                    raw.get("max_split_size_mb", out[profile]["max_split_size_mb"])
-                ),
-                "cpu_offload_inherited": bool(
-                    raw.get(
-                        "cpu_offload_inherited",
-                        out[profile]["cpu_offload_inherited"],
-                    )
-                ),
-                "cpu_offload_mode": self._normalize_retry_offload_mode(
-                    raw.get("cpu_offload_mode", out[profile]["cpu_offload_mode"])
-                ),
-            }
+            out_row = dict(out[profile])
+            out_row["garbage_collection_threshold"] = bool(
+                raw.get(
+                    "garbage_collection_threshold",
+                    out_row["garbage_collection_threshold"],
+                )
+            )
+            out_row["expandable_segments"] = bool(
+                raw.get("expandable_segments", out_row["expandable_segments"])
+            )
+            out_row["max_split_size_mb"] = self._normalize_retry_max_split(
+                raw.get("max_split_size_mb", out_row["max_split_size_mb"])
+            )
+            out_row["cpu_offload_inherited"] = bool(
+                raw.get(
+                    "cpu_offload_inherited",
+                    out_row["cpu_offload_inherited"],
+                )
+            )
+            out_row["cpu_offload_mode"] = self._normalize_retry_offload_mode(
+                raw.get("cpu_offload_mode", out_row["cpu_offload_mode"])
+            )
+            if "worker_mode" in out_row:
+                out_row["worker_mode"] = self._normalize_depth_runtime_mode(
+                    raw.get("worker_mode", out_row["worker_mode"])
+                )
+            if "window_size" in out_row:
+                out_row["window_size"] = self._normalize_depth_retry_window_size(
+                    raw.get("window_size", out_row["window_size"])
+                )
+            if "overlap" in out_row:
+                out_row["overlap"] = self._normalize_depth_retry_overlap(
+                    raw.get("overlap", out_row["overlap"])
+                )
+            out[profile] = out_row
         return out
 
     def _retry_policy_from_config_key(
@@ -7261,7 +6972,9 @@ class PipelineMasterGUI:
         out: dict[str, dict[str, object]] = {}
         for profile in self.RETRY_POLICY_PROFILES:
             row = vars_map.get(profile, {})
-            out[profile] = {
+            is_depth_run_row = vars_map is self.depth_retry_policy_vars and profile == "run"
+            is_inpaint_run_row = vars_map is self.inpaint_retry_policy_vars and profile == "run"
+            payload = {
                 "garbage_collection_threshold": bool(
                     row["garbage_collection_threshold"].get()
                 ),
@@ -7269,11 +6982,28 @@ class PipelineMasterGUI:
                 "max_split_size_mb": self._normalize_retry_max_split(
                     row["max_split_size_mb"].get()
                 ),
-                "cpu_offload_inherited": bool(row["cpu_offload_inherited"].get()),
-                "cpu_offload_mode": self._normalize_retry_offload_mode(
-                    row["cpu_offload_mode"].get()
-                ),
             }
+            if is_depth_run_row or is_inpaint_run_row:
+                payload["cpu_offload_inherited"] = True
+                out[profile] = payload
+                continue
+            payload["cpu_offload_inherited"] = bool(row["cpu_offload_inherited"].get())
+            payload["cpu_offload_mode"] = self._normalize_retry_offload_mode(
+                row["cpu_offload_mode"].get()
+            )
+            if "worker_mode" in row:
+                payload["worker_mode"] = self._normalize_depth_runtime_mode(
+                    row["worker_mode"].get()
+                )
+            if "window_size" in row:
+                payload["window_size"] = self._normalize_depth_retry_window_size(
+                    row["window_size"].get()
+                )
+            if "overlap" in row:
+                payload["overlap"] = self._normalize_depth_retry_overlap(
+                    row["overlap"].get()
+                )
+            out[profile] = payload
         return out
 
     def _build_retry_policy_runtime_payload(
@@ -7287,7 +7017,9 @@ class PipelineMasterGUI:
             row = vars_map[profile]
             max_split_s = self._normalize_retry_max_split(row["max_split_size_mb"].get())
             max_split: int | None = None if max_split_s == "off" else int(max_split_s)
-            inherited = bool(row["cpu_offload_inherited"].get())
+            is_depth_run_row = vars_map is self.depth_retry_policy_vars and profile == "run"
+            is_inpaint_run_row = vars_map is self.inpaint_retry_policy_vars and profile == "run"
+            inherited = bool(row["cpu_offload_inherited"].get()) or is_depth_run_row or is_inpaint_run_row
             if inherited:
                 offload_mode = fallback_offload
             else:
@@ -7302,6 +7034,30 @@ class PipelineMasterGUI:
                 "max_split_size_mb": max_split,
                 "cpu_offload_mode": offload_mode,
             }
+            if "worker_mode" in row:
+                worker_mode = self._normalize_depth_runtime_mode(
+                    self.depth_runtime_mode_var.get()
+                    if is_depth_run_row
+                    else row["worker_mode"].get()
+                )
+                out[profile]["worker_mode"] = worker_mode
+                out[profile]["worker_script"] = self._resolve_depth_worker_script(worker_mode)
+            if "window_size" in row:
+                out[profile]["window_size"] = int(
+                    self._normalize_depth_retry_window_size(
+                        self.depth_chunk_size_var.get()
+                        if is_depth_run_row
+                        else row["window_size"].get()
+                    )
+                )
+            if "overlap" in row:
+                out[profile]["overlap"] = int(
+                    self._normalize_depth_retry_overlap(
+                        self.depth_overlap_var.get()
+                        if is_depth_run_row
+                        else row["overlap"].get()
+                    )
+                )
         return out
 
     def _build_retry_policy_json(
@@ -7328,33 +7084,92 @@ class PipelineMasterGUI:
                 row["max_split_size_mb"].set(str(drow["max_split_size_mb"]))
                 row["cpu_offload_inherited"].set(bool(drow["cpu_offload_inherited"]))
                 row["cpu_offload_mode"].set(str(drow["cpu_offload_mode"]))
+                if "worker_mode" in row and "worker_mode" in drow:
+                    row["worker_mode"].set(str(drow["worker_mode"]))
+                if "window_size" in row and "window_size" in drow:
+                    row["window_size"].set(str(drow["window_size"]))
+                if "overlap" in row and "overlap" in drow:
+                    row["overlap"].set(str(drow["overlap"]))
 
-    def _set_retry_policy_offload_widget_state(
-        self,
-        vars_map: dict[str, dict[str, tk.Variable]],
-        widget_map: dict[str, ttk.Combobox],
-    ) -> None:
-        for profile in self.RETRY_POLICY_PROFILES:
-            combo = widget_map.get(profile)
-            row = vars_map.get(profile)
-            if combo is None or row is None:
-                continue
-            inherited = bool(row["cpu_offload_inherited"].get())
-            combo.configure(state=tk.DISABLED if inherited else "readonly")
+    def _save_config_if_ready(self) -> None:
+        if not getattr(self, "_config_save_ready", False):
+            return
+        self._save_config()
 
-    def _on_depth_retry_policy_changed(self) -> None:
-        self._set_retry_policy_offload_widget_state(
-            self.depth_retry_policy_vars,
-            self._depth_retry_offload_widgets,
+    def _sync_depth_retry_inherited_values(self) -> None:
+        inherited_offload = self._normalize_retry_offload_mode(
+            self.depth_cpu_offload_var.get().strip() or "model"
         )
+        inherited_worker_mode = self._normalize_depth_runtime_mode(
+            self.depth_runtime_mode_var.get()
+        )
+        inherited_window = self._normalize_depth_retry_window_size(
+            self.depth_chunk_size_var.get().strip() or "65"
+        )
+        inherited_overlap = self._normalize_depth_retry_overlap(
+            self.depth_overlap_var.get().strip() or "15"
+        )
+        for profile in self.RETRY_POLICY_PROFILES:
+            row = self.depth_retry_policy_vars.get(profile)
+            if row is None:
+                continue
+            effective_inherited = bool(row["cpu_offload_inherited"].get()) or profile == "run"
+            if profile == "run" and not bool(row["cpu_offload_inherited"].get()):
+                row["cpu_offload_inherited"].set(True)
+            if not effective_inherited:
+                continue
+            row["cpu_offload_mode"].set(inherited_offload)
+            if "worker_mode" in row:
+                row["worker_mode"].set(inherited_worker_mode)
+            if "window_size" in row:
+                row["window_size"].set(inherited_window)
+            if "overlap" in row:
+                row["overlap"].set(inherited_overlap)
+
+    def _set_depth_retry_widget_states(self) -> None:
+        for profile in self.RETRY_POLICY_PROFILES:
+            row = self.depth_retry_policy_vars.get(profile)
+            if row is None:
+                continue
+            inherited = bool(row["cpu_offload_inherited"].get()) or profile == "run"
+            offload = self._depth_retry_offload_widgets.get(profile)
+            worker = self._depth_retry_worker_widgets.get(profile)
+            window = self._depth_retry_window_widgets.get(profile)
+            overlap = self._depth_retry_overlap_widgets.get(profile)
+            inherited_toggle = self._depth_retry_inherited_widgets.get(profile)
+            combo_state = tk.DISABLED if inherited else "readonly"
+            entry_state = tk.DISABLED if inherited else tk.NORMAL
+            if offload is not None:
+                offload.configure(state=combo_state)
+            if worker is not None:
+                worker.configure(state=combo_state)
+            if window is not None:
+                window.configure(state=entry_state)
+            if overlap is not None:
+                overlap.configure(state=entry_state)
+            if inherited_toggle is not None:
+                inherited_toggle.configure(state=tk.DISABLED if profile == "run" else tk.NORMAL)
+
+    def _on_depth_retry_inherited_source_changed(self, *_args) -> None:
+        self._sync_depth_retry_inherited_values()
         self._preview_depth_command()
 
+    def _on_depth_retry_policy_changed(self) -> None:
+        self._sync_depth_retry_inherited_values()
+        self._set_depth_retry_widget_states()
+        self._preview_depth_command()
+        self._save_config_if_ready()
+
     def _on_inpaint_retry_policy_changed(self) -> None:
-        self._set_retry_policy_offload_widget_state(
-            self.inpaint_retry_policy_vars,
-            self._inpaint_retry_offload_widgets,
-        )
+        for profile in self.RETRY_POLICY_PROFILES:
+            row = self.inpaint_retry_policy_vars.get(profile)
+            combo = self._inpaint_retry_offload_widgets.get(profile)
+            if row is not None and "cpu_offload_inherited" in row:
+                row["cpu_offload_inherited"].set(profile == "run")
+            if combo is not None:
+                combo.configure(state="readonly")
         self._preview_inpaint_command()
+        self._save_config_if_ready()
 
     def _build_retry_policy_table(
         self,
@@ -7362,28 +7177,54 @@ class PipelineMasterGUI:
         vars_map: dict[str, dict[str, tk.Variable]],
         widget_map: dict[str, ttk.Combobox],
         change_cb,
+        *,
+        show_inherited: bool = True,
+        include_depth_controls: bool = False,
     ) -> None:
-        parent.grid_columnconfigure(6, weight=1)
-        ttk.Label(parent, text="Profile").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ttk.Label(parent, text="Garbage 0.8").grid(row=0, column=1, sticky="w", padx=(0, 6))
-        ttk.Label(parent, text="Expandable").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        ttk.Label(parent, text="Max split").grid(row=0, column=3, sticky="w", padx=(0, 6))
-        ttk.Label(parent, text="CPU mode").grid(row=0, column=4, sticky="w", padx=(0, 6))
-        ttk.Label(parent, text="Inherited").grid(row=0, column=5, sticky="w")
+        is_depth_policy = vars_map is self.depth_retry_policy_vars
+        is_inpaint_policy = vars_map is self.inpaint_retry_policy_vars
+        header: list[tuple[str, str]] = [
+            ("profile", "Profile"),
+            ("gc", "Garbage 0.8"),
+            ("expand", "Expandable"),
+            ("split", "Max split"),
+            ("cpu", "CPU mode"),
+        ]
+        if include_depth_controls:
+            header.extend(
+                [
+                    ("script", "Script"),
+                    ("window", "Window"),
+                    ("overlap", "Overlap"),
+                ]
+            )
+        if show_inherited:
+            header.append(("inherit", "Inherited"))
+        for idx in range(len(header) + 1):
+            parent.grid_columnconfigure(idx, weight=0)
+        parent.grid_columnconfigure(len(header), weight=1)
+        for cidx, (_key, text) in enumerate(header):
+            ttk.Label(parent, text=text).grid(
+                row=0, column=cidx, sticky="w", padx=(0, 6)
+            )
 
         for ridx, profile in enumerate(self.RETRY_POLICY_PROFILES, start=1):
             row = vars_map[profile]
-            ttk.Label(parent, text=profile).grid(row=ridx, column=0, sticky="w", pady=2)
+            col = 0
+            ttk.Label(parent, text=profile).grid(row=ridx, column=col, sticky="w", pady=2)
+            col += 1
             ttk.Checkbutton(
                 parent,
                 variable=row["garbage_collection_threshold"],
                 command=change_cb,
-            ).grid(row=ridx, column=1, sticky="w", pady=2)
+            ).grid(row=ridx, column=col, sticky="w", pady=2)
+            col += 1
             ttk.Checkbutton(
                 parent,
                 variable=row["expandable_segments"],
                 command=change_cb,
-            ).grid(row=ridx, column=2, sticky="w", pady=2)
+            ).grid(row=ridx, column=col, sticky="w", pady=2)
+            col += 1
             split_combo = ttk.Combobox(
                 parent,
                 textvariable=row["max_split_size_mb"],
@@ -7391,8 +7232,11 @@ class PipelineMasterGUI:
                 state="readonly",
                 width=6,
             )
-            split_combo.grid(row=ridx, column=3, sticky="w", pady=2)
+            split_combo.grid(row=ridx, column=col, sticky="w", pady=2)
             split_combo.bind("<<ComboboxSelected>>", lambda _e: change_cb())
+            col += 1
+            if profile == "run" and (is_depth_policy or is_inpaint_policy):
+                continue
             offload_combo = ttk.Combobox(
                 parent,
                 textvariable=row["cpu_offload_mode"],
@@ -7400,118 +7244,98 @@ class PipelineMasterGUI:
                 state="readonly",
                 width=10,
             )
-            offload_combo.grid(row=ridx, column=4, sticky="w", pady=2)
+            offload_combo.grid(row=ridx, column=col, sticky="w", pady=2)
             offload_combo.bind("<<ComboboxSelected>>", lambda _e: change_cb())
-            ttk.Checkbutton(
-                parent,
-                variable=row["cpu_offload_inherited"],
-                command=change_cb,
-            ).grid(row=ridx, column=5, sticky="w", pady=2)
+            col += 1
+            if include_depth_controls:
+                worker_combo = ttk.Combobox(
+                    parent,
+                    textvariable=row["worker_mode"],
+                    values=self.DEPTH_RUNTIME_MODE_CHOICES,
+                    state="readonly",
+                    width=9,
+                )
+                worker_combo.grid(row=ridx, column=col, sticky="w", pady=2)
+                worker_combo.bind("<<ComboboxSelected>>", lambda _e: change_cb())
+                col += 1
+                window_entry = ttk.Entry(
+                    parent,
+                    textvariable=row["window_size"],
+                    width=6,
+                )
+                window_entry.grid(row=ridx, column=col, sticky="w", pady=2)
+                window_entry.bind("<FocusOut>", lambda _e: change_cb())
+                window_entry.bind("<Return>", lambda _e: change_cb())
+                col += 1
+                overlap_entry = ttk.Entry(
+                    parent,
+                    textvariable=row["overlap"],
+                    width=6,
+                )
+                overlap_entry.grid(row=ridx, column=col, sticky="w", pady=2)
+                overlap_entry.bind("<FocusOut>", lambda _e: change_cb())
+                overlap_entry.bind("<Return>", lambda _e: change_cb())
+                self._depth_retry_worker_widgets[profile] = worker_combo
+                self._depth_retry_window_widgets[profile] = window_entry
+                self._depth_retry_overlap_widgets[profile] = overlap_entry
+                col += 1
+            if show_inherited:
+                inherited_btn = ttk.Checkbutton(
+                    parent,
+                    variable=row["cpu_offload_inherited"],
+                    command=change_cb,
+                )
+                inherited_btn.grid(row=ridx, column=col, sticky="w", pady=2)
+                if is_depth_policy:
+                    self._depth_retry_inherited_widgets[profile] = inherited_btn
             widget_map[profile] = offload_combo
 
     def _build_options_tab(self, parent: ttk.Frame) -> None:
-        parent.grid_rowconfigure(4, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
         parent.grid_columnconfigure(0, weight=1)
         parent.grid_columnconfigure(1, weight=1)
 
-        verify_opts = ttk.LabelFrame(parent, text="VerifyScene (Global)", padding=8)
-        verify_opts.grid(row=0, column=0, columnspan=2, sticky="ew", pady=4)
-        verify_opts.grid_columnconfigure(3, weight=1)
+        global_encode = ttk.LabelFrame(parent, text="Global Encoder Setting", padding=8)
+        global_encode.grid(row=0, column=0, columnspan=2, sticky="ew", pady=4)
+        global_encode.grid_columnconfigure(3, weight=1)
 
-        ttk.Label(verify_opts, text="Workers (all verify quick/deep):").grid(
-            row=0, column=0, sticky="w"
-        )
-        self.verify_scenes_workers_entry = ttk.Entry(
-            verify_opts, textvariable=self.verify_scenes_workers_var, width=7
-        )
-        self.verify_scenes_workers_entry.grid(row=0, column=1, sticky="w", padx=(6, 12))
-        ttk.Label(
-            verify_opts,
-            text="Used by all Verify Scenes actions in every tab.",
-        ).grid(row=0, column=2, columnspan=2, sticky="w")
-
-        depth_opts = ttk.LabelFrame(parent, text="DepthCrafter", padding=8)
-        depth_opts.grid(row=1, column=0, sticky="nsew", pady=4, padx=(0, 4))
-        depth_opts.grid_columnconfigure(2, weight=1)
-
-        ttk.Label(depth_opts, text="RealESRGAN runtime:").grid(row=0, column=0, sticky="w")
-        self.depth_realesrgan_source_combo = ttk.Combobox(
-            depth_opts,
-            textvariable=self.depth_realesrgan_source_var,
-            values=[
-                "Bundled (Utilities/realesrgan)",
-                "Local (system/custom path)",
-            ],
-            state="readonly",
-            width=34,
-        )
-        self.depth_realesrgan_source_combo.grid(row=0, column=1, sticky="w", padx=(6, 10))
-
-        ttk.Label(
-            depth_opts,
-            text=(
-                "Bundled uses Utilities/realesrgan/realesrgan-ncnn-vulkan with anime 2x or plus 4x model,\n"
-                "depending on the scale selected in the Depth tab.\n"
-                "Local uses your PATH/custom runtime configuration."
-            ),
-            justify="left",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
-
-        retry_opts = ttk.LabelFrame(parent, text="GPU Retry Policies", padding=8)
-        retry_opts.grid(row=2, column=0, columnspan=2, sticky="ew", pady=4)
-        retry_opts.grid_columnconfigure(0, weight=1)
-        retry_opts.grid_columnconfigure(1, weight=1)
-
-        depth_retry_frame = ttk.LabelFrame(retry_opts, text="DepthCrafter Retry Policy", padding=6)
-        depth_retry_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-        self._build_retry_policy_table(
-            depth_retry_frame,
-            self.depth_retry_policy_vars,
-            self._depth_retry_offload_widgets,
-            self._on_depth_retry_policy_changed,
-        )
-
-        inpaint_retry_frame = ttk.LabelFrame(retry_opts, text="Inpainting Retry Policy", padding=6)
-        inpaint_retry_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
-        self._build_retry_policy_table(
-            inpaint_retry_frame,
-            self.inpaint_retry_policy_vars,
-            self._inpaint_retry_offload_widgets,
-            self._on_inpaint_retry_policy_changed,
-        )
-
-        run_opts = ttk.LabelFrame(parent, text="Pipeline Run Controls", padding=8)
-        run_opts.grid(row=1, column=1, sticky="nsew", pady=4, padx=(4, 0))
-        run_opts.grid_columnconfigure(5, weight=1)
-
-        ttk.Label(run_opts, text="Verify after each step:").grid(row=0, column=0, sticky="w")
-        self.pipeline_verify_after_combo = ttk.Combobox(
-            run_opts,
-            textvariable=self.pipeline_verify_after_var,
-            values=self.PIPELINE_VERIFY_CHOICES,
+        ttk.Label(global_encode, text="Global encoder mode:").grid(row=0, column=0, sticky="w")
+        self.global_encoder_mode_combo = ttk.Combobox(
+            global_encode,
+            textvariable=self.global_encoder_mode_var,
+            values=self.GLOBAL_ENCODER_MODE_CHOICES,
             state="readonly",
             width=12,
         )
-        self.pipeline_verify_after_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
-        self.pipeline_verify_after_combo.bind(
-            "<<ComboboxSelected>>", self._on_pipeline_verify_after_changed
+        self.global_encoder_mode_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        self.global_encoder_mode_combo.bind(
+            "<<ComboboxSelected>>", self._on_global_encoder_mode_selected
         )
-        ttk.Label(
-            run_opts,
-            textvariable=self.pipeline_checked_files_var,
-        ).grid(row=0, column=2, columnspan=4, sticky="w", padx=(8, 0))
-        ttk.Label(run_opts, text="Test run files:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(global_encode, text="Generated args preview:").grid(
+            row=0, column=2, sticky="w", padx=(0, 8)
+        )
         ttk.Entry(
-            run_opts,
-            textvariable=self.pipeline_test_run_files_var,
-            width=6,
-        ).grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(6, 0))
-        ttk.Label(run_opts, text="(max files from incomplete list)").grid(
-            row=1, column=2, columnspan=4, sticky="w", pady=(6, 0)
+            global_encode,
+            textvariable=self.global_encoder_preview_var,
+            state="readonly",
+        ).grid(row=0, column=3, sticky="ew")
+
+        ttk.Label(global_encode, text="Global extra ffmpeg args (append):").grid(
+            row=1, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Entry(global_encode, textvariable=self.global_ffmpeg_extra_args_var).grid(
+            row=1, column=1, columnspan=3, sticky="ew", padx=(6, 0), pady=(8, 0)
         )
 
-        step_frame = ttk.LabelFrame(parent, text="Pipeline Step State", padding=8)
-        step_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=6)
+        middle_frame = ttk.Frame(parent)
+        middle_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=6)
+        middle_frame.grid_columnconfigure(0, weight=3)
+        middle_frame.grid_columnconfigure(1, weight=2)
+        middle_frame.grid_rowconfigure(0, weight=1)
+        middle_frame.grid_rowconfigure(1, weight=1)
+
+        step_frame = ttk.LabelFrame(middle_frame, text="Pipeline Step State", padding=8)
+        step_frame.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 4))
         step_frame.grid_columnconfigure(0, weight=1)
         step_frame.grid_columnconfigure(1, weight=0)
         step_frame.grid_columnconfigure(2, weight=0)
@@ -7530,8 +7354,30 @@ class PipelineMasterGUI:
                 "verify": verify_lbl,
             }
 
+        depth_retry_frame = ttk.LabelFrame(middle_frame, text="DepthCrafter Retry Policy", padding=6)
+        depth_retry_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 4))
+        self._build_retry_policy_table(
+            depth_retry_frame,
+            self.depth_retry_policy_vars,
+            self._depth_retry_offload_widgets,
+            self._on_depth_retry_policy_changed,
+            show_inherited=True,
+            include_depth_controls=True,
+        )
+
+        inpaint_retry_frame = ttk.LabelFrame(middle_frame, text="Inpainting Retry Policy", padding=6)
+        inpaint_retry_frame.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(4, 0))
+        self._build_retry_policy_table(
+            inpaint_retry_frame,
+            self.inpaint_retry_policy_vars,
+            self._inpaint_retry_offload_widgets,
+            self._on_inpaint_retry_policy_changed,
+            show_inherited=False,
+            include_depth_controls=False,
+        )
+
         run_frame = ttk.LabelFrame(parent, text="Run & Progress", padding=8)
-        run_frame.grid(row=4, column=0, columnspan=2, sticky="nsew", pady=6)
+        run_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=6)
         run_frame.grid_columnconfigure(0, weight=1)
         run_frame.grid_rowconfigure(3, weight=1)
 
@@ -7557,9 +7403,32 @@ class PipelineMasterGUI:
             btn_row, text="Clear Run", command=self._pipeline_clear_run_flags
         )
         self.pipeline_clear_run_btn.grid(row=0, column=4, padx=8)
+        self.codec_validation_btn = ttk.Button(
+            btn_row,
+            text="Codec Validation",
+            command=self._start_codec_validation,
+        )
+        self.codec_validation_btn.grid(row=0, column=5, padx=(18, 8))
+        ttk.Label(btn_row, text="Verify workers:").grid(row=0, column=6, padx=(12, 6))
+        self.verify_scenes_workers_entry = ttk.Entry(
+            btn_row, textvariable=self.verify_scenes_workers_var, width=7
+        )
+        self.verify_scenes_workers_entry.grid(row=0, column=7, sticky="w")
+        ttk.Label(btn_row, text="Test run files:").grid(row=0, column=8, padx=(12, 6))
+        ttk.Entry(
+            btn_row,
+            textvariable=self.pipeline_test_run_files_var,
+            width=6,
+        ).grid(row=0, column=9, sticky="w")
 
-        ttk.Label(run_frame, textvariable=self.pipeline_run_status_var).grid(
-            row=1, column=0, sticky="w", pady=(8, 4)
+        status_row = ttk.Frame(run_frame)
+        status_row.grid(row=1, column=0, sticky="ew", pady=(8, 4))
+        status_row.grid_columnconfigure(0, weight=1)
+        ttk.Label(status_row, textvariable=self.pipeline_run_status_var).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(status_row, textvariable=self.pipeline_checked_files_var).grid(
+            row=0, column=1, sticky="e", padx=(12, 0)
         )
         self.pipeline_global_progress = ttk.Progressbar(
             run_frame,
@@ -7593,8 +7462,221 @@ class PipelineMasterGUI:
         popup_scroll.grid(row=0, column=1, sticky="ns")
         self.pipeline_popup_log_text.configure(yscrollcommand=popup_scroll.set)
         self._flush_pipeline_popup_log_buffer()
+        self._refresh_global_encoder_preview()
         self._on_depth_retry_policy_changed()
         self._on_inpaint_retry_policy_changed()
+
+    def _build_join_validation_command(self, output_path: str) -> tuple[list[str], str]:
+        encoder = self._normalize_ffmpeg_codec(self.join_encoder_var.get(), "hevc_nvenc")
+        quality_flag = self._join_quality_flag()
+        quality_value = self.join_crf_var.get().strip() or "12"
+        preset = self.join_preset_var.get().strip() or "p7"
+        pix_fmt = self.join_pix_fmt_var.get().strip() or "yuv420p"
+        extra_args = self.join_extra_args_var.get().strip()
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=256x144:rate=1",
+            "-frames:v",
+            "1",
+            "-an",
+            "-sn",
+            "-dn",
+            "-c:v",
+            encoder,
+            "-preset",
+            preset,
+            f"-{quality_flag}",
+            quality_value,
+            "-pix_fmt",
+            pix_fmt,
+        ]
+        if extra_args:
+            cmd.extend(shlex.split(extra_args))
+        cmd.append(output_path)
+        summary = f"{encoder} {quality_flag}={quality_value} {pix_fmt}"
+        if extra_args:
+            summary = f"{summary} | + {extra_args}"
+        return cmd, summary
+
+    def _build_codec_validation_specs(self) -> list[dict[str, object]]:
+        specs: list[dict[str, object]] = []
+        extra_args = self._current_global_ffmpeg_extra_args()
+        color_steps = [
+            ("Scene split", self.scene_codec_var.get()),
+            ("Splat output", self.splat_codec_var.get()),
+            ("Inpaint output", self.inpaint_codec_var.get()),
+            ("Merge output", self.merge_codec_var.get()),
+        ]
+        for label, codec in color_steps:
+            profile = self._resolve_color_profile_for_codec(codec)
+            specs.append(
+                {
+                    "label": label,
+                    "summary": profile_preview_line(profile, extra_args),
+                    "builder": lambda out_path, p=profile, extra=extra_args: build_validation_command(
+                        p, out_path, extra_args=extra
+                    ),
+                    "ext": ".mp4",
+                }
+            )
+
+        depth_pre = resolve_depth_preprocess_profile(self.depth_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC)
+        specs.append(
+            {
+                "label": "Depth preprocess",
+                "summary": profile_preview_line(depth_pre),
+                "builder": lambda out_path, p=depth_pre: build_validation_command(p, out_path),
+                "ext": ".mp4",
+            }
+        )
+
+        depth_final = resolve_depth_final_grayscale_profile()
+        specs.append(
+            {
+                "label": "Depth final grayscale",
+                "summary": profile_preview_line(depth_final),
+                "builder": lambda out_path, p=depth_final: build_validation_command(p, out_path),
+                "ext": ".mp4",
+            }
+        )
+
+        replace_mask = resolve_replace_mask_binary_profile()
+        specs.append(
+            {
+                "label": "Replace mask binary",
+                "summary": profile_preview_line(replace_mask),
+                "builder": lambda out_path, p=replace_mask: build_validation_command(p, out_path),
+                "ext": ".mkv",
+            }
+        )
+
+        mask_gray = resolve_mask_for_merge_grayscale_profile()
+        specs.append(
+            {
+                "label": "Mask for merge grayscale",
+                "summary": profile_preview_line(mask_gray),
+                "builder": lambda out_path, p=mask_gray: build_validation_command(p, out_path),
+                "ext": ".mp4",
+            }
+        )
+
+        specs.append(
+            {
+                "label": "Join output",
+                "summary": "join runtime settings",
+                "builder": self._build_join_validation_command,
+                "ext": ".mp4",
+            }
+        )
+        return specs
+
+    def _start_codec_validation(self) -> None:
+        if self._codec_validation_running:
+            messagebox.showinfo("Codec Validation", "Codec validation is already running.")
+            return
+        self._codec_validation_running = True
+        self.pipeline_run_status_var.set("Codec validation running...")
+        if hasattr(self, "codec_validation_btn"):
+            self.codec_validation_btn.configure(state=tk.DISABLED)
+        self._codec_validation_thread = threading.Thread(
+            target=self._run_codec_validation_worker,
+            daemon=True,
+        )
+        self._codec_validation_thread.start()
+
+    def _run_codec_validation_worker(self) -> None:
+        results: list[dict[str, str]] = []
+        error_message = ""
+        try:
+            specs = self._build_codec_validation_specs()
+            with tempfile.TemporaryDirectory(prefix="codec_validation_") as tmp_dir:
+                tmp_root = Path(tmp_dir)
+                for idx, spec in enumerate(specs, start=1):
+                    label = str(spec["label"])
+                    ext = str(spec.get("ext", ".mp4"))
+                    out_path = str(tmp_root / f"{idx:02d}_{label.lower().replace(' ', '_')}{ext}")
+                    builder = spec["builder"]
+                    try:
+                        built = builder(out_path)
+                        if isinstance(built, tuple):
+                            cmd, summary = built
+                        else:
+                            cmd = built
+                            summary = str(spec.get("summary", "")).strip() or label
+                        proc = subprocess.run(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            check=False,
+                        )
+                        stderr_tail = " | ".join(
+                            line.strip()
+                            for line in (proc.stderr or "").splitlines()[-3:]
+                            if line.strip()
+                        )
+                        ok = proc.returncode == 0
+                        results.append(
+                            {
+                                "label": label,
+                                "summary": str(summary),
+                                "status": "OK" if ok else "FAILED",
+                                "reason": stderr_tail or ("" if ok else f"exit {proc.returncode}"),
+                            }
+                        )
+                    except Exception as exc:
+                        results.append(
+                            {
+                                "label": label,
+                                "summary": str(spec.get("summary", "")).strip() or label,
+                                "status": "FAILED",
+                                "reason": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+        self.root.after(0, lambda: self._finish_codec_validation(results, error_message))
+
+    def _finish_codec_validation(
+        self,
+        results: list[dict[str, str]],
+        error_message: str = "",
+    ) -> None:
+        self._codec_validation_running = False
+        if hasattr(self, "codec_validation_btn"):
+            self.codec_validation_btn.configure(state=tk.NORMAL)
+        if error_message:
+            self.pipeline_run_status_var.set("Codec validation failed.")
+            self._append_pipeline_popup_log("ERROR", "Codec Validation", error_message)
+            messagebox.showerror("Codec Validation", error_message)
+            return
+
+        lines: list[str] = []
+        has_failed = False
+        for row in results:
+            line = f"{row['label']} | {row['summary']} | {row['status']}"
+            reason = str(row.get("reason", "")).strip()
+            if reason:
+                line = f"{line} | {reason}"
+            lines.append(line)
+            if row["status"] != "OK":
+                has_failed = True
+        body = "\n".join(lines) if lines else "No codec validation rows generated."
+        self._append_pipeline_popup_log("INFO", "Codec Validation", body)
+        self.pipeline_run_status_var.set(
+            "Codec validation completed with failures." if has_failed else "Codec validation completed."
+        )
+        if has_failed:
+            messagebox.showwarning("Codec Validation", body)
+        else:
+            messagebox.showinfo("Codec Validation", body)
 
     def _build_progress_tab(self, parent: ttk.Frame) -> None:
         parent.grid_columnconfigure(0, weight=1)
@@ -8057,7 +8139,7 @@ class PipelineMasterGUI:
             prev_done = bool((prev_entry or {}).get("completed", False)) if isinstance(prev_entry, dict) else False
             prev_ver = str((prev_entry or {}).get("verified", "none")) if isinstance(prev_entry, dict) else "none"
             if bool(state[step]["completed"]) and prev_done:
-                state[step]["verified"] = prev_ver if prev_ver in {"quick", "deep"} else "none"
+                state[step]["verified"] = "quick" if prev_ver in {"quick", "deep"} else "none"
             else:
                 state[step]["verified"] = "none"
 
@@ -8291,10 +8373,15 @@ class PipelineMasterGUI:
                             if isinstance(entry, dict):
                                 self._pipeline_step_state[key]["completed"] = bool(entry.get("completed", False))
                                 ver = str(entry.get("verified", "none")).strip().lower()
-                                self._pipeline_step_state[key]["verified"] = ver if ver in {"none", "quick", "deep"} else "none"
+                                if ver in {"quick", "deep"}:
+                                    self._pipeline_step_state[key]["verified"] = "quick"
+                                else:
+                                    self._pipeline_step_state[key]["verified"] = "none"
                     verify_after = str(data.get("verify_after", "")).strip()
                     if verify_after in self.PIPELINE_VERIFY_CHOICES:
                         self.pipeline_verify_after_var.set(verify_after)
+                    elif verify_after.lower() == "deep":
+                        self.pipeline_verify_after_var.set("Quick")
             except Exception:
                 pass
         self._sync_pipeline_csv_done_flags()
@@ -8430,16 +8517,11 @@ class PipelineMasterGUI:
         self.scene_tonemap_var.set(
             "Mobius (HDR style, available only for 10-bit input source)"
         )
-        self.scene_chroma_var.set("420")
         self.scene_codec_var.set(self.DEFAULT_SCENE_CODEC)
-        self.scene_crf_var.set("1")
-        self.scene_encoder_preset_var.set("fast")
-        self.scene_pix_fmt_var.set(self._chroma_to_pixfmt(self.scene_chroma_var.get().strip()))
-        self.scene_extra_ffmpeg_args_var.set("")
 
         # Depth defaults.
         self.depth_mode_var.set("Auto (recommended)")
-        self.depth_chunk_size_var.set("100")
+        self.depth_chunk_size_var.set("65")
         self.depth_overlap_var.set("15")
         self.depth_inference_steps_var.set("5")
         self.depth_cpu_offload_var.set("model")
@@ -8450,25 +8532,22 @@ class PipelineMasterGUI:
         self.depth_debug_mem_var.set(True)
         self.depth_scale_factor_var.set(self.DEFAULT_DEPTH_SCALE_FACTOR)
         self.depth_glob_var.set("*.mp4")
+        self.depth_runtime_mode_var.set("original")
         self.depth_worker_script_var.set("./depthcrafter_nogui_batch.py")
-        self.depth_encode_override_var.set(False)
-        self.depth_extra_ffmpeg_args_var.set("")
+        self.depth_codec_var.set(self.DEFAULT_SCENE_CODEC)
         self.depth_realesrgan_source_var.set("Bundled (Utilities/realesrgan)")
         self.depth_use_realesrgan_upscale_var.set(False)
         self.depth_realesrgan_scale_var.set("2x")
         self.depth_realesrgan_workers_var.set(str(self.DEFAULT_DEPTH_REALESRGAN_WORKERS))
         self._on_depth_mode_changed()
-        self._on_depth_override_toggle(initial=True)
 
         # Splat defaults.
         self.splat_mode_var.set("Auto (recommended)")
         self.splat_batch_size_var.set("50")
-        self.splat_workers_var.set("4")
+        self.splat_workers_var.set("8")
         self.splat_disparity_var.set("20")
-        self.splat_encode_override_var.set(False)
-        self.splat_extra_ffmpeg_args_var.set("")
+        self.splat_codec_var.set(self.DEFAULT_SCENE_CODEC)
         self._on_splat_mode_changed()
-        self._on_splat_override_toggle(initial=True)
 
         # Inpaint defaults.
         self.inpaint_mode_var.set("Auto (recommended)")
@@ -8477,30 +8556,27 @@ class PipelineMasterGUI:
         self.inpaint_sharpness_workers_var.set("19")
         self.inpaint_use_sharpen_var.set(True)
         self.inpaint_sharpen_workers_var.set("19")
-        self.inpaint_encode_override_var.set(False)
-        self.inpaint_extra_ffmpeg_args_var.set("")
+        self.inpaint_codec_var.set(self.DEFAULT_SCENE_CODEC)
         self._on_inpaint_mode_changed()
-        self._on_inpaint_override_toggle(initial=True)
 
         # Merge defaults.
         self.merge_mode_var.set("Auto (recommended)")
-        self.merge_encode_override_var.set(False)
-        self.merge_extra_ffmpeg_args_var.set("")
+        self.merge_parallel_workers_var.set("4")
+        self.merge_codec_var.set(self.DEFAULT_SCENE_CODEC)
         self._on_merge_mode_changed()
-        self._on_merge_override_toggle(initial=True)
 
         # Join defaults.
         self.join_mode_var.set("Auto (recommended)")
-        self.join_crf_var.set("16")
-        self.join_pix_fmt_override_var.set(False)
+        self.join_crf_var.set("12")
         self._on_join_mode_changed()
-        self._on_join_pixfmt_override_toggle()
 
         # Options defaults.
         self.scene_split_threads_var.set(str(self.DEFAULT_SPLIT_SCENES_WORKERS))
         self.verify_scenes_workers_var.set("19")
         self.pipeline_verify_after_var.set("Quick")
         self.pipeline_test_run_files_var.set(str(self.DEFAULT_PIPELINE_TEST_RUN_FILES))
+        self.global_encoder_mode_var.set("lossless")
+        self.global_ffmpeg_extra_args_var.set("")
         self._set_retry_policy_vars_to_defaults()
         self._on_depth_retry_policy_changed()
         self._on_inpaint_retry_policy_changed()
@@ -8510,6 +8586,7 @@ class PipelineMasterGUI:
 
         self._refresh_standard_paths()
         self._apply_option_states()
+        self._refresh_global_encoder_preview()
         self._preview_scene_command()
         self._refresh_pipeline_status_panel()
         self.pipeline_run_status_var.set("Settings reset to defaults.")
@@ -8537,7 +8614,7 @@ class PipelineMasterGUI:
         if step not in state:
             return
         mode_low = str(mode).strip().lower()
-        state[step]["verified"] = mode_low if mode_low in {"quick", "deep"} else "none"
+        state[step]["verified"] = "quick" if mode_low in {"quick", "deep"} else "none"
 
     def _pipeline_set_completed(self, step: str, value: bool) -> None:
         self._pipeline_set_completed_in_state(self._pipeline_step_state, step, value)
@@ -8548,8 +8625,6 @@ class PipelineMasterGUI:
     @staticmethod
     def _pipeline_verified_rank(mode: str) -> int:
         mode_low = str(mode).strip().lower()
-        if mode_low == "deep":
-            return 2
         if mode_low == "quick":
             return 1
         return 0
@@ -8562,7 +8637,7 @@ class PipelineMasterGUI:
     ) -> None:
         if step not in state:
             return
-        mode_low = "deep" if str(mode).strip().lower() == "deep" else "quick"
+        mode_low = "quick" if str(mode).strip().lower() in {"quick", "deep"} else "none"
         current = str(state[step].get("verified", "none"))
         if self._pipeline_verified_rank(mode_low) >= self._pipeline_verified_rank(current):
             self._pipeline_set_verified_in_state(state, step, mode_low)
@@ -8593,7 +8668,7 @@ class PipelineMasterGUI:
         step_keys = [k for k, _ in self.PIPELINE_STEPS]
         if step not in step_keys:
             return
-        target_mode = "deep" if str(mode).strip().lower() == "deep" else "quick"
+        target_mode = "quick" if str(mode).strip().lower() in {"quick", "deep"} else "none"
         upto_idx = step_keys.index(step)
         for k in step_keys[: upto_idx + 1]:
             if k in self.PIPELINE_CSV_STEPS:
@@ -8713,7 +8788,7 @@ class PipelineMasterGUI:
     @staticmethod
     def _scene_output_filename(source_path: str, scene_number: int) -> str:
         stem = Path(str(source_path or "")).stem or "source"
-        return f"{stem}-Scene-{int(scene_number):03d}.mp4"
+        return f"{stem}-Scene-{int(scene_number):04d}.mp4"
 
     def _load_scene_csv_entries(
         self,
@@ -8877,6 +8952,54 @@ class PipelineMasterGUI:
             count += len([p for p in root.glob(ext) if p.is_file()])
         return count
 
+    def _collect_join_scene_count_stats(self) -> dict[str, int | bool]:
+        seg_dir = self.scene_output_var.get().strip()
+        seg_mono_dir = self.join_seg_mono_var.get().strip()
+        sbs_dir = self.join_input_var.get().strip()
+        seg_count = self._count_video_files(seg_dir)
+        seg_mono_count = 0
+        if seg_mono_dir and os.path.isdir(seg_mono_dir):
+            same_as_seg = False
+            try:
+                same_as_seg = Path(seg_mono_dir).resolve() == Path(seg_dir).resolve()
+            except Exception:
+                same_as_seg = False
+            if not same_as_seg:
+                seg_mono_count = self._count_video_files(seg_mono_dir)
+        sbs_count = self._count_video_files(sbs_dir)
+        expected_total = int(seg_count) + int(seg_mono_count)
+        return {
+            "seg_count": int(seg_count),
+            "seg_mono_count": int(seg_mono_count),
+            "sbs_count": int(sbs_count),
+            "expected_total": int(expected_total),
+            "counts_match": bool(int(sbs_count) == int(expected_total)),
+        }
+
+    def _join_incomplete_flag_path(self) -> Path:
+        work_dir = self.work_folder_var.get().strip() or "./work"
+        return Path(work_dir).resolve() / ".join_incomplete.flag"
+
+    def _join_incomplete_flag_exists(self) -> bool:
+        try:
+            return self._join_incomplete_flag_path().is_file()
+        except Exception:
+            return False
+
+    def _set_join_incomplete_flag(self, incomplete: bool) -> None:
+        flag_path = self._join_incomplete_flag_path()
+        try:
+            if incomplete:
+                flag_path.parent.mkdir(parents=True, exist_ok=True)
+                flag_path.write_text(
+                    "Join Scenes was last completed in incomplete mode.\n",
+                    encoding="utf-8",
+                )
+            elif flag_path.exists():
+                flag_path.unlink()
+        except Exception:
+            pass
+
     @staticmethod
     def _scene_csv_exists(scene_csv_path: str) -> bool:
         csv_path = str(scene_csv_path or "").strip()
@@ -8971,6 +9094,7 @@ class PipelineMasterGUI:
         mono_to_sbs_ok, _mono_msg, _mono_broken_output, _mono_broken_reference = (
             self._verify_join_mono_outputs_coverage(cleanup_incomplete=False)
         )
+        join_counts = self._collect_join_scene_count_stats()
         join_done = Path(self.join_output_var.get().strip()).is_file()
         remux_done = Path(self._default_remux_output_path()).is_file()
         sharp_done = Path(self.inpaint_sharpness_csv_var.get().strip()).is_file()
@@ -9006,7 +9130,11 @@ class PipelineMasterGUI:
             "mask_for_merge": bool(scene_ref_ready and mask_formerge_count >= seg_ref_count),
             "merging": bool(scene_ref_ready and merge_count >= seg_ref_count),
             "mono_to_sbs": bool(mono_to_sbs_ok),
-            "join": bool(join_done),
+            "join": bool(
+                join_done
+                and bool(join_counts.get("counts_match", False))
+                and not self._join_incomplete_flag_exists()
+            ),
             "remux": bool(remux_done),
         }
 
@@ -9047,6 +9175,9 @@ class PipelineMasterGUI:
             "seg_scene_stems": list(scene_stems),
             "split_ok_actual": bool(split_ok),
             "split_missing": [str(Path(p).name) for p in missing_split_outputs],
+            "join_expected_total": int(join_counts.get("expected_total", 0)),
+            "join_sbs_total": int(join_counts.get("sbs_count", 0)),
+            "join_incomplete_flag": bool(self._join_incomplete_flag_exists()),
             "completed_final": completed,
             "incomplete_final": incomplete,
         }
@@ -9103,11 +9234,11 @@ class PipelineMasterGUI:
             self._pipeline_sync_noninteractive_mode()
             return
         split_verified = str(split_state.get("verified", "none")).strip().lower()
-        if split_verified not in {"quick", "deep"}:
+        if split_verified != "quick":
             messagebox.showwarning(
                 "Test Run",
                 (
-                    "Run Verify Scenes (Quick or Deep) first.\n\n"
+                    "Run Verify Scenes (Quick) first.\n\n"
                     "Test Run can start only after scene verification."
                 ),
             )
@@ -9710,9 +9841,7 @@ class PipelineMasterGUI:
         verify_mode = self.pipeline_verify_after_var.get().strip().lower()
         verified = str(st.get("verified", "none")).strip().lower()
         if verify_mode == "quick":
-            return verified not in {"quick", "deep"}
-        if verify_mode == "deep":
-            return verified != "deep"
+            return verified != "quick"
         return False
 
     def _pipeline_reset_skip_notices(self) -> None:
@@ -9810,14 +9939,10 @@ class PipelineMasterGUI:
                 return step, "run", "none"
             if self._pipeline_test_active and step in {"scenedetect", "split_scenes"}:
                 continue
-            if step in self.PIPELINE_STEPS_WITH_VERIFY and verify_mode in {"quick", "deep"}:
+            if step in self.PIPELINE_STEPS_WITH_VERIFY and verify_mode == "quick":
                 current = str(st.get("verified", "none"))
-                if verify_mode == "quick":
-                    if current not in {"quick", "deep"}:
-                        return step, "verify", "quick"
-                else:
-                    if current != "deep":
-                        return step, "verify", "deep"
+                if current != "quick":
+                    return step, "verify", "quick"
         return None
 
     def _pipeline_dispatch_run(self, step: str) -> bool:
@@ -9884,25 +10009,25 @@ class PipelineMasterGUI:
         self.pipeline_run_status_var.set(f"Verifying {step} ({mode})")
         before = self._verify_running
         if step == "split_scenes":
-            self._start_verify_deep() if mode == "deep" else self._start_verify_quick()
+            self._start_verify_quick()
         elif step == "depthcrafter":
-            self._start_depth_verify_deep() if mode == "deep" else self._start_depth_verify_quick()
+            self._start_depth_verify_quick()
         elif step == "depth_upscale":
-            self._start_depth_upscaled_verify_deep() if mode == "deep" else self._start_depth_upscaled_verify_quick()
+            self._start_depth_upscaled_verify_quick()
         elif step == "splatting":
-            self._start_splat_verify_deep() if mode == "deep" else self._start_splat_verify_quick()
+            self._start_splat_verify_quick()
         elif step == "inpaint":
-            self._start_inpaint_verify_deep() if mode == "deep" else self._start_inpaint_verify_quick()
+            self._start_inpaint_verify_quick()
         elif step == "sharpen":
-            self._start_inpaint_sharpen_verify_deep() if mode == "deep" else self._start_inpaint_sharpen_verify_quick()
+            self._start_inpaint_sharpen_verify_quick()
         elif step == "mask_for_merge":
-            self._start_merge_mask_verify_deep() if mode == "deep" else self._start_merge_mask_verify_quick()
+            self._start_merge_mask_verify_quick()
         elif step == "merging":
-            self._start_merge_verify_deep() if mode == "deep" else self._start_merge_verify_quick()
+            self._start_merge_verify_quick()
         elif step == "mono_to_sbs":
             self._start_join_mono_verify()
         elif step == "join":
-            # Join has only one verify mode; use it for quick/deep policy.
+            # Join has only one verify mode; reuse it for pipeline verification.
             self._start_join_verify()
         else:
             return False
@@ -9922,7 +10047,13 @@ class PipelineMasterGUI:
             ]
         )
 
-    def _pipeline_on_run_finished(self, step: str, success: bool) -> None:
+    def _pipeline_on_run_finished(
+        self,
+        step: str,
+        success: bool,
+        *,
+        mark_completed: bool = True,
+    ) -> None:
         pending = self._pipeline_pending_action
         state = (
             self._pipeline_test_step_state
@@ -9930,7 +10061,7 @@ class PipelineMasterGUI:
             else self._pipeline_step_state
         )
         if success:
-            self._pipeline_set_completed_in_state(state, step, True)
+            self._pipeline_set_completed_in_state(state, step, bool(mark_completed))
             self._pipeline_set_verified_in_state(state, step, "none")
             if step in self.PIPELINE_CSV_STEPS:
                 self._sync_pipeline_csv_done_flags_in_state(state)
@@ -9946,9 +10077,16 @@ class PipelineMasterGUI:
                 self.pipeline_run_status_var.set(f"Pipeline stopped: step failed ({step})")
                 self._pipeline_sync_noninteractive_mode()
                 return
+            if not mark_completed:
+                self._pipeline_autorun = False
+                self.pipeline_run_status_var.set(
+                    f"Pipeline paused: {step} ran in incomplete mode and was not marked complete."
+                )
+                self._pipeline_sync_noninteractive_mode()
+                return
             if step == "split_scenes" and self._pipeline_pause_after_split_scenes and not self._pipeline_test_active:
                 verify_mode = self.pipeline_verify_after_var.get().strip().lower()
-                if verify_mode not in {"quick", "deep"}:
+                if verify_mode != "quick":
                     self._pipeline_pause_after_split_scenes = False
                     self._pipeline_autorun = False
                     pause_msg = (
@@ -10064,10 +10202,20 @@ class PipelineMasterGUI:
 
     def _reset_depth_auto_locked_defaults(self) -> None:
         # Fields disabled in Auto mode are informational and update dynamically.
+        self.depth_runtime_mode_var.set("original")
+        self.depth_worker_script_var.set(self._resolve_depth_worker_script("original"))
         self.depth_use_realesrgan_upscale_var.set(False)
         self.depth_realesrgan_scale_var.set("2x")
         self.depth_realesrgan_workers_var.set(str(self.DEFAULT_DEPTH_REALESRGAN_WORKERS))
         self._update_depth_resolution_preview()
+
+    def _on_depth_runtime_mode_selected(self, _event=None) -> None:
+        mode = self._normalize_depth_runtime_mode(self.depth_runtime_mode_var.get())
+        self.depth_runtime_mode_var.set(mode)
+        self.depth_worker_script_var.set(self._resolve_depth_worker_script(mode))
+        if mode == "stream":
+            messagebox.showwarning("DepthCrafter", self.DEPTH_STREAM_WARNING)
+        self._preview_depth_command()
 
     def _normalize_depth_realesrgan_scale(self, value: object) -> str:
         txt = str(value or "").strip().lower()
@@ -10117,12 +10265,10 @@ class PipelineMasterGUI:
         )
         verify_state = tk.DISABLED if (is_running or verify_active) else tk.NORMAL
         self.depth_verify_quick_btn.configure(state=verify_state)
-        self.depth_verify_deep_btn.configure(state=verify_state)
         upscale_verify_state = (
             tk.NORMAL if (verify_state == tk.NORMAL and manual_upscale_enabled) else tk.DISABLED
         )
         self.depth_upscaled_verify_quick_btn.configure(state=upscale_verify_state)
-        self.depth_upscaled_verify_deep_btn.configure(state=upscale_verify_state)
 
     def _apply_depth_control_states(self) -> None:
         mode_manual = self.depth_mode_var.get().strip() == "Manual"
@@ -10136,6 +10282,14 @@ class PipelineMasterGUI:
         self.depth_seed_entry.configure(state=state_auto)
         self.depth_scale_factor_scale.configure(state=state_auto)
         self.depth_cpu_offload_combo.configure(state="readonly")
+        if mode_manual:
+            self.depth_runtime_mode_combo.configure(state="readonly")
+        else:
+            self.depth_runtime_mode_var.set("original")
+            self.depth_runtime_mode_combo.configure(state=tk.DISABLED)
+        self.depth_worker_script_var.set(
+            self._resolve_depth_worker_script(self.depth_runtime_mode_var.get())
+        )
         self.depth_res_x_entry.configure(state=state_res)
         self.depth_res_y_entry.configure(state=state_res)
         self.depth_use_realesrgan_check.configure(
@@ -10146,6 +10300,9 @@ class PipelineMasterGUI:
         )
         self.depth_realesrgan_workers_entry.configure(
             state=tk.NORMAL if upscale_controls_enabled else tk.DISABLED
+        )
+        self.depth_realesrgan_source_combo.configure(
+            state="readonly" if upscale_controls_enabled else tk.DISABLED
         )
 
         self._sync_depth_to_splat_input_path()
@@ -10292,69 +10449,117 @@ class PipelineMasterGUI:
             return fb
         return self.DEFAULT_SCENE_CODEC
 
-    def _set_codec_widget_override_state(self, widget, enabled: bool) -> None:
-        widget.configure(state="readonly" if enabled else tk.DISABLED)
+    def _migrate_global_encoder_mode_from_legacy(self) -> str:
+        existing = str(self._config.get("global_encoder_mode", "")).strip()
+        if existing:
+            return normalize_global_encoder_mode(existing)
+        legacy_quality = str(self._config.get("scene_crf", "")).strip()
+        if legacy_quality == "0":
+            return "crf/qp 0"
+        if legacy_quality == "1":
+            return "crf/qp 1"
+        return "lossless"
 
-    def _on_scene_encode_var_changed(self, *_args) -> None:
-        if not self.depth_encode_override_var.get():
-            self._sync_depth_encoding_from_scene()
-            self._preview_depth_command()
-        if not self.splat_encode_override_var.get():
-            self._sync_splat_encoding_from_scene()
-            self._preview_splat_command()
-        if not self.inpaint_encode_override_var.get():
-            self._sync_inpaint_encoding_from_scene()
-            self._preview_inpaint_command()
-        if not self.merge_encode_override_var.get():
-            self._sync_merge_encoding_from_scene()
-            self._preview_merge_command()
-        if not self.join_pix_fmt_override_var.get():
-            self._sync_join_encoding_from_scene()
-            self._preview_join_command()
+    def _normalize_depth_runtime_mode(self, value: object) -> str:
+        mode = str(value or "").strip().lower()
+        if mode in self.DEPTH_RUNTIME_MODE_CHOICES:
+            return mode
+        return "original"
 
-    def _sync_depth_encoding_from_scene(self) -> None:
-        self.depth_codec_var.set(
-            self._normalize_ffmpeg_codec(
-                self.scene_codec_var.get(),
-                self.DEFAULT_SCENE_CODEC,
+    def _resolve_depth_worker_script(self, mode: object) -> str:
+        resolved_mode = self._normalize_depth_runtime_mode(mode)
+        return str(
+            self.DEPTH_RUNTIME_MODE_TO_SCRIPT.get(
+                resolved_mode,
+                self.DEPTH_RUNTIME_MODE_TO_SCRIPT["original"],
             )
         )
-        self.depth_crf_var.set(self.scene_crf_var.get().strip())
-        self.depth_preset_var.set(self.scene_encoder_preset_var.get().strip())
-        self.depth_pix_fmt_var.set(self.scene_pix_fmt_var.get().strip())
 
-    def _on_depth_override_toggle(self, initial: bool = False) -> None:
-        enabled = bool(self.depth_encode_override_var.get())
-        if not enabled:
-            self._sync_depth_encoding_from_scene()
-        elif not initial and not self._depth_override_notice_shown:
-            self._depth_override_notice_shown = True
-            messagebox.showwarning("Depth Encode Override", self.DEPTH_OVERRIDE_WARNING)
+    def _migrate_depth_runtime_mode_from_legacy(self) -> str:
+        existing = str(self._config.get("depth_runtime_mode", "")).strip()
+        if existing:
+            return self._normalize_depth_runtime_mode(existing)
+        legacy_worker = str(self._config.get("depth_worker_script", "")).strip().lower()
+        if "stream" in legacy_worker:
+            return "stream"
+        return "original"
 
-        state = tk.NORMAL if enabled else tk.DISABLED
-        self._set_codec_widget_override_state(self.depth_codec_entry, enabled)
-        for widget in (
-            self.depth_crf_entry,
-            self.depth_preset_entry,
-            self.depth_pixfmt_entry,
-            self.depth_extra_ffmpeg_entry,
-        ):
-            widget.configure(state=state)
-        self._preview_depth_command()
+    def _normalize_depth_retry_window_size(self, value: object, fallback: str = "65") -> str:
+        sval = str(value or "").strip()
+        try:
+            parsed = int(float(sval))
+        except Exception:
+            parsed = int(float(fallback))
+        return str(max(1, parsed))
+
+    def _normalize_depth_retry_overlap(self, value: object, fallback: str = "15") -> str:
+        sval = str(value or "").strip()
+        try:
+            parsed = int(float(sval))
+        except Exception:
+            parsed = int(float(fallback))
+        return str(max(0, parsed))
+
+    def _current_global_encoder_mode(self) -> str:
+        mode = normalize_global_encoder_mode(self.global_encoder_mode_var.get())
+        if self.global_encoder_mode_var.get().strip() != mode:
+            self.global_encoder_mode_var.set(mode)
+        return mode
+
+    def _current_global_ffmpeg_extra_args(self) -> str:
+        return str(self.global_ffmpeg_extra_args_var.get() or "").strip()
+
+    def _resolve_color_profile_for_codec(self, codec: str):
+        codec_value = self._normalize_ffmpeg_codec(codec, self.DEFAULT_SCENE_CODEC)
+        return resolve_color_encoding_profile(codec_value, self._current_global_encoder_mode())
+
+    @staticmethod
+    def _append_extra_args_to_tokens(tokens: list[str], extra_args: str) -> list[str]:
+        extra = str(extra_args or "").strip()
+        if not extra:
+            return list(tokens)
+        return list(tokens) + shlex.split(extra)
+
+    def _refresh_global_encoder_preview(self) -> None:
+        extra_args = self._current_global_ffmpeg_extra_args()
+        lines: list[str] = []
+        for codec in self.FFMPEG_CODEC_CHOICES:
+            try:
+                profile = resolve_color_encoding_profile(codec, self._current_global_encoder_mode())
+                lines.append(profile_preview_line(profile, extra_args))
+            except Exception as exc:
+                lines.append(f"{codec} FAILED: {exc}")
+        self.global_encoder_preview_var.set(" | ".join(lines))
+
+    def _on_global_encoder_mode_selected(self, _event=None) -> None:
+        self._on_global_encoder_settings_changed()
+
+    def _on_global_encoder_settings_changed(self, *_args) -> None:
+        self._refresh_global_encoder_preview()
+        self._preview_scene_command()
+        self._preview_splat_command()
+        self._preview_inpaint_command()
+        self._preview_merge_command()
 
     def _build_depth_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
         final_upscale = "False"
         depth_codec = self._normalize_ffmpeg_codec(
             self.depth_codec_var.get(),
-            self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
+            self.DEFAULT_SCENE_CODEC,
         )
         self.depth_codec_var.set(depth_codec)
+        depth_runtime_mode = self._normalize_depth_runtime_mode(
+            self.depth_runtime_mode_var.get()
+        )
+        self.depth_runtime_mode_var.set(depth_runtime_mode)
+        depth_worker_script = self._resolve_depth_worker_script(depth_runtime_mode)
+        self.depth_worker_script_var.set(depth_worker_script)
         scene_strip_pad_top, scene_strip_pad_bottom = self._depth_scene_strip_pad()
         scale_factor = self._get_depth_scale_factor()
 
         env_updates: dict[str, str] = {
             "PYTHON": sys.executable,
-            "WORKER_SCRIPT": self.depth_worker_script_var.get().strip() or "./depthcrafter_nogui_batch.py",
+            "WORKER_SCRIPT": depth_worker_script,
             "INPUT_DIR": self.depth_input_var.get().strip(),
             "OUTPUT_DIR": self.depth_output_var.get().strip(),
             "GLOB": self.depth_glob_var.get().strip() or "*.mp4",
@@ -10374,10 +10579,6 @@ class PipelineMasterGUI:
             "SCENE_STRIP_PAD_TOP": str(scene_strip_pad_top),
             "SCENE_STRIP_PAD_BOTTOM": str(scene_strip_pad_bottom),
             "FFMPEG_CODEC": depth_codec,
-            "FFMPEG_CRF": self.depth_crf_var.get().strip() or "1",
-            "FFMPEG_PRESET": self.depth_preset_var.get().strip(),
-            "FFMPEG_PIX_FMT": self.depth_pix_fmt_var.get().strip(),
-            "FFMPEG_EXTRA_ARGS": self.depth_extra_ffmpeg_args_var.get().strip(),
             "RETRY_POLICY_JSON": self._build_retry_policy_json(
                 self.depth_retry_policy_vars,
                 self.depth_cpu_offload_var.get().strip() or "model",
@@ -11123,11 +11324,11 @@ class PipelineMasterGUI:
         # Fields disabled in Auto mode.
         self.splat_layout_var.set("Single Warp")
         self.splat_auto_convergence_var.set("Min Borders")
-        self.splat_dilate_x_var.set("5")
-        self.splat_dilate_y_var.set("5")
+        self.splat_dilate_x_var.set("3")
+        self.splat_dilate_y_var.set("1.5")
         self.splat_blur_x_var.set("0")
         self.splat_blur_y_var.set("0")
-        self.splat_dilate_left_var.set("0")
+        self.splat_dilate_left_var.set("1")
         self.splat_blur_balance_var.set("0.5")
         self.splat_gamma_var.set("1")
         self.splat_convergence_var.set("50")
@@ -11184,36 +11385,6 @@ class PipelineMasterGUI:
         self._update_replace_mask_dependent_controls()
         self._preview_splat_command()
 
-    def _sync_splat_encoding_from_scene(self) -> None:
-        self.splat_codec_var.set(
-            self._normalize_ffmpeg_codec(
-                self.scene_codec_var.get(),
-                self.DEFAULT_SCENE_CODEC,
-            )
-        )
-        self.splat_crf_var.set(self.scene_crf_var.get().strip())
-        self.splat_preset_var.set(self.scene_encoder_preset_var.get().strip())
-        self.splat_pix_fmt_var.set(self.scene_pix_fmt_var.get().strip())
-
-    def _on_splat_override_toggle(self, initial: bool = False) -> None:
-        enabled = bool(self.splat_encode_override_var.get())
-        if not enabled:
-            self._sync_splat_encoding_from_scene()
-        elif not initial and not self._splat_override_notice_shown:
-            self._splat_override_notice_shown = True
-            messagebox.showwarning("Splat Encode Override", self.SPLAT_OVERRIDE_WARNING)
-
-        state = tk.NORMAL if enabled else tk.DISABLED
-        self._set_codec_widget_override_state(self.splat_codec_entry, enabled)
-        for widget in (
-            self.splat_crf_entry,
-            self.splat_preset_entry,
-            self.splat_pixfmt_entry,
-            self.splat_extra_ffmpeg_entry,
-        ):
-            widget.configure(state=state)
-        self._preview_splat_command()
-
     def _build_splat_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
         layout_ui = self.splat_layout_var.get().strip()
         layout_cli = {
@@ -11223,14 +11394,14 @@ class PipelineMasterGUI:
         }.get(layout_ui, "single_warp")
         codec_value = self._normalize_ffmpeg_codec(
             self.splat_codec_var.get(),
-            self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
+            self.DEFAULT_SCENE_CODEC,
         )
         self.splat_codec_var.set(codec_value)
         workers_raw = self.splat_workers_var.get().strip()
         try:
             workers = max(1, int(workers_raw))
         except Exception:
-            workers = 4
+            workers = 8
             self.splat_workers_var.set(str(workers))
         auto_conv_ui = self.splat_auto_convergence_var.get().strip()
         auto_conv_cli = "Off" if auto_conv_ui == "Off" else "MinBorders"
@@ -11250,10 +11421,10 @@ class PipelineMasterGUI:
             "OUTPUT_LAYOUT": layout_cli,
             "AUTO_CONVERGENCE_MODE": auto_conv_cli,
             "DILATE_X": self.splat_dilate_x_var.get().strip() or "3",
-            "DILATE_Y": self.splat_dilate_y_var.get().strip() or "3",
+            "DILATE_Y": self.splat_dilate_y_var.get().strip() or "1.5",
             "BLUR_X": self.splat_blur_x_var.get().strip() or "0",
             "BLUR_Y": self.splat_blur_y_var.get().strip() or "0",
-            "DILATE_LEFT": self.splat_dilate_left_var.get().strip() or "2",
+            "DILATE_LEFT": self.splat_dilate_left_var.get().strip() or "1",
             "BLUR_BALANCE": self.splat_blur_balance_var.get().strip() or "0.5",
             "GAMMA": self.splat_gamma_var.get().strip() or "1",
             "CONVERGENCE": self.splat_convergence_var.get().strip() or "50",
@@ -11275,10 +11446,8 @@ class PipelineMasterGUI:
             "ADD_BORDERS": "False",
             "REPLACE_MASK_CODEC": "ffv1",
             "FFMPEG_CODEC": codec_value,
-            "FFMPEG_CRF": self.splat_crf_var.get().strip() or "1",
-            "FFMPEG_PRESET": self.splat_preset_var.get().strip() or "fast",
-            "FFMPEG_PIX_FMT": self.splat_pix_fmt_var.get().strip() or "yuv420p",
-            "FFMPEG_EXTRA_ARGS": self.splat_extra_ffmpeg_args_var.get().strip(),
+            "ENCODER_MODE": self._current_global_encoder_mode(),
+            "FFMPEG_EXTRA_ARGS": self._current_global_ffmpeg_extra_args(),
             "STOP_MARKER": os.path.join(
                 self.splat_output_var.get().strip() or "./work/splat",
                 ".stop_after_current",
@@ -11543,7 +11712,18 @@ class PipelineMasterGUI:
         )
         pairs: list[dict[str, object]] = []
         expected_codec_family = self._expected_mono_codec_family()
-        expected_pix_fmt = self.merge_pix_fmt_var.get().strip().lower()
+        expected_pix_fmt = "yuv444p"
+        try:
+            mono_profile = resolve_color_encoding_profile(
+                self._normalize_ffmpeg_codec(
+                    self.merge_codec_var.get(),
+                    self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
+                ),
+                self._current_global_encoder_mode(),
+            )
+            expected_pix_fmt = str(mono_profile.pix_fmt or "yuv444p").strip().lower()
+        except Exception:
+            pass
         for src in source_files:
             src_meta = self._probe_video_basic(str(src))
             src_width = src_meta.get("width")
@@ -12079,7 +12259,6 @@ class PipelineMasterGUI:
         if hasattr(self, "inpaint_sharpen_verify_quick_btn"):
             verify_state = tk.NORMAL if (allow_csv_features and sharpen_enabled and not inpaint_running and not self._verify_running) else tk.DISABLED
             self.inpaint_sharpen_verify_quick_btn.configure(state=verify_state)
-            self.inpaint_sharpen_verify_deep_btn.configure(state=verify_state)
         if hasattr(self, "merge_csv_btn"):
             self.merge_csv_btn.configure(
                 state=tk.NORMAL if (allow_csv_features and not merge_running) else tk.DISABLED
@@ -12786,7 +12965,6 @@ class PipelineMasterGUI:
         self.splat_stop_btn.configure(state=tk.NORMAL if is_running else tk.DISABLED)
         verify_state = tk.DISABLED if (is_running or self._verify_running) else tk.NORMAL
         self.splat_verify_quick_btn.configure(state=verify_state)
-        self.splat_verify_deep_btn.configure(state=verify_state)
         if is_running:
             self.splat_stop_btn.configure(text="Stop")
         else:
@@ -13535,8 +13713,32 @@ class PipelineMasterGUI:
     def _on_backend_changed(self, _event=None) -> None:
         self._preview_scene_command()
 
+    def _scene_crop_target_matches_auto_default(self, raw_value: str | None = None) -> bool:
+        profile = self._crop_recommendation_profile or {}
+        default_target = profile.get("default_target_eff_h")
+        if not default_target:
+            return False
+        try:
+            default_target_int = int(default_target)
+        except Exception:
+            return False
+        current_raw = self.scene_crop_target_h_var.get().strip() if raw_value is None else str(raw_value).strip()
+        if current_raw == "":
+            return False
+        normalized = self._normalize_scene_crop_target_effective(
+            current_raw,
+            profile,
+            fallback=default_target_int,
+        )
+        if normalized is None:
+            return False
+        return int(normalized) == default_target_int
+
     def _on_scene_crop_target_spin(self) -> None:
-        if self.scene_crop_mode_var.get().strip().lower() == "auto":
+        if (
+            self.scene_crop_mode_var.get().strip().lower() == "auto"
+            and not self._scene_crop_target_matches_auto_default()
+        ):
             self.scene_crop_mode_var.set("manual")
         self._sync_auto_crop_from_target()
         self._refresh_crop_controls_state()
@@ -13544,7 +13746,10 @@ class PipelineMasterGUI:
     def _on_scene_crop_target_changed(self, *_args) -> None:
         if self._scene_crop_target_syncing:
             return
-        if self.scene_crop_mode_var.get().strip().lower() == "auto":
+        if (
+            self.scene_crop_mode_var.get().strip().lower() == "auto"
+            and not self._scene_crop_target_matches_auto_default()
+        ):
             self.scene_crop_mode_var.set("manual")
         self._sync_auto_crop_from_target()
         self._refresh_crop_controls_state()
@@ -13571,24 +13776,9 @@ class PipelineMasterGUI:
         self._preview_scene_command()
 
     def _on_layout_changed(self, _event=None) -> None:
-        # Fast layout can favor 422 when available.
-        if "Half-SBS early" in self.scene_layout_var.get().strip():
-            allowed = set(
-                self._source_capabilities.get(
-                    "allowed_chroma",
-                    {"444", "422", "420"},
-                )
-            )
-            if "422" in allowed:
-                self.scene_chroma_var.set("422")
-                self.scene_pix_fmt_var.set(self._chroma_to_pixfmt("422"))
         self._preview_scene_command()
 
     def _on_tonemap_changed(self, _event=None) -> None:
-        self._preview_scene_command()
-
-    def _on_chroma_changed(self) -> None:
-        self.scene_pix_fmt_var.set(self._chroma_to_pixfmt(self.scene_chroma_var.get().strip()))
         self._preview_scene_command()
 
     def _refresh_crop_controls_state(self) -> None:
@@ -13616,44 +13806,10 @@ class PipelineMasterGUI:
             return "opencv"
         return "opencv"
 
-    @staticmethod
-    def _chroma_to_pixfmt(chroma: str) -> str:
-        if chroma == "444":
-            return "yuv444p"
-        if chroma == "422":
-            return "yuv422p"
-        return "yuv420p"
-
-    @staticmethod
-    def _pixfmt_to_chroma(pix_fmt: str) -> str:
-        low = (pix_fmt or "").lower()
-        if "444" in low:
-            return "444"
-        if "422" in low:
-            return "422"
-        return "420"
-
-    def _compute_allowed_chroma_set(self, info: dict) -> set[str]:
-        width = info.get("width")
-        height = info.get("height")
-        source_chroma = str(info.get("chroma") or "").strip()
-        is_4k_or_more = bool(
-            (isinstance(width, int) and width >= 3840)
-            or (isinstance(height, int) and height >= 2160)
-        )
-        if is_4k_or_more:
-            return {"444", "422", "420"}
-        if source_chroma == "444":
-            return {"444", "422", "420"}
-        if source_chroma == "422":
-            return {"422", "420"}
-        return {"420"}
-
     def _apply_option_states(self) -> None:
         caps = self._source_capabilities or {}
         has_analysis = bool(caps)
         is_hdr = bool(caps.get("is_hdr", False))
-        allowed = set(caps.get("allowed_chroma", {"444", "422", "420"}))
 
         # Tonemap only for HDR source.
         if has_analysis and is_hdr:
@@ -13665,24 +13821,6 @@ class PipelineMasterGUI:
         else:
             self.scene_tonemap_combo.configure(state=tk.DISABLED)
             self.hdr_policy_var.set("HDR -> SDR 8-bit BT.709: waiting for source analysis")
-
-        # Chroma options always visible, disabled by capability rules.
-        self.chroma_444_rb.configure(state=tk.NORMAL if "444" in allowed else tk.DISABLED)
-        self.chroma_422_rb.configure(state=tk.NORMAL if "422" in allowed else tk.DISABLED)
-        self.chroma_420_rb.configure(state=tk.NORMAL if "420" in allowed else tk.DISABLED)
-        current = self.scene_chroma_var.get().strip()
-        if current not in allowed:
-            if "420" in allowed:
-                current = "420"
-            elif "422" in allowed:
-                current = "422"
-            else:
-                current = "444"
-            self.scene_chroma_var.set(current)
-        if has_analysis:
-            self.scene_pix_fmt_var.set(self._chroma_to_pixfmt(self.scene_chroma_var.get().strip()))
-        elif not self.scene_pix_fmt_var.get().strip():
-            self.scene_pix_fmt_var.set(self._chroma_to_pixfmt(self.scene_chroma_var.get().strip()))
 
         # Crop mode availability based on analysis.
         if has_analysis:
@@ -13699,23 +13837,17 @@ class PipelineMasterGUI:
         source_tag = caps.get("source_tag", "n.d.")
         hint = [f"Source class: {source_tag}"]
         if not has_analysis:
-            hint.append("Analyze Source Video to apply source-driven crop/chroma limits.")
+            hint.append("Analyze Source Video to apply source-driven crop recommendations.")
         elif is_hdr:
             hint.append("HDR input: 8-bit BT.709 conversion will be applied automatically.")
         else:
             hint.append("SDR input: no forced tonemap chain.")
-        if allowed == {"420"}:
-            hint.append("Chroma capped at 420 for this source class.")
-        elif allowed == {"422", "420"}:
-            hint.append("Chroma capped at 422/420 for this source class.")
-        else:
-            hint.append("Chroma 444/422/420 available.")
+        hint.append("Intermediate color steps now use yuv444p via the global encoder policy.")
         self.scene_option_hint_var.set(" | ".join(hint))
 
     def _update_source_capabilities(self, info: dict) -> None:
         dynamic_range = str(info.get("dynamic_range") or "").upper()
         is_hdr = "HDR" in dynamic_range
-        allowed_chroma = self._compute_allowed_chroma_set(info)
         width = info.get("width")
         height = info.get("height")
         source_tag = "n.d."
@@ -13728,7 +13860,6 @@ class PipelineMasterGUI:
                 source_tag = "sub-FHD"
         self._source_capabilities = {
             "is_hdr": is_hdr,
-            "allowed_chroma": allowed_chroma,
             "source_tag": source_tag,
         }
         if is_hdr and not self._hdr_notice_shown:
@@ -14006,6 +14137,9 @@ class PipelineMasterGUI:
         if default_target:
             current_raw = self.scene_crop_target_h_var.get().strip()
             mode = self.scene_crop_mode_var.get().strip().lower()
+            if mode != "auto" and self._scene_crop_target_matches_auto_default(current_raw):
+                self.scene_crop_mode_var.set("auto")
+                mode = "auto"
             should_apply_auto = (mode == "auto") or (current_raw == "")
             if should_apply_auto:
                 self._scene_crop_target_syncing = True
@@ -14047,7 +14181,6 @@ class PipelineMasterGUI:
             filters.append(crop_filter)
 
         is_hdr = bool(self._source_capabilities.get("is_hdr", False))
-        pix_fmt = self.scene_pix_fmt_var.get().strip() or "yuv420p"
         tonemap_display = self.scene_tonemap_var.get().strip()
         tonemap = self.TONEMAP_PRESET_TO_FFMPEG.get(tonemap_display, "mobius")
 
@@ -14065,7 +14198,7 @@ class PipelineMasterGUI:
             filters.append("scale=1920:-2:flags=lanczos+accurate_rnd+full_chroma_int")
 
         if is_hdr:
-            filters.append(f"format={pix_fmt}")
+            filters.append("format=yuv444p")
         return filters
 
     def _build_scene_split_ffmpeg_tokens(self) -> list[str]:
@@ -14074,6 +14207,7 @@ class PipelineMasterGUI:
             self.DEFAULT_SCENE_CODEC,
         )
         self.scene_codec_var.set(scene_codec)
+        profile = self._resolve_color_profile_for_codec(scene_codec)
         ffmpeg_tokens = [
             "-map",
             "0:v:0",
@@ -14090,22 +14224,11 @@ class PipelineMasterGUI:
         if vf_filters:
             ffmpeg_tokens += ["-vf", ",".join(vf_filters)]
 
-        ffmpeg_tokens += [
-            "-c:v",
-            scene_codec,
-            "-" + self._quality_flag_for_codec(scene_codec, self.DEFAULT_SCENE_CODEC, "qp"),
-            self.scene_crf_var.get().strip() or "1",
-            "-preset",
-            self.scene_encoder_preset_var.get().strip() or "fast",
-            "-pix_fmt",
-            self.scene_pix_fmt_var.get().strip() or "yuv420p",
-            "-b:v",
-            "0",
-        ]
+        ffmpeg_tokens += list(profile.generated_args)
 
-        extra_ffmpeg = self.scene_extra_ffmpeg_args_var.get().strip()
+        extra_ffmpeg = self._current_global_ffmpeg_extra_args()
         if extra_ffmpeg:
-            ffmpeg_tokens.extend(shlex.split(extra_ffmpeg))
+            ffmpeg_tokens = self._append_extra_args_to_tokens(ffmpeg_tokens, extra_ffmpeg)
         return ffmpeg_tokens
 
     def _build_scenedetect_command(self) -> list[str]:
@@ -14196,10 +14319,8 @@ class PipelineMasterGUI:
         self.scene_stop_btn.configure(state=tk.NORMAL if stop_enabled else tk.DISABLED)
         if is_running:
             self.scene_verify_quick_btn.configure(state=tk.DISABLED)
-            self.scene_verify_deep_btn.configure(state=tk.DISABLED)
         elif not self._verify_running and not self._analysis_running:
             self.scene_verify_quick_btn.configure(state=tk.NORMAL)
-            self.scene_verify_deep_btn.configure(state=tk.NORMAL)
         self._refresh_pipeline_run_button()
 
     def _set_analysis_running(self, is_running: bool) -> None:
@@ -14209,46 +14330,28 @@ class PipelineMasterGUI:
         self.scene_stop_btn.configure(state=tk.NORMAL if (is_running or scene_is_running) else tk.DISABLED)
         if is_running:
             self.scene_verify_quick_btn.configure(state=tk.DISABLED)
-            self.scene_verify_deep_btn.configure(state=tk.DISABLED)
         elif (not scene_is_running) and (not self._verify_running):
             self.scene_verify_quick_btn.configure(state=tk.NORMAL)
-            self.scene_verify_deep_btn.configure(state=tk.NORMAL)
         self._refresh_pipeline_run_button()
 
     def _verify_button_specs(self) -> list[tuple[str, str, object]]:
         return [
-            ("scene_verify_quick_btn", "Verify Scenes (Quick)", self._start_verify_quick),
-            ("scene_verify_deep_btn", "Verify Scenes (Deep)", self._start_verify_deep),
-            ("depth_verify_quick_btn", "Verify Depth (Quick)", self._start_depth_verify_quick),
-            ("depth_verify_deep_btn", "Verify Depth (Deep)", self._start_depth_verify_deep),
+            ("scene_verify_quick_btn", "Verify Scenes", self._start_verify_quick),
+            ("depth_verify_quick_btn", "Verify Depth", self._start_depth_verify_quick),
             (
                 "depth_upscaled_verify_quick_btn",
-                "Verify Upscale (Quick)",
+                "Verify Upscale",
                 self._start_depth_upscaled_verify_quick,
             ),
-            (
-                "depth_upscaled_verify_deep_btn",
-                "Verify Upscale (Deep)",
-                self._start_depth_upscaled_verify_deep,
-            ),
-            ("splat_verify_quick_btn", "Verify Scenes (Quick)", self._start_splat_verify_quick),
-            ("splat_verify_deep_btn", "Verify Scenes (Deep)", self._start_splat_verify_deep),
-            ("inpaint_verify_quick_btn", "Verify Scenes (Quick)", self._start_inpaint_verify_quick),
-            ("inpaint_verify_deep_btn", "Verify Scenes (Deep)", self._start_inpaint_verify_deep),
-            ("inpaint_sharpen_verify_quick_btn", "Verify Sharpen (Quick)", self._start_inpaint_sharpen_verify_quick),
-            ("inpaint_sharpen_verify_deep_btn", "Verify Sharpen (Deep)", self._start_inpaint_sharpen_verify_deep),
+            ("splat_verify_quick_btn", "Verify Scenes", self._start_splat_verify_quick),
+            ("inpaint_verify_quick_btn", "Verify Scenes", self._start_inpaint_verify_quick),
+            ("inpaint_sharpen_verify_quick_btn", "Verify Sharpen", self._start_inpaint_sharpen_verify_quick),
             (
                 "merge_mask_verify_quick_btn",
-                "Verify Mask (Quick)",
+                "Verify Mask",
                 self._start_merge_mask_verify_quick,
             ),
-            (
-                "merge_mask_verify_deep_btn",
-                "Verify Mask (Deep)",
-                self._start_merge_mask_verify_deep,
-            ),
-            ("merge_verify_quick_btn", "Verify Merge (Quick)", self._start_merge_verify_quick),
-            ("merge_verify_deep_btn", "Verify Merge (Deep)", self._start_merge_verify_deep),
+            ("merge_verify_quick_btn", "Verify Merge", self._start_merge_verify_quick),
             ("join_mono_verify_btn", "Verify Mono->SBS", self._start_join_mono_verify),
             ("join_verify_btn", "Verify Join", self._start_join_verify),
         ]
@@ -14257,23 +14360,14 @@ class PipelineMasterGUI:
         mode = str(self._verify_mode or "").strip().lower()
         return {
             "quick": "scene_verify_quick_btn",
-            "deep": "scene_verify_deep_btn",
             "depth_quick": "depth_verify_quick_btn",
-            "depth_deep": "depth_verify_deep_btn",
             "depth_upscaled_quick": "depth_upscaled_verify_quick_btn",
-            "depth_upscaled_deep": "depth_upscaled_verify_deep_btn",
             "splat_quick": "splat_verify_quick_btn",
-            "splat_deep": "splat_verify_deep_btn",
             "inpaint_quick": "inpaint_verify_quick_btn",
-            "inpaint_deep": "inpaint_verify_deep_btn",
             "sharpen_quick": "inpaint_sharpen_verify_quick_btn",
-            "sharpen_deep": "inpaint_sharpen_verify_deep_btn",
             "merge_mask_quick": "merge_mask_verify_quick_btn",
-            "merge_mask_deep": "merge_mask_verify_deep_btn",
             "merge_quick": "merge_verify_quick_btn",
-            "merge_deep": "merge_verify_deep_btn",
             "join_mono_quick": "join_mono_verify_btn",
-            "join_mono_deep": "join_mono_verify_btn",
             "join_quick": "join_verify_btn",
         }.get(mode, "")
 
@@ -14384,7 +14478,7 @@ class PipelineMasterGUI:
         mode: str | None = None,
     ) -> tuple[tk.StringVar | None, object | None, str]:
         cur = str(mode or self._verify_mode or "").strip().lower()
-        if cur in {"quick", "deep"}:
+        if cur == "quick":
             return self.scene_status_var, self._append_scene_log, "Verify Scenes"
         if cur.startswith("depth_upscaled"):
             return self.depth_status_var, self._append_depth_log, "Verify Upscale"
@@ -14525,7 +14619,7 @@ class PipelineMasterGUI:
             )
         self._verify_stop_requested = True
         self._verify_stop_clicks += 1
-        if self._verify_mode in {"quick", "deep"}:
+        if self._verify_mode == "quick":
             self._scene_verify_result_applied = True
         if status_var is not None:
             status_var.set("Force stop requested..." if self._verify_stop_clicks > 1 else "Stop requested...")
@@ -14550,55 +14644,39 @@ class PipelineMasterGUI:
             self._verify_stop_clicks = 0
         if is_running:
             self.scene_verify_quick_btn.configure(state=tk.DISABLED)
-            self.scene_verify_deep_btn.configure(state=tk.DISABLED)
             self.splat_verify_quick_btn.configure(state=tk.DISABLED)
-            self.splat_verify_deep_btn.configure(state=tk.DISABLED)
             self.inpaint_verify_quick_btn.configure(state=tk.DISABLED)
-            self.inpaint_verify_deep_btn.configure(state=tk.DISABLED)
             self.merge_mask_verify_quick_btn.configure(state=tk.DISABLED)
-            self.merge_mask_verify_deep_btn.configure(state=tk.DISABLED)
             self.merge_verify_quick_btn.configure(state=tk.DISABLED)
-            self.merge_verify_deep_btn.configure(state=tk.DISABLED)
             self.join_mono_verify_btn.configure(state=tk.DISABLED)
             self.join_verify_btn.configure(state=tk.DISABLED)
         else:
             scene_is_running = bool(self._scene_thread and self._scene_thread.is_alive())
             if scene_is_running:
                 self.scene_verify_quick_btn.configure(state=tk.DISABLED)
-                self.scene_verify_deep_btn.configure(state=tk.DISABLED)
             else:
                 if self._analysis_running:
                     self.scene_verify_quick_btn.configure(state=tk.DISABLED)
-                    self.scene_verify_deep_btn.configure(state=tk.DISABLED)
                 else:
                     self.scene_verify_quick_btn.configure(state=tk.NORMAL)
-                    self.scene_verify_deep_btn.configure(state=tk.NORMAL)
             depth_is_running = bool(self._depth_thread and self._depth_thread.is_alive())
             splat_is_running = bool(self._splat_thread and self._splat_thread.is_alive())
             if splat_is_running:
                 self.splat_verify_quick_btn.configure(state=tk.DISABLED)
-                self.splat_verify_deep_btn.configure(state=tk.DISABLED)
             else:
                 self.splat_verify_quick_btn.configure(state=tk.NORMAL)
-                self.splat_verify_deep_btn.configure(state=tk.NORMAL)
             inpaint_is_running = bool(self._inpaint_thread and self._inpaint_thread.is_alive())
             if inpaint_is_running:
                 self.inpaint_verify_quick_btn.configure(state=tk.DISABLED)
-                self.inpaint_verify_deep_btn.configure(state=tk.DISABLED)
             else:
                 self.inpaint_verify_quick_btn.configure(state=tk.NORMAL)
-                self.inpaint_verify_deep_btn.configure(state=tk.NORMAL)
             merge_is_running = bool(self._merge_thread and self._merge_thread.is_alive())
             if merge_is_running:
                 self.merge_mask_verify_quick_btn.configure(state=tk.DISABLED)
-                self.merge_mask_verify_deep_btn.configure(state=tk.DISABLED)
                 self.merge_verify_quick_btn.configure(state=tk.DISABLED)
-                self.merge_verify_deep_btn.configure(state=tk.DISABLED)
             else:
                 self.merge_mask_verify_quick_btn.configure(state=tk.NORMAL)
-                self.merge_mask_verify_deep_btn.configure(state=tk.NORMAL)
                 self.merge_verify_quick_btn.configure(state=tk.NORMAL)
-                self.merge_verify_deep_btn.configure(state=tk.NORMAL)
             join_is_running = bool(self._join_thread and self._join_thread.is_alive())
             if join_is_running:
                 self.join_mono_verify_btn.configure(state=tk.DISABLED)
@@ -16509,12 +16587,27 @@ class PipelineMasterGUI:
                         if isinstance(payload, dict) and "success" in payload
                         else ("completed" in status_txt)
                     )
+                    mark_completed = True
+                    if step_name == "join":
+                        mark_completed = bool(self._join_mark_completed)
+                        if success:
+                            self._set_join_incomplete_flag(not mark_completed)
+                            if not mark_completed:
+                                self.join_status_var.set("Completed (incomplete merge)")
+                                self._append_join_log(
+                                    "[JOIN] Completed in incomplete mode; step left not completed."
+                                )
+                        self._join_mark_completed = True
                     if step_name == "remux":
                         self._pipeline_on_run_finished("remux", success)
                     elif step_name == "mono_to_sbs":
                         self._pipeline_on_run_finished("mono_to_sbs", success)
                     else:
-                        self._pipeline_on_run_finished("join", success)
+                        self._pipeline_on_run_finished(
+                            "join",
+                            success,
+                            mark_completed=mark_completed,
+                        )
                     if stop_requested:
                         label_map = {
                             "mono_to_sbs": "Mono->SBS",
@@ -17209,15 +17302,12 @@ class PipelineMasterGUI:
                     else:
                         self.join_status_var.set("Verify failed")
                         messagebox.showwarning("Verify Join", msg)
-                    pending = self._pipeline_pending_action
                     mode = "quick"
-                    if pending and pending[0] == "join" and pending[1] == "verify":
-                        mode = "deep" if pending[2] == "deep" else "quick"
                     self._pipeline_on_verify_finished("join", ok, mode)
                 elif kind == "join_mono_verify_result" and isinstance(payload, dict):
                     ok = bool(payload.get("ok", False))
                     msg = str(payload.get("message", "Mono->SBS verification finished."))
-                    mode = "deep" if str(payload.get("mode", "")).strip().lower() == "deep" else "quick"
+                    mode = "quick"
                     broken_output = [
                         str(p) for p in (payload.get("broken_output") or []) if str(p).strip()
                     ]
@@ -17274,7 +17364,7 @@ class PipelineMasterGUI:
                     verify_stopped = bool(self._verify_stop_requested)
                     pipeline_stop_requested = bool(self._pipeline_stop_requested)
                     if (
-                        mode_txt in {"quick", "deep"}
+                        mode_txt == "quick"
                         and not self._scene_verify_result_applied
                         and not verify_stopped
                     ):
@@ -17311,12 +17401,9 @@ class PipelineMasterGUI:
             "scene_crop_target_h": self.scene_crop_target_h_var.get().strip(),
             "scene_layout": self.scene_layout_var.get().strip(),
             "scene_tonemap": self.scene_tonemap_var.get().strip(),
-            "scene_chroma": self.scene_chroma_var.get().strip(),
             "scene_codec": self.scene_codec_var.get().strip(),
-            "scene_crf": self.scene_crf_var.get().strip(),
-            "scene_encoder_preset": self.scene_encoder_preset_var.get().strip(),
-            "scene_pix_fmt": self.scene_pix_fmt_var.get().strip(),
-            "scene_extra_ffmpeg_args": self.scene_extra_ffmpeg_args_var.get().strip(),
+            "global_encoder_mode": self._current_global_encoder_mode(),
+            "global_ffmpeg_extra_args": self._current_global_ffmpeg_extra_args(),
             "depth_mode": self.depth_mode_var.get().strip(),
             "depth_chunk_size": self.depth_chunk_size_var.get().strip(),
             "depth_overlap": self.depth_overlap_var.get().strip(),
@@ -17328,16 +17415,14 @@ class PipelineMasterGUI:
             "depth_restart_every": self.depth_restart_every_var.get().strip(),
             "depth_debug_mem": bool(self.depth_debug_mem_var.get()),
             "depth_glob": self.depth_glob_var.get().strip(),
+            "depth_runtime_mode": self._normalize_depth_runtime_mode(
+                self.depth_runtime_mode_var.get()
+            ),
             "depth_worker_script": self.depth_worker_script_var.get().strip(),
             "depth_scale_factor": f"{self._get_depth_scale_factor():.2f}",
             "depth_res_x": self.depth_res_x_var.get().strip(),
             "depth_res_y": self.depth_res_y_var.get().strip(),
-            "depth_encode_override": bool(self.depth_encode_override_var.get()),
             "depth_codec": self.depth_codec_var.get().strip(),
-            "depth_crf": self.depth_crf_var.get().strip(),
-            "depth_preset": self.depth_preset_var.get().strip(),
-            "depth_pix_fmt": self.depth_pix_fmt_var.get().strip(),
-            "depth_extra_ffmpeg_args": self.depth_extra_ffmpeg_args_var.get().strip(),
             "depth_realesrgan_source": self.depth_realesrgan_source_var.get().strip(),
             "depth_use_realesrgan_upscale": bool(self.depth_use_realesrgan_upscale_var.get()),
             "depth_realesrgan_scale": self.depth_realesrgan_scale_var.get().strip(),
@@ -17367,12 +17452,7 @@ class PipelineMasterGUI:
             "splat_replace_mask_max": self.splat_replace_mask_max_var.get().strip(),
             "splat_replace_mask_gap": self.splat_replace_mask_gap_var.get().strip(),
             "splat_replace_mask_edge": bool(self.splat_replace_mask_edge_var.get()),
-            "splat_encode_override": bool(self.splat_encode_override_var.get()),
             "splat_codec": self.splat_codec_var.get().strip(),
-            "splat_crf": self.splat_crf_var.get().strip(),
-            "splat_preset": self.splat_preset_var.get().strip(),
-            "splat_pix_fmt": self.splat_pix_fmt_var.get().strip(),
-            "splat_extra_ffmpeg_args": self.splat_extra_ffmpeg_args_var.get().strip(),
             "inpaint_mode": self.inpaint_mode_var.get().strip(),
             "inpaint_frames_chunk": self.inpaint_frames_chunk_var.get().strip(),
             "inpaint_cpu_offload": self.inpaint_cpu_offload_var.get().strip(),
@@ -17385,12 +17465,7 @@ class PipelineMasterGUI:
             "inpaint_use_sharpen": bool(self.inpaint_use_sharpen_var.get()),
             "inpaint_sharpen_workers": self.inpaint_sharpen_workers_var.get().strip(),
             "inpaint_inference_steps": self.inpaint_inference_steps_var.get().strip(),
-            "inpaint_encode_override": bool(self.inpaint_encode_override_var.get()),
             "inpaint_codec": self.inpaint_codec_var.get().strip(),
-            "inpaint_crf": self.inpaint_crf_var.get().strip(),
-            "inpaint_preset": self.inpaint_preset_var.get().strip(),
-            "inpaint_pix_fmt": self.inpaint_pix_fmt_var.get().strip(),
-            "inpaint_extra_ffmpeg_args": self.inpaint_extra_ffmpeg_args_var.get().strip(),
             "merge_mode": self.merge_mode_var.get().strip(),
             "merge_autoct_workers": self.merge_autoct_workers_var.get().strip(),
             "merge_mask_formerge_workers": self.merge_mask_formerge_workers_var.get().strip(),
@@ -17410,17 +17485,11 @@ class PipelineMasterGUI:
             "merge_ct_preset": self.merge_ct_preset_var.get().strip(),
             "merge_ct_auto_mode": self.merge_ct_auto_mode_var.get().strip(),
             "merge_ct_exclude_black": bool(self.merge_ct_exclude_black_var.get()),
-            "merge_encode_override": bool(self.merge_encode_override_var.get()),
             "merge_codec": self.merge_codec_var.get().strip(),
-            "merge_crf": self.merge_crf_var.get().strip(),
-            "merge_preset": self.merge_preset_var.get().strip(),
-            "merge_pix_fmt": self.merge_pix_fmt_var.get().strip(),
-            "merge_extra_ffmpeg_args": self.merge_extra_ffmpeg_args_var.get().strip(),
             "join_mode": self.join_mode_var.get().strip(),
             "join_encoder": self.join_encoder_var.get().strip(),
             "join_crf": self.join_crf_var.get().strip(),
             "join_preset": self.join_preset_var.get().strip(),
-            "join_pix_fmt_override": bool(self.join_pix_fmt_override_var.get()),
             "join_pix_fmt": self.join_pix_fmt_var.get().strip(),
             "join_extra_args": self.join_extra_args_var.get().strip(),
             "scene_split_threads": self.scene_split_threads_var.get().strip(),

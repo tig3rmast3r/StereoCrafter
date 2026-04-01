@@ -10,7 +10,7 @@ This isolates the mask pipeline used in merging:
 5) optional shadow expansion with temporal state across chunks
 
 Outputs are written in a dedicated folder (default: ./work/mask_formerge) as
-lossless grayscale FFV1 MKV files.
+lossless-safe grayscale x264 files.
 """
 
 from __future__ import annotations
@@ -29,6 +29,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from decord import VideoReader, cpu  # type: ignore
+
+from dependency.ffmpeg_encoding_profiles import resolve_mask_for_merge_grayscale_profile
 
 LOG = logging.getLogger("mask_formerge")
 
@@ -625,6 +627,7 @@ class GrayFFmpegWriter:
     def __init__(self, output_path: str, width: int, height: int, fps: float) -> None:
         self.output_path = output_path
         self.proc: Optional[subprocess.Popen] = None
+        profile = resolve_mask_for_merge_grayscale_profile()
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -648,20 +651,19 @@ class GrayFFmpegWriter:
             "-1",
             "-map_chapters",
             "-1",
-            "-c:v",
-            "ffv1",
-            "-level",
-            "3",
-            "-g",
-            "1",
-            "-slices",
-            "16",
-            "-slicecrc",
-            "1",
-            "-pix_fmt",
-            "gray",
-            output_path,
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-color_range",
+            "tv",
         ]
+        if output_path.lower().endswith((".mp4", ".mov", ".m4v")):
+            cmd.extend(["-movflags", "+write_colr"])
+        cmd.extend(profile.generated_args)
+        cmd.append(output_path)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         if self.proc.stdin is None:
             raise RuntimeError("Failed to open ffmpeg stdin pipe.")

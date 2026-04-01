@@ -50,9 +50,7 @@ CT_CLAMP_AB_MIN="${CT_CLAMP_AB_MIN:-0.1}"
 CT_CLAMP_AB_MAX="${CT_CLAMP_AB_MAX:-3}"
 CT_EXCLUDE_BLACK_IN_TARGET="${CT_EXCLUDE_BLACK_IN_TARGET:-1}"
 FFMPEG_CODEC="${FFMPEG_CODEC:-}"
-FFMPEG_CRF="${FFMPEG_CRF:-}"
-FFMPEG_PRESET="${FFMPEG_PRESET:-}"
-FFMPEG_PIX_FMT="${FFMPEG_PIX_FMT:-}"
+ENCODING_MODE="${ENCODING_MODE:-}"
 FFMPEG_EXTRA_ARGS="${FFMPEG_EXTRA_ARGS:-}"
 RESTART_EVERY="${RESTART_EVERY:-1}"
 PLANNED_RESTART_CODE="${PLANNED_RESTART_CODE:-99}"
@@ -147,14 +145,8 @@ fi
 if [ -n "${FFMPEG_CODEC// }" ]; then
   CMD+=(--ffmpeg-codec "$FFMPEG_CODEC")
 fi
-if [ -n "${FFMPEG_CRF// }" ]; then
-  CMD+=(--ffmpeg-crf "$FFMPEG_CRF")
-fi
-if [ -n "${FFMPEG_PRESET// }" ]; then
-  CMD+=(--ffmpeg-preset "$FFMPEG_PRESET")
-fi
-if [ -n "${FFMPEG_PIX_FMT// }" ]; then
-  CMD+=(--ffmpeg-pix-fmt "$FFMPEG_PIX_FMT")
+if [ -n "${ENCODING_MODE// }" ]; then
+  CMD+=(--encoding-mode "$ENCODING_MODE")
 fi
 if [ -n "${FFMPEG_EXTRA_ARGS// }" ]; then
   CMD+=(--ffmpeg-extra-args "$FFMPEG_EXTRA_ARGS")

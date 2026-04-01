@@ -182,11 +182,9 @@ DEFAULTS: Dict[str, object] = {
     "retries": 1,
     "move_finished": False,
     "cleanup_partial_outputs": True,
-    # FFmpeg output overrides (empty = keep auto behavior)
+    # FFmpeg output policy
     "ffmpeg_codec": "",
-    "ffmpeg_crf": None,
-    "ffmpeg_preset": "",
-    "ffmpeg_pix_fmt": "",
+    "encoding_mode": "",
     "ffmpeg_extra_args": "",
 }
 
@@ -2243,15 +2241,8 @@ def process_one_job(
     encode_ok = False
 
     try:
-        ffmpeg_crf_raw = settings.get("ffmpeg_crf", None)
-        ffmpeg_crf: Optional[int]
-        try:
-            ffmpeg_crf = int(ffmpeg_crf_raw) if ffmpeg_crf_raw is not None else None
-        except Exception:
-            ffmpeg_crf = None
         ffmpeg_codec = str(settings.get("ffmpeg_codec", "") or "").strip() or None
-        ffmpeg_preset = str(settings.get("ffmpeg_preset", "") or "").strip() or None
-        ffmpeg_pix_fmt = str(settings.get("ffmpeg_pix_fmt", "") or "").strip() or None
+        encoding_mode = str(settings.get("encoding_mode", "") or "").strip() or None
         ffmpeg_extra_args = str(settings.get("ffmpeg_extra_args", "") or "").strip() or None
         ffmpeg_process = start_ffmpeg_pipe_process(
             content_width=output_width,
@@ -2261,10 +2252,8 @@ def process_one_job(
             video_stream_info=video_stream_info,
             pad_to_16_9=bool(settings.get("pad_to_16_9", False)),
             output_format_str=output_format,
-            user_output_crf=ffmpeg_crf,
             force_output_codec=ffmpeg_codec,
-            force_output_pix_fmt=ffmpeg_pix_fmt,
-            force_output_preset=ffmpeg_preset,
+            encoding_mode=encoding_mode,
             ffmpeg_extra_output_args=ffmpeg_extra_args,
         )
         if ffmpeg_process is None:
@@ -2764,9 +2753,7 @@ def main() -> int:
     ap.add_argument("--use-gpu", action="store_true", default=None)
     ap.add_argument("--no-use-gpu", action="store_true", default=False)
     ap.add_argument("--ffmpeg-codec", default=None)
-    ap.add_argument("--ffmpeg-crf", type=int, default=None)
-    ap.add_argument("--ffmpeg-preset", default=None)
-    ap.add_argument("--ffmpeg-pix-fmt", default=None)
+    ap.add_argument("--encoding-mode", default=None)
     ap.add_argument("--ffmpeg-extra-args", default=None)
     ap.add_argument("--replace-mask-folder", required=True)
     ap.add_argument("--preprocessed-mask-folder", required=True)
@@ -2847,12 +2834,8 @@ def main() -> int:
         settings["use_gpu_mask_ops"] = False
     if args.ffmpeg_codec is not None:
         settings["ffmpeg_codec"] = str(args.ffmpeg_codec).strip()
-    if args.ffmpeg_crf is not None:
-        settings["ffmpeg_crf"] = int(args.ffmpeg_crf)
-    if args.ffmpeg_preset is not None:
-        settings["ffmpeg_preset"] = str(args.ffmpeg_preset).strip()
-    if args.ffmpeg_pix_fmt is not None:
-        settings["ffmpeg_pix_fmt"] = str(args.ffmpeg_pix_fmt).strip()
+    if args.encoding_mode is not None:
+        settings["encoding_mode"] = str(args.encoding_mode).strip()
     if args.ffmpeg_extra_args is not None:
         settings["ffmpeg_extra_args"] = str(args.ffmpeg_extra_args).strip()
 
