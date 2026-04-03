@@ -20,16 +20,6 @@ MASK_DILATE_KERNEL_SIZE="${MASK_DILATE_KERNEL_SIZE:-2}"
 MASK_BLUR_KERNEL_SIZE="${MASK_BLUR_KERNEL_SIZE:-4}"
 SHADOW_LENGTH_PX="${SHADOW_LENGTH_PX:-25}"
 SHADOW_CURVE="${SHADOW_CURVE:-0}"
-SHADOW_MOTION_GAIN="${SHADOW_MOTION_GAIN:-1}"
-SHADOW_MOTION_DEADZONE_PX="${SHADOW_MOTION_DEADZONE_PX:-20}"
-SHADOW_MOTION_MAX_PX="${SHADOW_MOTION_MAX_PX:-40}"
-SHADOW_MOTION_CHAIN_ENABLED="${SHADOW_MOTION_CHAIN_ENABLED:-1}"
-SHADOW_AREA_MIN_PX="${SHADOW_AREA_MIN_PX:-0}"
-SHADOW_AREA_MAX_PX="${SHADOW_AREA_MAX_PX:-0}"
-SHADOW_AREA_RESET_RATIO="${SHADOW_AREA_RESET_RATIO:-1.8}"
-SHADOW_AREA_RESET_ABS_PX="${SHADOW_AREA_RESET_ABS_PX:-0}"
-SHADOW_COMPONENT_MERGE_Y_TOL_PX="${SHADOW_COMPONENT_MERGE_Y_TOL_PX:-0}"
-SHADOW_ALPHA_DOWN="${SHADOW_ALPHA_DOWN:-0.45}"
 SHADOW_WIDTH_ADAPTIVE="${SHADOW_WIDTH_ADAPTIVE:-1}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 VERBOSE="${VERBOSE:-0}"
@@ -102,7 +92,6 @@ done
 echo "[CFG ] workers=$WORKERS files=${#FILES[@]} use_gpu=$USE_GPU chunk=$CHUNK_SIZE"
 echo "[CFG ] input=$REPLACE_MASK_FOLDER"
 echo "[CFG ] output=$OUTPUT_FOLDER"
-echo "[CFG ] motion_chain=$SHADOW_MOTION_CHAIN_ENABLED motion_deadzone=$SHADOW_MOTION_DEADZONE_PX motion_max=$SHADOW_MOTION_MAX_PX area_min=$SHADOW_AREA_MIN_PX area_max=$SHADOW_AREA_MAX_PX area_reset_ratio=$SHADOW_AREA_RESET_RATIO area_reset_abs=$SHADOW_AREA_RESET_ABS_PX y_tol=$SHADOW_COMPONENT_MERGE_Y_TOL_PX alpha_down=$SHADOW_ALPHA_DOWN"
 
 signal_descendants() {
   local sig="$1"
@@ -368,15 +357,6 @@ run_single_file_once() {
     --mask-blur-kernel-size "$MASK_BLUR_KERNEL_SIZE"
     --shadow-length-px "$SHADOW_LENGTH_PX"
     --shadow-curve "$SHADOW_CURVE"
-    --shadow-motion-gain "$SHADOW_MOTION_GAIN"
-    --shadow-motion-deadzone-px "$SHADOW_MOTION_DEADZONE_PX"
-    --shadow-motion-max-px "$SHADOW_MOTION_MAX_PX"
-    --shadow-area-min-px "$SHADOW_AREA_MIN_PX"
-    --shadow-area-max-px "$SHADOW_AREA_MAX_PX"
-    --shadow-area-reset-ratio "$SHADOW_AREA_RESET_RATIO"
-    --shadow-area-reset-abs-px "$SHADOW_AREA_RESET_ABS_PX"
-    --shadow-component-merge-y-tol-px "$SHADOW_COMPONENT_MERGE_Y_TOL_PX"
-    --shadow-alpha-down "$SHADOW_ALPHA_DOWN"
   )
 
   if [ "$USE_GPU" = "1" ]; then
@@ -388,11 +368,6 @@ run_single_file_once() {
     cmd+=(--shadow-width-adaptive)
   else
     cmd+=(--no-shadow-width-adaptive)
-  fi
-  if [ "$SHADOW_MOTION_CHAIN_ENABLED" = "1" ]; then
-    cmd+=(--shadow-motion-chain-enabled)
-  else
-    cmd+=(--no-shadow-motion-chain-enabled)
   fi
   if [ "$SKIP_EXISTING" = "1" ]; then
     cmd+=(--skip-existing)

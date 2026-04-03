@@ -43,15 +43,27 @@ SHADOW_MAX_DELTA_UP_FRAC_DEFAULT = 0.35
 SHADOW_MAX_DELTA_DOWN_FRAC_DEFAULT = 0.20
 SHADOW_MAX_LEN_CAP_MULT_DEFAULT = 4.0
 SHADOW_MOTION_MAX_PX_DEFAULT = 40.0
-SHADOW_AREA_MIN_PX_DEFAULT = 0.0
-SHADOW_AREA_MAX_PX_DEFAULT = 0.0
-SHADOW_AREA_RESET_RATIO_DEFAULT = 1.8
+SHADOW_AREA_MIN_PX_DEFAULT = 1000.0
+SHADOW_AREA_MAX_PX_DEFAULT = 2000.0
+SHADOW_AREA_RESET_RATIO_DEFAULT = 1.65
 SHADOW_AREA_RESET_ABS_PX_DEFAULT = 0.0
-SHADOW_COMPONENT_MERGE_Y_TOL_PX_DEFAULT = 0
+SHADOW_COMPONENT_MERGE_Y_TOL_PX_DEFAULT = 4
 SHADOW_MOTION_GAIN_DEFAULT = 1.0
-SHADOW_MOTION_DEADZONE_PX_DEFAULT = 4.0
+SHADOW_MOTION_DEADZONE_PX_DEFAULT = 20.0
 MOTION_DEFAULTS_FILENAME = "config_mask_formerge_nogui_motion_defaults.json"
 MOTION_DEFAULTS_ENV = "MASK_FORMERGE_MOTION_DEFAULTS_JSON"
+MOTION_DEFAULTS_FALLBACK: Dict[str, Any] = {
+    "shadow_motion_gain": SHADOW_MOTION_GAIN_DEFAULT,
+    "shadow_motion_deadzone_px": SHADOW_MOTION_DEADZONE_PX_DEFAULT,
+    "shadow_motion_max_px": SHADOW_MOTION_MAX_PX_DEFAULT,
+    "shadow_area_min_px": SHADOW_AREA_MIN_PX_DEFAULT,
+    "shadow_area_max_px": SHADOW_AREA_MAX_PX_DEFAULT,
+    "shadow_area_reset_ratio": SHADOW_AREA_RESET_RATIO_DEFAULT,
+    "shadow_area_reset_abs_px": SHADOW_AREA_RESET_ABS_PX_DEFAULT,
+    "shadow_component_merge_y_tol_px": SHADOW_COMPONENT_MERGE_Y_TOL_PX_DEFAULT,
+    "shadow_alpha_down": SHADOW_ALPHA_DOWN_DEFAULT,
+    "shadow_motion_chain_enabled": SHADOW_MOTION_CHAIN_ENABLED_DEFAULT,
+}
 
 
 def _limit_native_threads() -> None:
@@ -98,19 +110,8 @@ def _coerce_int(value: Any, fallback: int) -> int:
         return int(fallback)
 
 
-def _load_motion_defaults_from_json() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "shadow_motion_gain": SHADOW_MOTION_GAIN_DEFAULT,
-        "shadow_motion_deadzone_px": SHADOW_MOTION_DEADZONE_PX_DEFAULT,
-        "shadow_motion_max_px": SHADOW_MOTION_MAX_PX_DEFAULT,
-        "shadow_area_min_px": SHADOW_AREA_MIN_PX_DEFAULT,
-        "shadow_area_max_px": SHADOW_AREA_MAX_PX_DEFAULT,
-        "shadow_area_reset_ratio": SHADOW_AREA_RESET_RATIO_DEFAULT,
-        "shadow_area_reset_abs_px": SHADOW_AREA_RESET_ABS_PX_DEFAULT,
-        "shadow_component_merge_y_tol_px": SHADOW_COMPONENT_MERGE_Y_TOL_PX_DEFAULT,
-        "shadow_alpha_down": SHADOW_ALPHA_DOWN_DEFAULT,
-        "shadow_motion_chain_enabled": SHADOW_MOTION_CHAIN_ENABLED_DEFAULT,
-    }
+def load_motion_defaults() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = dict(MOTION_DEFAULTS_FALLBACK)
     cfg_raw = str(os.environ.get(MOTION_DEFAULTS_ENV, MOTION_DEFAULTS_FILENAME)).strip()
     if os.path.isabs(cfg_raw):
         cfg_path = cfg_raw
@@ -189,6 +190,10 @@ def _load_motion_defaults_from_json() -> Dict[str, Any]:
     return defaults
 
 
+def _load_motion_defaults_from_json() -> Dict[str, Any]:
+    return load_motion_defaults()
+
+
 def _shadow_curve_opacity(u: float, curve: float) -> float:
     u = float(max(0.0, min(1.0, u)))
     c = float(max(-1.0, min(1.0, curve)))
@@ -231,7 +236,7 @@ def apply_shadow_blur(
     base_length_px: int,
     curve: float,
     motion_gain: float,
-    motion_deadzone_px: float = 4.0,
+    motion_deadzone_px: float = SHADOW_MOTION_DEADZONE_PX_DEFAULT,
     motion_max_px: float = SHADOW_MOTION_MAX_PX_DEFAULT,
     motion_chain_enabled: bool = SHADOW_MOTION_CHAIN_ENABLED_DEFAULT,
     area_min_px: float = SHADOW_AREA_MIN_PX_DEFAULT,
@@ -851,7 +856,7 @@ def process_one_file(
 
 
 def parse_args() -> argparse.Namespace:
-    motion_defaults = _load_motion_defaults_from_json()
+    motion_defaults = load_motion_defaults()
     parser = argparse.ArgumentParser(description="Mask-only preprocessing for merging.")
     parser.add_argument(
         "--input-dir",

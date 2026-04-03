@@ -809,29 +809,6 @@ class PipelineMasterGUI:
         self.merge_shadow_curve_var = tk.StringVar(
             value=str(self._config.get("merge_shadow_curve", "0"))
         )
-        _legacy_merge_shadow_motion_gain = str(
-            self._config.get("merge_shadow_motion_gain", "1")
-        ).strip()
-        try:
-            _legacy_merge_shadow_motion_enabled = float(_legacy_merge_shadow_motion_gain) > 0.0
-        except Exception:
-            _legacy_merge_shadow_motion_enabled = (
-                _legacy_merge_shadow_motion_gain.lower() not in {"0", "false", "no", "off"}
-            )
-        _merge_shadow_motion_enabled_cfg = self._config.get(
-            "merge_shadow_motion_enabled",
-            _legacy_merge_shadow_motion_enabled,
-        )
-        if isinstance(_merge_shadow_motion_enabled_cfg, str):
-            _merge_shadow_motion_enabled = (
-                _merge_shadow_motion_enabled_cfg.strip().lower()
-                in {"1", "true", "yes", "on"}
-            )
-        else:
-            _merge_shadow_motion_enabled = bool(_merge_shadow_motion_enabled_cfg)
-        self.merge_shadow_motion_enabled_var = tk.BooleanVar(
-            value=_merge_shadow_motion_enabled
-        )
         self.merge_dynamic_shadow_width_var = tk.BooleanVar(
             value=bool(self._config.get("merge_dynamic_shadow_width", True))
         )
@@ -3937,16 +3914,6 @@ class PipelineMasterGUI:
         )
         self.merge_shadow_curve_entry.grid(row=1, column=9, sticky="w", padx=(6, 0), pady=(8, 0))
 
-        self.merge_shadow_motion_enabled_check = ttk.Checkbutton(
-            params_frame,
-            text="Motion chain enabled",
-            variable=self.merge_shadow_motion_enabled_var,
-            command=self._preview_merge_command,
-        )
-        self.merge_shadow_motion_enabled_check.grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(8, 0)
-        )
-
         self.merge_dynamic_shadow_check = ttk.Checkbutton(
             params_frame,
             text="Dynamic shadow by mask width",
@@ -4097,7 +4064,6 @@ class PipelineMasterGUI:
             self.merge_shadow_curve_entry,
         ]
         self._merge_manual_check_widgets = [
-            self.merge_shadow_motion_enabled_check,
             self.merge_dynamic_shadow_check,
             self.merge_use_replace_mask_check,
             self.merge_ct_exclude_black_check,
@@ -4182,7 +4148,6 @@ class PipelineMasterGUI:
         self.merge_mask_blur_var.set("2")
         self.merge_shadow_length_var.set("15")
         self.merge_shadow_curve_var.set("0")
-        self.merge_shadow_motion_enabled_var.set(True)
         self.merge_dynamic_shadow_width_var.set(True)
         self.merge_use_replace_mask_var.set(True)
         self.merge_ct_preset_var.set("1")
@@ -4312,7 +4277,6 @@ class PipelineMasterGUI:
         self.merge_log_text.configure(state=tk.DISABLED)
 
     def _build_mask_formerge_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
-        motion_enabled = bool(self.merge_shadow_motion_enabled_var.get())
         mask_workers_raw = self.merge_mask_formerge_workers_var.get().strip()
         try:
             mask_workers = max(1, int(mask_workers_raw))
@@ -4338,9 +4302,6 @@ class PipelineMasterGUI:
             "MASK_BLUR_KERNEL_SIZE": self.merge_mask_blur_var.get().strip() or "4",
             "SHADOW_LENGTH_PX": self.merge_shadow_length_var.get().strip() or "25",
             "SHADOW_CURVE": self.merge_shadow_curve_var.get().strip() or "0",
-            "SHADOW_MOTION_GAIN": "1" if motion_enabled else "0",
-            "SHADOW_MOTION_DEADZONE_PX": "20",
-            "SHADOW_MOTION_CHAIN_ENABLED": "1" if motion_enabled else "0",
             "SHADOW_WIDTH_ADAPTIVE": "1" if bool(self.merge_dynamic_shadow_width_var.get()) else "0",
             "SKIP_EXISTING": "1",
         }
@@ -17479,7 +17440,6 @@ class PipelineMasterGUI:
             "merge_mask_blur": self.merge_mask_blur_var.get().strip(),
             "merge_shadow_length": self.merge_shadow_length_var.get().strip(),
             "merge_shadow_curve": self.merge_shadow_curve_var.get().strip(),
-            "merge_shadow_motion_enabled": bool(self.merge_shadow_motion_enabled_var.get()),
             "merge_dynamic_shadow_width": bool(self.merge_dynamic_shadow_width_var.get()),
             "merge_use_replace_mask": bool(self.merge_use_replace_mask_var.get()),
             "merge_ct_preset": self.merge_ct_preset_var.get().strip(),

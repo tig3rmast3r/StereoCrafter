@@ -26,6 +26,7 @@ from mask_formerge_nogui import (
     apply_gaussian_blur,
     apply_mask_dilation,
     apply_shadow_blur,
+    load_motion_defaults,
 )
 
 
@@ -58,6 +59,14 @@ def _area_reset_pct_to_ratio(pct: float) -> float:
     return float(1.0 + p / 100.0)
 
 
+def _load_canonical_motion_defaults() -> Dict[str, Any]:
+    defaults = dict(load_motion_defaults())
+    defaults["shadow_area_reset_pct"] = _ratio_to_area_reset_pct(
+        float(defaults.get("shadow_area_reset_ratio", 1.0))
+    )
+    return defaults
+
+
 class MaskForMergePreviewGUI(tk.Tk):
     PREVIEW_SOURCES = ["Mask Original", "Mask Processed"]
     PREVIEW_SIZES = ["50%", "75%", "100%", "125%", "150%", "200%"]
@@ -65,26 +74,13 @@ class MaskForMergePreviewGUI(tk.Tk):
     WARMUP_MAX_FRAMES = 120
     PLAY_INTERVAL_MS = 40
     SETTINGS_FILENAME = "config_mask_formerge_preview_gui.json"
-    MERGE_GUI_MOTION_DEFAULTS_FILENAME = "config_merging_gui_motion_defaults.json"
-    MASK_FORMERGE_NOGUI_MOTION_DEFAULTS_FILENAME = (
-        "config_mask_formerge_nogui_motion_defaults.json"
-    )
-    MOTION_DEFAULTS: Dict[str, float] = {
-        "shadow_motion_gain": 1.0,
-        "shadow_motion_deadzone_px": 20.0,
-        "shadow_motion_max_px": 40.0,
-        "shadow_area_min_px": 1000.0,
-        "shadow_area_max_px": 2000.0,
-        "shadow_area_reset_pct": 65.0,
-        "shadow_area_reset_abs_px": 0.0,
-        "shadow_component_merge_y_tol_px": 4.0,
-        "shadow_alpha_down": 0.45,
-    }
+    MOTION_DEFAULTS_FILENAME = "config_mask_formerge_nogui_motion_defaults.json"
 
     def __init__(self) -> None:
         super().__init__()
         self.title("Mask-for-merge Preview GUI")
         self.geometry("1460x960")
+        self.motion_defaults = _load_canonical_motion_defaults()
 
         self.input_folder_var = tk.StringVar(value="./work/mask/")
         self.input_glob_var = tk.StringVar(value="*_replace_mask.*")
@@ -103,34 +99,36 @@ class MaskForMergePreviewGUI(tk.Tk):
         self.shadow_length_px_var = tk.IntVar(value=25)
         self.shadow_curve_var = tk.DoubleVar(value=0.0)
         self.shadow_motion_gain_var = tk.DoubleVar(
-            value=float(self.MOTION_DEFAULTS["shadow_motion_gain"])
+            value=float(self.motion_defaults["shadow_motion_gain"])
         )
         self.shadow_motion_deadzone_px_var = tk.DoubleVar(
-            value=float(self.MOTION_DEFAULTS["shadow_motion_deadzone_px"])
+            value=float(self.motion_defaults["shadow_motion_deadzone_px"])
         )
         self.shadow_motion_max_px_var = tk.DoubleVar(
-            value=float(self.MOTION_DEFAULTS["shadow_motion_max_px"])
+            value=float(self.motion_defaults["shadow_motion_max_px"])
         )
         self.shadow_area_min_px_var = tk.DoubleVar(
-            value=float(self.MOTION_DEFAULTS["shadow_area_min_px"])
+            value=float(self.motion_defaults["shadow_area_min_px"])
         )
         self.shadow_area_max_px_var = tk.DoubleVar(
-            value=float(self.MOTION_DEFAULTS["shadow_area_max_px"])
+            value=float(self.motion_defaults["shadow_area_max_px"])
         )
         self.shadow_area_reset_pct_var = tk.DoubleVar(
-            value=float(self.MOTION_DEFAULTS["shadow_area_reset_pct"])
+            value=float(self.motion_defaults["shadow_area_reset_pct"])
         )
         self.shadow_area_reset_abs_px_var = tk.DoubleVar(
-            value=float(self.MOTION_DEFAULTS["shadow_area_reset_abs_px"])
+            value=float(self.motion_defaults["shadow_area_reset_abs_px"])
         )
         self.shadow_component_merge_y_tol_px_var = tk.IntVar(
-            value=int(round(float(self.MOTION_DEFAULTS["shadow_component_merge_y_tol_px"])))
+            value=int(round(float(self.motion_defaults["shadow_component_merge_y_tol_px"])))
         )
         self.shadow_alpha_down_var = tk.DoubleVar(
-            value=float(self.MOTION_DEFAULTS["shadow_alpha_down"])
+            value=float(self.motion_defaults["shadow_alpha_down"])
         )
         self.shadow_width_adaptive_var = tk.BooleanVar(value=True)
-        self.shadow_motion_chain_enabled_var = tk.BooleanVar(value=True)
+        self.shadow_motion_chain_enabled_var = tk.BooleanVar(
+            value=bool(self.motion_defaults["shadow_motion_chain_enabled"])
+        )
         self.use_gpu_mask_ops_var = tk.BooleanVar(value=False)
         self.warmup_frames_var = tk.IntVar(value=self.DEFAULT_WARMUP_FRAMES)
 
@@ -144,12 +142,7 @@ class MaskForMergePreviewGUI(tk.Tk):
         self._is_playing: bool = False
         self._play_button: Optional[ttk.Button] = None
         self._settings_path = os.path.abspath(self.SETTINGS_FILENAME)
-        self._merge_gui_motion_defaults_path = os.path.abspath(
-            self.MERGE_GUI_MOTION_DEFAULTS_FILENAME
-        )
-        self._mask_formerge_nogui_motion_defaults_path = os.path.abspath(
-            self.MASK_FORMERGE_NOGUI_MOTION_DEFAULTS_FILENAME
-        )
+        self._motion_defaults_path = os.path.abspath(self.MOTION_DEFAULTS_FILENAME)
         self._startup_restore_clip_name: Optional[str] = None
         self._startup_restore_frame_idx: Optional[int] = None
 
@@ -678,21 +671,25 @@ class MaskForMergePreviewGUI(tk.Tk):
         }
 
     def _reset_motion_defaults(self) -> None:
-        self.shadow_motion_gain_var.set(float(self.MOTION_DEFAULTS["shadow_motion_gain"]))
+        self.motion_defaults = _load_canonical_motion_defaults()
+        self.shadow_motion_gain_var.set(float(self.motion_defaults["shadow_motion_gain"]))
         self.shadow_motion_deadzone_px_var.set(
-            float(self.MOTION_DEFAULTS["shadow_motion_deadzone_px"])
+            float(self.motion_defaults["shadow_motion_deadzone_px"])
         )
-        self.shadow_motion_max_px_var.set(float(self.MOTION_DEFAULTS["shadow_motion_max_px"]))
-        self.shadow_area_min_px_var.set(float(self.MOTION_DEFAULTS["shadow_area_min_px"]))
-        self.shadow_area_max_px_var.set(float(self.MOTION_DEFAULTS["shadow_area_max_px"]))
-        self.shadow_area_reset_pct_var.set(float(self.MOTION_DEFAULTS["shadow_area_reset_pct"]))
+        self.shadow_motion_max_px_var.set(float(self.motion_defaults["shadow_motion_max_px"]))
+        self.shadow_area_min_px_var.set(float(self.motion_defaults["shadow_area_min_px"]))
+        self.shadow_area_max_px_var.set(float(self.motion_defaults["shadow_area_max_px"]))
+        self.shadow_area_reset_pct_var.set(float(self.motion_defaults["shadow_area_reset_pct"]))
         self.shadow_area_reset_abs_px_var.set(
-            float(self.MOTION_DEFAULTS["shadow_area_reset_abs_px"])
+            float(self.motion_defaults["shadow_area_reset_abs_px"])
         )
         self.shadow_component_merge_y_tol_px_var.set(
-            int(round(float(self.MOTION_DEFAULTS["shadow_component_merge_y_tol_px"])))
+            int(round(float(self.motion_defaults["shadow_component_merge_y_tol_px"])))
         )
-        self.shadow_alpha_down_var.set(float(self.MOTION_DEFAULTS["shadow_alpha_down"]))
+        self.shadow_alpha_down_var.set(float(self.motion_defaults["shadow_alpha_down"]))
+        self.shadow_motion_chain_enabled_var.set(
+            bool(self.motion_defaults["shadow_motion_chain_enabled"])
+        )
         self.status_var.set("Motion defaults restored.")
         self._schedule_preview(10)
 
@@ -705,24 +702,20 @@ class MaskForMergePreviewGUI(tk.Tk):
     def _push_motion_settings_to_targets(self) -> None:
         payload = self._motion_settings_payload()
         payload["updated_from"] = "mask_formerge_preview_gui"
-        targets = [
-            ("merging GUI", self._merge_gui_motion_defaults_path),
-            ("mask_for_merge noGUI", self._mask_formerge_nogui_motion_defaults_path),
-        ]
         written: List[str] = []
         failures: List[str] = []
-        for label, path in targets:
+        try:
+            self._write_json_atomic(self._motion_defaults_path, payload)
+            self.motion_defaults = _load_canonical_motion_defaults()
+            written.append(os.path.basename(self._motion_defaults_path))
+        except Exception as e:
+            failures.append(f"canonical defaults: {e}")
             try:
-                self._write_json_atomic(path, payload)
-                written.append(f"{label} ({os.path.basename(path)})")
-            except Exception as e:
-                failures.append(f"{label}: {e}")
-                try:
-                    tmp_path = f"{path}.tmp"
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                except Exception:
-                    pass
+                tmp_path = f"{self._motion_defaults_path}.tmp"
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
         if failures:
             if written:
                 self.status_var.set(
@@ -923,39 +916,7 @@ class MaskForMergePreviewGUI(tk.Tk):
         self._set_var_from_settings(data, "mask_blur_kernel_size", self.mask_blur_kernel_size_var, int)
         self._set_var_from_settings(data, "shadow_length_px", self.shadow_length_px_var, int)
         self._set_var_from_settings(data, "shadow_curve", self.shadow_curve_var, float)
-        self._set_var_from_settings(data, "shadow_motion_gain", self.shadow_motion_gain_var, float)
-        self._set_var_from_settings(data, "shadow_motion_deadzone_px", self.shadow_motion_deadzone_px_var, float)
-        self._set_var_from_settings(data, "shadow_motion_max_px", self.shadow_motion_max_px_var, float)
-        self._set_var_from_settings(data, "shadow_area_min_px", self.shadow_area_min_px_var, float)
-        self._set_var_from_settings(data, "shadow_area_max_px", self.shadow_area_max_px_var, float)
-        if "shadow_area_reset_pct" in data:
-            self._set_var_from_settings(
-                data,
-                "shadow_area_reset_pct",
-                self.shadow_area_reset_pct_var,
-                float,
-            )
-        elif "shadow_area_reset_ratio" in data:
-            try:
-                ratio = float(data["shadow_area_reset_ratio"])
-                self.shadow_area_reset_pct_var.set(_ratio_to_area_reset_pct(ratio))
-            except Exception:
-                pass
-        self._set_var_from_settings(data, "shadow_area_reset_abs_px", self.shadow_area_reset_abs_px_var, float)
-        self._set_var_from_settings(
-            data,
-            "shadow_component_merge_y_tol_px",
-            self.shadow_component_merge_y_tol_px_var,
-            int,
-        )
-        self._set_var_from_settings(data, "shadow_alpha_down", self.shadow_alpha_down_var, float)
         self._set_var_from_settings(data, "shadow_width_adaptive", self.shadow_width_adaptive_var, _parse_bool)
-        self._set_var_from_settings(
-            data,
-            "shadow_motion_chain_enabled",
-            self.shadow_motion_chain_enabled_var,
-            _parse_bool,
-        )
         self._set_var_from_settings(data, "use_gpu_mask_ops", self.use_gpu_mask_ops_var, _parse_bool)
         self._set_var_from_settings(data, "warmup_frames", self.warmup_frames_var, int)
 
@@ -982,20 +943,7 @@ class MaskForMergePreviewGUI(tk.Tk):
             "mask_blur_kernel_size": int(self.mask_blur_kernel_size_var.get()),
             "shadow_length_px": int(self.shadow_length_px_var.get()),
             "shadow_curve": float(self.shadow_curve_var.get()),
-            "shadow_motion_gain": float(self.shadow_motion_gain_var.get()),
-            "shadow_motion_deadzone_px": float(self.shadow_motion_deadzone_px_var.get()),
-            "shadow_motion_max_px": float(self.shadow_motion_max_px_var.get()),
-            "shadow_area_min_px": float(self.shadow_area_min_px_var.get()),
-            "shadow_area_max_px": float(self.shadow_area_max_px_var.get()),
-            "shadow_area_reset_pct": float(self.shadow_area_reset_pct_var.get()),
-            "shadow_area_reset_ratio": _area_reset_pct_to_ratio(
-                float(self.shadow_area_reset_pct_var.get())
-            ),
-            "shadow_area_reset_abs_px": float(self.shadow_area_reset_abs_px_var.get()),
-            "shadow_component_merge_y_tol_px": int(self.shadow_component_merge_y_tol_px_var.get()),
-            "shadow_alpha_down": float(self.shadow_alpha_down_var.get()),
             "shadow_width_adaptive": bool(self.shadow_width_adaptive_var.get()),
-            "shadow_motion_chain_enabled": bool(self.shadow_motion_chain_enabled_var.get()),
             "use_gpu_mask_ops": bool(self.use_gpu_mask_ops_var.get()),
             "warmup_frames": int(self.warmup_frames_var.get()),
             "current_clip_basename": clip_name,

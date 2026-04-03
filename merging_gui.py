@@ -21,6 +21,7 @@ import queue
 import faulthandler
 import signal
 from concurrent.futures import ThreadPoolExecutor
+from mask_formerge_nogui import load_motion_defaults as load_mask_formerge_motion_defaults
 from dependency.stereocrafter_util import (
     Tooltip,
     logger,
@@ -1660,7 +1661,7 @@ def _apply_ct_preset_frame(
 
 
 class MergingGUI(ThemedTk):
-    MOTION_DEFAULTS_CONFIG_PATH = "config_merging_gui_motion_defaults.json"
+    MOTION_DEFAULTS_CONFIG_PATH = "config_mask_formerge_nogui_motion_defaults.json"
     PREVIEW_SHADOW_WARMUP_MAX_FRAMES = 20
     PREVIEW_SHADOW_WARMUP_RESIDUAL = 0.05
     OUTPUT_FORMAT_CHOICES = [
@@ -2595,29 +2596,16 @@ class MergingGUI(ThemedTk):
         defaults = dict(self.MOTION_DEFAULTS_FALLBACK)
         path = self.MOTION_DEFAULTS_CONFIG_PATH
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            if not isinstance(payload, dict):
-                return defaults
-
+            payload = load_mask_formerge_motion_defaults()
             parsed = dict(defaults)
-            # Backward compatibility for percent-based payloads.
-            if (
-                "shadow_area_reset_ratio" not in payload
-                and "shadow_area_reset_pct" in payload
-            ):
-                try:
-                    pct = float(payload.get("shadow_area_reset_pct", 0.0))
-                    payload["shadow_area_reset_ratio"] = 1.0 + (pct / 100.0)
-                except Exception:
-                    pass
-
             parsed["shadow_motion_gain"] = self._coerce_float(
                 payload.get("shadow_motion_gain", parsed["shadow_motion_gain"]),
                 parsed["shadow_motion_gain"],
             )
             parsed["shadow_motion_enabled"] = bool(
-                payload.get("shadow_motion_enabled", parsed["shadow_motion_enabled"])
+                payload.get(
+                    "shadow_motion_chain_enabled", parsed["shadow_motion_enabled"]
+                )
             )
             parsed["shadow_motion_deadzone_px"] = self._coerce_float(
                 payload.get(
@@ -2660,12 +2648,21 @@ class MergingGUI(ThemedTk):
                 payload.get("shadow_alpha_down", parsed["shadow_alpha_down"]),
                 parsed["shadow_alpha_down"],
             )
-            logger.info(f"Loaded motion defaults from {path}")
+            resolved_path = path
+            if not os.path.isabs(resolved_path):
+                resolved_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), resolved_path
+                )
+            if os.path.isfile(resolved_path):
+                logger.info(f"Loaded motion defaults from {resolved_path}")
+            else:
+                logger.info(
+                    f"Motion defaults JSON not found at {resolved_path}; using embedded defaults"
+                )
             return parsed
-        except FileNotFoundError:
-            return defaults
         except Exception as e:
             logger.warning(f"Failed loading motion defaults from '{path}': {e}")
+            return defaults
             return defaults
 
     @staticmethod
@@ -4673,37 +4670,80 @@ class MergingGUI(ThemedTk):
                                 processed_mask, settings["mask_blur_kernel_size"], use_gpu
                             )
 
+                        motion_defaults = self.motion_defaults
                         if int(settings.get("shadow_length_px", 0)) > 0:
                             processed_mask = apply_shadow_blur(
                                 processed_mask,
                                 base_length_px=int(settings.get("shadow_length_px", 0)),
                                 curve=float(settings.get("shadow_curve", 0.0)),
-                                motion_gain=float(settings.get("shadow_motion_gain", 0.0)),
+                                motion_gain=float(
+                                    settings.get(
+                                        "shadow_motion_gain",
+                                        motion_defaults.get("shadow_motion_gain", 1.0),
+                                    )
+                                ),
                                 motion_deadzone_px=float(
-                                    settings.get("shadow_motion_deadzone_px", 4.0)
+                                    settings.get(
+                                        "shadow_motion_deadzone_px",
+                                        motion_defaults.get(
+                                            "shadow_motion_deadzone_px", 20.0
+                                        ),
+                                    )
                                 ),
                                 motion_max_px=float(
-                                    settings.get("shadow_motion_max_px", 40.0)
+                                    settings.get(
+                                        "shadow_motion_max_px",
+                                        motion_defaults.get("shadow_motion_max_px", 40.0),
+                                    )
                                 ),
                                 motion_chain_enabled=bool(
-                                    settings.get("shadow_motion_enabled", True)
+                                    settings.get(
+                                        "shadow_motion_enabled",
+                                        motion_defaults.get("shadow_motion_enabled", True),
+                                    )
                                 ),
                                 area_min_px=float(
-                                    settings.get("shadow_area_min_px", 0.0)
+                                    settings.get(
+                                        "shadow_area_min_px",
+                                        motion_defaults.get("shadow_area_min_px", 1000.0),
+                                    )
                                 ),
                                 area_max_px=float(
-                                    settings.get("shadow_area_max_px", 0.0)
+                                    settings.get(
+                                        "shadow_area_max_px",
+                                        motion_defaults.get("shadow_area_max_px", 2000.0),
+                                    )
                                 ),
                                 area_reset_ratio=float(
-                                    settings.get("shadow_area_reset_ratio", 1.8)
+                                    settings.get(
+                                        "shadow_area_reset_ratio",
+                                        motion_defaults.get(
+                                            "shadow_area_reset_ratio", 1.65
+                                        ),
+                                    )
                                 ),
                                 area_reset_abs_px=float(
-                                    settings.get("shadow_area_reset_abs_px", 0.0)
+                                    settings.get(
+                                        "shadow_area_reset_abs_px",
+                                        motion_defaults.get(
+                                            "shadow_area_reset_abs_px", 0.0
+                                        ),
+                                    )
                                 ),
                                 component_merge_y_tol_px=int(
-                                    settings.get("shadow_component_merge_y_tol_px", 0)
+                                    settings.get(
+                                        "shadow_component_merge_y_tol_px",
+                                        motion_defaults.get(
+                                            "shadow_component_merge_y_tol_px", 4
+                                        ),
+                                    )
                                 ),
-                                alpha_down=float(settings.get("shadow_alpha_down", 0.45)),
+                                alpha_down=float(
+                                    settings.get(
+                                        "shadow_alpha_down",
+                                        motion_defaults.get("shadow_alpha_down", 0.45),
+                                    )
+                                ),
                                 width_adaptive=bool(
                                     settings.get("shadow_width_adaptive", True)
                                 ),
@@ -5494,10 +5534,66 @@ class MergingGUI(ThemedTk):
                 params.get("preview_shadow_temporal", False)
             )
             warmup_frames = int(params.get("preview_shadow_warmup_frames", 20))
-            shadow_motion_gain = float(params.get("shadow_motion_gain", 0.0))
-            shadow_motion_enabled = bool(params.get("shadow_motion_enabled", True))
+            motion_defaults = self.motion_defaults
+            shadow_motion_gain = float(
+                params.get(
+                    "shadow_motion_gain",
+                    motion_defaults.get("shadow_motion_gain", 1.0),
+                )
+            )
+            shadow_motion_enabled = bool(
+                params.get(
+                    "shadow_motion_enabled",
+                    motion_defaults.get("shadow_motion_enabled", True),
+                )
+            )
             shadow_motion_deadzone_px = float(
-                params.get("shadow_motion_deadzone_px", 4.0)
+                params.get(
+                    "shadow_motion_deadzone_px",
+                    motion_defaults.get("shadow_motion_deadzone_px", 20.0),
+                )
+            )
+            shadow_motion_max_px = float(
+                params.get(
+                    "shadow_motion_max_px",
+                    motion_defaults.get("shadow_motion_max_px", 40.0),
+                )
+            )
+            shadow_area_min_px = float(
+                params.get(
+                    "shadow_area_min_px",
+                    motion_defaults.get("shadow_area_min_px", 1000.0),
+                )
+            )
+            shadow_area_max_px = float(
+                params.get(
+                    "shadow_area_max_px",
+                    motion_defaults.get("shadow_area_max_px", 2000.0),
+                )
+            )
+            shadow_area_reset_ratio = float(
+                params.get(
+                    "shadow_area_reset_ratio",
+                    motion_defaults.get("shadow_area_reset_ratio", 1.65),
+                )
+            )
+            shadow_area_reset_abs_px = float(
+                params.get(
+                    "shadow_area_reset_abs_px",
+                    motion_defaults.get("shadow_area_reset_abs_px", 0.0),
+                )
+            )
+            shadow_component_merge_y_tol_px = int(
+                params.get(
+                    "shadow_component_merge_y_tol_px",
+                    motion_defaults.get("shadow_component_merge_y_tol_px", 4),
+                )
+            )
+            shadow_alpha_down = float(
+                params.get(
+                    "shadow_alpha_down",
+                    motion_defaults.get("shadow_alpha_down", 0.45),
+                )
             )
 
             if shadow_len_px > 0 and not use_mask_formerge_effective:
@@ -5521,13 +5617,13 @@ class MergingGUI(ThemedTk):
                         float(shadow_motion_gain),
                         bool(shadow_motion_enabled),
                         float(shadow_motion_deadzone_px),
-                        float(params.get("shadow_motion_max_px", 40.0)),
-                        float(params.get("shadow_area_min_px", 0.0)),
-                        float(params.get("shadow_area_max_px", 0.0)),
-                        float(params.get("shadow_area_reset_ratio", 1.8)),
-                        float(params.get("shadow_area_reset_abs_px", 0.0)),
-                        int(params.get("shadow_component_merge_y_tol_px", 0)),
-                        float(params.get("shadow_alpha_down", 0.45)),
+                        float(shadow_motion_max_px),
+                        float(shadow_area_min_px),
+                        float(shadow_area_max_px),
+                        float(shadow_area_reset_ratio),
+                        float(shadow_area_reset_abs_px),
+                        int(shadow_component_merge_y_tol_px),
+                        float(shadow_alpha_down),
                         bool(params.get("shadow_width_adaptive", True)),
                         int(warmup_frames),
                         int(hires_H),
@@ -5551,14 +5647,14 @@ class MergingGUI(ThemedTk):
                             curve=float(params.get("shadow_curve", 0.0)),
                             motion_gain=shadow_motion_gain,
                             motion_deadzone_px=shadow_motion_deadzone_px,
-                            motion_max_px=float(params.get("shadow_motion_max_px", 40.0)),
+                            motion_max_px=shadow_motion_max_px,
                             motion_chain_enabled=shadow_motion_enabled,
-                            area_min_px=float(params.get("shadow_area_min_px", 0.0)),
-                            area_max_px=float(params.get("shadow_area_max_px", 0.0)),
-                            area_reset_ratio=float(params.get("shadow_area_reset_ratio", 1.8)),
-                            area_reset_abs_px=float(params.get("shadow_area_reset_abs_px", 0.0)),
-                            component_merge_y_tol_px=int(params.get("shadow_component_merge_y_tol_px", 0)),
-                            alpha_down=float(params.get("shadow_alpha_down", 0.45)),
+                            area_min_px=shadow_area_min_px,
+                            area_max_px=shadow_area_max_px,
+                            area_reset_ratio=shadow_area_reset_ratio,
+                            area_reset_abs_px=shadow_area_reset_abs_px,
+                            component_merge_y_tol_px=shadow_component_merge_y_tol_px,
+                            alpha_down=shadow_alpha_down,
                             width_adaptive=bool(
                                 params.get("shadow_width_adaptive", True)
                             ),
@@ -5597,14 +5693,14 @@ class MergingGUI(ThemedTk):
                                 curve=float(params.get("shadow_curve", 0.0)),
                                 motion_gain=shadow_motion_gain,
                                 motion_deadzone_px=shadow_motion_deadzone_px,
-                                motion_max_px=float(params.get("shadow_motion_max_px", 40.0)),
+                                motion_max_px=shadow_motion_max_px,
                                 motion_chain_enabled=shadow_motion_enabled,
-                                area_min_px=float(params.get("shadow_area_min_px", 0.0)),
-                                area_max_px=float(params.get("shadow_area_max_px", 0.0)),
-                                area_reset_ratio=float(params.get("shadow_area_reset_ratio", 1.8)),
-                                area_reset_abs_px=float(params.get("shadow_area_reset_abs_px", 0.0)),
-                                component_merge_y_tol_px=int(params.get("shadow_component_merge_y_tol_px", 0)),
-                                alpha_down=float(params.get("shadow_alpha_down", 0.45)),
+                                area_min_px=shadow_area_min_px,
+                                area_max_px=shadow_area_max_px,
+                                area_reset_ratio=shadow_area_reset_ratio,
+                                area_reset_abs_px=shadow_area_reset_abs_px,
+                                component_merge_y_tol_px=shadow_component_merge_y_tol_px,
+                                alpha_down=shadow_alpha_down,
                                 width_adaptive=bool(
                                     params.get("shadow_width_adaptive", True)
                                 ),
@@ -5628,14 +5724,14 @@ class MergingGUI(ThemedTk):
                         curve=float(params.get("shadow_curve", 0.0)),
                         motion_gain=shadow_motion_gain,
                         motion_deadzone_px=shadow_motion_deadzone_px,
-                        motion_max_px=float(params.get("shadow_motion_max_px", 40.0)),
+                        motion_max_px=shadow_motion_max_px,
                         motion_chain_enabled=shadow_motion_enabled,
-                        area_min_px=float(params.get("shadow_area_min_px", 0.0)),
-                        area_max_px=float(params.get("shadow_area_max_px", 0.0)),
-                        area_reset_ratio=float(params.get("shadow_area_reset_ratio", 1.8)),
-                        area_reset_abs_px=float(params.get("shadow_area_reset_abs_px", 0.0)),
-                        component_merge_y_tol_px=int(params.get("shadow_component_merge_y_tol_px", 0)),
-                        alpha_down=float(params.get("shadow_alpha_down", 0.45)),
+                        area_min_px=shadow_area_min_px,
+                        area_max_px=shadow_area_max_px,
+                        area_reset_ratio=shadow_area_reset_ratio,
+                        area_reset_abs_px=shadow_area_reset_abs_px,
+                        component_merge_y_tol_px=shadow_component_merge_y_tol_px,
+                        alpha_down=shadow_alpha_down,
                         width_adaptive=bool(
                             params.get("shadow_width_adaptive", True)
                         ),
