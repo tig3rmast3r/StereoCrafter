@@ -32,19 +32,6 @@ FFMPEG_CODEC="${FFMPEG_CODEC:-}"
 RETRY_POLICY_JSON="${RETRY_POLICY_JSON:-}"
 RETRY_PROCESS_RESTART_ALLOC_MB="${RETRY_PROCESS_RESTART_ALLOC_MB:-1024}"
 
-# Optional RealESRGAN upscale stage (used by pipeline GUI auto mode)
-USE_REALESRGAN_UPSCALE="${USE_REALESRGAN_UPSCALE:-False}"
-REALESRGAN_UPSCALE_SCRIPT="${REALESRGAN_UPSCALE_SCRIPT:-Utilities/upscale_esrgan_x264.sh}"
-REALESRGAN_SCALE="${REALESRGAN_SCALE:-2}"
-REALESRGAN_MODEL="${REALESRGAN_MODEL:-realesr-animevideov3-x2}"
-REALESRGAN_TILE="${REALESRGAN_TILE:-auto}"
-REALESRGAN_DEST="${REALESRGAN_DEST:-}"
-REALESRGAN_JOBS="${REALESRGAN_JOBS:-$(nproc)}"
-REALESRGAN_RETRIES="${REALESRGAN_RETRIES:-3}"
-# Optional runtime overrides, typically set by GUI when Bundled runtime is selected.
-REALESRGAN_BIN="${REALESRGAN_BIN:-}"
-REALESRGAN_MODEL_DIR="${REALESRGAN_MODEL_DIR:-}"
-
 # ---------------------------------
 # Crash/kill retry policy (process)
 # ---------------------------------
@@ -217,65 +204,6 @@ _is_true() {
   esac
 }
 
-_run_realesrgan_upscale() {
-  local script_path="$REALESRGAN_UPSCALE_SCRIPT"
-  local tmp_out="$OUTPUT_DIR/.tmp_esrgan_upscaled"
-
-  if [[ -z "$script_path" || ! -f "$script_path" ]]; then
-    echo "[ESRGAN] upscale script not found: $script_path"
-    return 2
-  fi
-
-  rm -rf -- "$tmp_out" 2>/dev/null || true
-  mkdir -p -- "$tmp_out"
-
-  echo "[ESRGAN] running: $script_path"
-
-  if [[ -n "${REALESRGAN_BIN// }" ]]; then
-    export REALESRGAN_BIN
-  fi
-  if [[ -n "${REALESRGAN_MODEL_DIR// }" ]]; then
-    export REALESRGAN_MODEL_DIR
-  fi
-  # Keep only encoder family alignment (NVENC vs x264).
-  # Other encode knobs stay depthmap-optimized/hardcoded in ESRGAN scripts.
-  if [[ -n "${FFMPEG_CODEC// }" ]]; then
-    export REALESRGAN_OUT_CODEC="$FFMPEG_CODEC"
-  fi
-
-  if ! bash "$script_path" \
-    "$OUTPUT_DIR" \
-    "$tmp_out" \
-    "$REALESRGAN_SCALE" \
-    "$REALESRGAN_MODEL" \
-    "$REALESRGAN_TILE" \
-    "$REALESRGAN_DEST" \
-    "$REALESRGAN_JOBS" \
-    "$REALESRGAN_RETRIES"; then
-    echo "[ESRGAN] upscale failed"
-    rm -rf -- "$tmp_out" 2>/dev/null || true
-    return 3
-  fi
-
-  shopt -s nullglob
-  local up_files=("$tmp_out"/*.mp4)
-  shopt -u nullglob
-  if (( ${#up_files[@]} == 0 )); then
-    echo "[ESRGAN] no upscaled outputs found in $tmp_out"
-    rm -rf -- "$tmp_out" 2>/dev/null || true
-    return 4
-  fi
-
-  local f base
-  for f in "${up_files[@]}"; do
-    base="$(basename "$f")"
-    mv -f -- "$f" "$OUTPUT_DIR/$base"
-  done
-  rm -rf -- "$tmp_out" 2>/dev/null || true
-  echo "[ESRGAN] upscale completed"
-  return 0
-}
-
 _request_stop_signal() {
   if [[ "$STOP_REQUESTED" -eq 0 ]]; then
     STOP_REQUESTED=1
@@ -392,12 +320,6 @@ while true; do
   fi
 
   if [[ "$rc" -eq 0 ]]; then
-    if _is_true "$USE_REALESRGAN_UPSCALE"; then
-      if ! _run_realesrgan_upscale; then
-        echo "[FAIL] RealESRGAN upscale stage failed."
-        exit 1
-      fi
-    fi
     echo "[OK] success"
     exit 0
   fi

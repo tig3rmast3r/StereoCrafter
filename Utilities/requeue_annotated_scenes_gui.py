@@ -27,7 +27,6 @@ SCENE_ID_PATTERN = r"[^/\\\\]+?-Scene-\d+(?:-Scene-\d+)*"
 
 STEP_OPTIONS = [
     ("depthcrafter", "depthcrafter"),
-    ("realesrgan", "realesrgan"),
     ("splatting", "splatting"),
     ("inpainting", "inpainting"),
     ("sharpen", "sharpen"),
@@ -51,7 +50,6 @@ STEP_TO_DIRS = {
     # It is distinct from "mask_for_merge", which is generated later by the
     # mask preprocessing step used by merge.
     "depthcrafter": ["depthmap", "splat/hires", "mask", "output", "output-sharpen", "mask_for_merge", "sbs"],
-    "realesrgan": ["splat/hires", "mask", "output", "output-sharpen", "mask_for_merge", "sbs"],
     "splatting": ["splat/hires", "mask", "output", "output-sharpen", "mask_for_merge", "sbs"],
     "inpainting": ["output", "output-sharpen", "mask_for_merge", "sbs"],
     "sharpen": ["output-sharpen", "sbs"],
@@ -72,7 +70,6 @@ DIR_LABELS = {
 }
 STEP_TO_SUBSET_PREV_DIRS = {
     "depthcrafter": ["seg"],
-    "realesrgan": ["seg", "depthmap"],
     "splatting": ["seg", "depthmap"],
     "inpainting": ["seg", "splat/hires", "mask"],
     "sharpen": ["seg", "splat/hires", "mask", "output"],
@@ -915,15 +912,15 @@ def _parse_textbox_requests(
 
 
 def _step_needs_sharpness_subset_rows(step_id: str) -> bool:
-    return step_id in {"depthcrafter", "realesrgan", "splatting", "inpainting", "sharpen"}
+    return step_id in {"depthcrafter", "splatting", "inpainting", "sharpen"}
 
 
 def _step_invalidates_sharpness_rows(step_id: str) -> bool:
-    return step_id in {"depthcrafter", "realesrgan", "splatting", "inpainting"}
+    return step_id in {"depthcrafter", "splatting", "inpainting"}
 
 
 def _step_needs_autoct_rows(step_id: str) -> bool:
-    return step_id in {"depthcrafter", "realesrgan", "splatting", "inpainting", "sharpen"}
+    return step_id in {"depthcrafter", "splatting", "inpainting", "sharpen"}
 
 
 def _suppress_missing_match_warning(rel_dir: str) -> bool:

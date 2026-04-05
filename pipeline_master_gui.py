@@ -60,20 +60,13 @@ class PipelineMasterGUI:
     DEFAULT_DEPTH_SCALE_FACTOR = 0.80
     MIN_DEPTH_SCALE_FACTOR = 0.5
     MAX_DEPTH_SCALE_FACTOR = 1.0
-    DEFAULT_DEPTH_REALESRGAN_WORKERS = 2
     DEFAULT_SPLIT_SCENES_WORKERS = 8
     DEFAULT_PIPELINE_TEST_RUN_FILES = 5
-    DEPTH_REALESRGAN_SCALE_CHOICES = ("2x", "4x")
     DEPTH_RUNTIME_MODE_CHOICES = ("original", "stream")
     DEPTH_RUNTIME_MODE_TO_SCRIPT = {
         "original": "./depthcrafter_nogui_batch.py",
         "stream": "./depthcrafter_nogui_stream_carry.py",
     }
-    DEPTH_REALESRGAN_MODEL_MAP = {
-        "2x": {"scale": "2", "model": "realesr-animevideov3-x2"},
-        "4x": {"scale": "4", "model": "realesrgan-x4plus"},
-    }
-    REALESRGAN_RELEASES_URL = "https://github.com/xinntao/Real-ESRGAN/releases"
     RETRY_POLICY_PROFILES = ("run", "retry1", "retry2", "retry3")
     RETRY_POLICY_MAX_SPLIT_CHOICES = ("off", "64", "128", "256", "512")
     RETRY_POLICY_OFFLOAD_CHOICES = ("none", "model", "sequential")
@@ -269,7 +262,6 @@ class PipelineMasterGUI:
         ("scenedetect", "SceneDetect"),
         ("split_scenes", "Split Scenes"),
         ("depthcrafter", "DepthCrafter"),
-        ("depth_upscale", "Depth Upscale"),
         ("splatting", "Splatting"),
         ("sharpness_csv", "Sharpness CSV"),
         ("inpaint", "Inpaint"),
@@ -284,7 +276,6 @@ class PipelineMasterGUI:
     PIPELINE_STEPS_WITH_VERIFY = {
         "split_scenes",
         "depthcrafter",
-        "depth_upscale",
         "splatting",
         "inpaint",
         "sharpen",
@@ -529,7 +520,6 @@ class PipelineMasterGUI:
         # DepthCrafter tab (GUI only for now, no runner integration yet).
         self.depth_input_var = tk.StringVar(value="")
         self.depth_output_var = tk.StringVar(value="")
-        self.depth_upscaled_var = tk.StringVar(value="")
         self.depth_mode_var = tk.StringVar(
             value=self._config.get("depth_mode", "Auto (recommended)")
         )
@@ -591,25 +581,6 @@ class PipelineMasterGUI:
 
         self.depth_codec_var = tk.StringVar(
             value=self._config.get("depth_codec", self.scene_codec_var.get())
-        )
-        self.depth_realesrgan_source_var = tk.StringVar(
-            value=self._config.get(
-                "depth_realesrgan_source", "Bundled (Utilities/realesrgan)"
-            )
-        )
-        self.depth_use_realesrgan_upscale_var = tk.BooleanVar(
-            value=bool(self._config.get("depth_use_realesrgan_upscale", False))
-        )
-        self.depth_realesrgan_scale_var = tk.StringVar(
-            value=str(self._config.get("depth_realesrgan_scale", "2x"))
-        )
-        self.depth_realesrgan_workers_var = tk.StringVar(
-            value=str(
-                self._config.get(
-                    "depth_realesrgan_workers",
-                    str(self.DEFAULT_DEPTH_REALESRGAN_WORKERS),
-                )
-            )
         )
         self.depth_cmd_preview_var = tk.StringVar(value="")
         self.depth_status_var = tk.StringVar(value="Ready")
@@ -988,19 +959,6 @@ class PipelineMasterGUI:
         self.depth_scale_factor_text_var.set(
             f"{float(self.depth_scale_factor_var.get()):.2f}x"
         )
-        if self.depth_realesrgan_source_var.get().strip() not in {
-            "Bundled (Utilities/realesrgan)",
-            "Local (system/custom path)",
-        }:
-            self.depth_realesrgan_source_var.set("Bundled (Utilities/realesrgan)")
-        self.depth_realesrgan_scale_var.set(
-            self._normalize_depth_realesrgan_scale(self.depth_realesrgan_scale_var.get())
-        )
-        try:
-            if int(self.depth_realesrgan_workers_var.get().strip()) < 1:
-                raise ValueError
-        except Exception:
-            self.depth_realesrgan_workers_var.set(str(self.DEFAULT_DEPTH_REALESRGAN_WORKERS))
         if self.splat_mode_var.get().strip() not in {"Auto (recommended)", "Manual"}:
             self.splat_mode_var.set("Auto (recommended)")
         try:
@@ -1456,18 +1414,8 @@ class PipelineMasterGUI:
             row=2, column=2, padx=4
         )
 
-        ttk.Label(parent, text="Depth upscaled folder (optional/manual):").grid(
-            row=3, column=0, sticky="w", pady=3
-        )
-        ttk.Entry(parent, textvariable=self.depth_upscaled_var, state="readonly").grid(
-            row=3, column=1, sticky="ew", padx=6
-        )
-        ttk.Button(parent, text="Open", command=self._open_depth_upscaled_folder).grid(
-            row=3, column=2, padx=4
-        )
-
         mode_frame = ttk.LabelFrame(parent, text="Depth Mode", padding=8)
-        mode_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=6)
+        mode_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=6)
         mode_frame.grid_columnconfigure(3, weight=1)
 
         ttk.Label(mode_frame, text="Preset:").grid(row=0, column=0, sticky="w")
@@ -1502,7 +1450,7 @@ class PipelineMasterGUI:
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         params_frame = ttk.LabelFrame(parent, text="Depth Parameters", padding=8)
-        params_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
+        params_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=6)
         for col in range(8):
             params_frame.grid_columnconfigure(col, weight=0)
         params_frame.grid_columnconfigure(7, weight=1)
@@ -1568,56 +1516,8 @@ class PipelineMasterGUI:
             row=2, column=6, columnspan=2, sticky="w", padx=(6, 0), pady=(8, 0)
         )
 
-        self.depth_use_realesrgan_check = ttk.Checkbutton(
-            params_frame,
-            text="Use RealESRGAN Upscale",
-            variable=self.depth_use_realesrgan_upscale_var,
-            command=self._on_depth_realesrgan_toggle,
-        )
-        self.depth_use_realesrgan_check.grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0)
-        )
-        ttk.Label(params_frame, text="Scale:").grid(row=3, column=2, sticky="w", pady=(8, 0))
-        self.depth_realesrgan_scale_combo = ttk.Combobox(
-            params_frame,
-            textvariable=self.depth_realesrgan_scale_var,
-            values=list(self.DEPTH_REALESRGAN_SCALE_CHOICES),
-            width=8,
-            state="readonly",
-        )
-        self.depth_realesrgan_scale_combo.grid(
-            row=3, column=3, sticky="w", padx=(6, 12), pady=(8, 0)
-        )
-        self.depth_realesrgan_scale_combo.bind(
-            "<<ComboboxSelected>>", self._on_depth_realesrgan_scale_changed
-        )
-
-        ttk.Label(params_frame, text="ESRGAN workers:").grid(
-            row=3, column=4, sticky="w", pady=(8, 0)
-        )
-        self.depth_realesrgan_workers_entry = ttk.Entry(
-            params_frame, textvariable=self.depth_realesrgan_workers_var, width=8
-        )
-        self.depth_realesrgan_workers_entry.grid(
-            row=3, column=5, sticky="w", padx=(6, 12), pady=(8, 0)
-        )
-        ttk.Label(params_frame, text="Runtime:").grid(row=3, column=6, sticky="w", pady=(8, 0))
-        self.depth_realesrgan_source_combo = ttk.Combobox(
-            params_frame,
-            textvariable=self.depth_realesrgan_source_var,
-            values=[
-                "Bundled (Utilities/realesrgan)",
-                "Local (system/custom path)",
-            ],
-            state="readonly",
-            width=30,
-        )
-        self.depth_realesrgan_source_combo.grid(
-            row=3, column=7, sticky="w", padx=(6, 0), pady=(8, 0)
-        )
-
         encode_frame = ttk.LabelFrame(parent, text="Encoding", padding=8)
-        encode_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
+        encode_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
         encode_frame.grid_columnconfigure(3, weight=1)
 
         ttk.Label(encode_frame, text="Codec:").grid(row=0, column=0, sticky="w")
@@ -1636,14 +1536,14 @@ class PipelineMasterGUI:
         ).grid(row=0, column=2, columnspan=2, sticky="w")
 
         cmd_frame = ttk.LabelFrame(parent, text="Command Preview", padding=8)
-        cmd_frame.grid(row=7, column=0, columnspan=3, sticky="ew", pady=6)
+        cmd_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
         cmd_frame.grid_columnconfigure(0, weight=1)
         ttk.Entry(cmd_frame, textvariable=self.depth_cmd_preview_var, state="readonly").grid(
             row=0, column=0, sticky="ew"
         )
 
         buttons = ttk.Frame(parent)
-        buttons.grid(row=8, column=0, columnspan=3, sticky="w", pady=(4, 6))
+        buttons.grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 6))
         self.depth_preview_btn = ttk.Button(
             buttons, text="Preview Command", command=self._preview_depth_command
         )
@@ -1652,24 +1552,16 @@ class PipelineMasterGUI:
             buttons, text="Run DepthCrafter", command=self._run_depth_placeholder
         )
         self.depth_run_btn.grid(row=0, column=1, padx=6)
-        self.depth_upscale_btn = ttk.Button(
-            buttons, text="Run ESRGAN", command=self._run_depth_upscale_placeholder
-        )
-        self.depth_upscale_btn.grid(row=0, column=2, padx=6)
         self.depth_verify_quick_btn = ttk.Button(
             buttons, text="Verify Depth", command=self._start_depth_verify_quick
         )
-        self.depth_verify_quick_btn.grid(row=0, column=3, padx=6)
-        self.depth_upscaled_verify_quick_btn = ttk.Button(
-            buttons, text="Verify Upscale", command=self._start_depth_upscaled_verify_quick
-        )
-        self.depth_upscaled_verify_quick_btn.grid(row=0, column=4, padx=6)
+        self.depth_verify_quick_btn.grid(row=0, column=2, padx=6)
         self.depth_stop_btn = ttk.Button(
             buttons, text="Stop", command=self._stop_depth_placeholder
         )
-        self.depth_stop_btn.grid(row=0, column=5, padx=6)
+        self.depth_stop_btn.grid(row=0, column=3, padx=6)
         ttk.Button(buttons, text="Clear Log", command=self._clear_depth_log).grid(
-            row=0, column=6, padx=6
+            row=0, column=4, padx=6
         )
 
         status_frame = ttk.Frame(parent)
@@ -8019,15 +7911,6 @@ class PipelineMasterGUI:
             scene_stems,
             ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"],
         )
-        state["depth_upscale"]["completed"] = (
-            self._pipeline_test_has_scene_outputs(
-                self.depth_upscaled_var.get().strip(),
-                scene_stems,
-                ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"],
-            )
-            if self._is_pipeline_step_required("depth_upscale")
-            else False
-        )
         state["splatting"]["completed"] = self._pipeline_test_has_scene_outputs(
             self._resolve_splat_hires_dir(),
             scene_stems,
@@ -8112,7 +7995,6 @@ class PipelineMasterGUI:
             "scene_output_var",
             "depth_input_var",
             "depth_output_var",
-            "depth_upscaled_var",
             "splat_input_clips_var",
             "splat_input_depth_var",
             "splat_output_var",
@@ -8231,7 +8113,6 @@ class PipelineMasterGUI:
         }
 
         test_depth = test_root / "depthmap"
-        test_depth_up = test_depth / "upscaled"
         test_splat_root = test_root / "splat"
         test_splat_hires = test_splat_root / "hires"
         test_mask = test_root / "mask"
@@ -8246,7 +8127,6 @@ class PipelineMasterGUI:
         self.scene_output_var.set(str(test_seg))
         self.depth_input_var.set(str(test_seg))
         self.depth_output_var.set(str(test_depth))
-        self.depth_upscaled_var.set(str(test_depth_up))
         self.splat_input_clips_var.set(str(test_seg))
         self._sync_depth_to_splat_input_path()
         self.splat_output_var.set(str(test_splat_root))
@@ -8363,8 +8243,6 @@ class PipelineMasterGUI:
     def _is_pipeline_step_required(self, step: str) -> bool:
         if self._pipeline_test_active and step in {"mono_to_sbs", "join", "remux"}:
             return False
-        if step == "depth_upscale":
-            return self._depth_upscale_enabled_in_manual()
         if step == "sharpness_csv":
             return (
                 self.inpaint_mode_var.get().strip() == "Auto (recommended)"
@@ -8397,7 +8275,7 @@ class PipelineMasterGUI:
                     done_w.configure(text="-", fg="#999999")
                 if verify_w is not None:
                     verify_w.configure(
-                        text="Disabled" if step in {"depth_upscale", "sharpen"} else "N/A",
+                        text="Disabled" if step == "sharpen" else "N/A",
                         fg="#999999",
                     )
                 done_count += 1
@@ -8496,10 +8374,6 @@ class PipelineMasterGUI:
         self.depth_runtime_mode_var.set("original")
         self.depth_worker_script_var.set("./depthcrafter_nogui_batch.py")
         self.depth_codec_var.set(self.DEFAULT_SCENE_CODEC)
-        self.depth_realesrgan_source_var.set("Bundled (Utilities/realesrgan)")
-        self.depth_use_realesrgan_upscale_var.set(False)
-        self.depth_realesrgan_scale_var.set("2x")
-        self.depth_realesrgan_workers_var.set(str(self.DEFAULT_DEPTH_REALESRGAN_WORKERS))
         self._on_depth_mode_changed()
 
         # Splat defaults.
@@ -9020,11 +8894,6 @@ class PipelineMasterGUI:
             scene_stems,
             self.VERIFY_VIDEO_PATTERNS,
         )
-        depth_upscaled_count = self._pipeline_count_scene_output_coverage(
-            self.depth_upscaled_var.get().strip(),
-            scene_stems,
-            self.VERIFY_VIDEO_PATTERNS,
-        )
         splat_count = self._pipeline_count_scene_output_coverage(
             self._resolve_splat_hires_dir(),
             scene_stems,
@@ -9070,11 +8939,6 @@ class PipelineMasterGUI:
             "scenedetect": bool(prev_scene_done or scene_csv_present),
             "split_scenes": bool(prev_split_done or split_ok),
             "depthcrafter": bool(scene_ref_ready and depth_count >= seg_ref_count),
-            "depth_upscale": (
-                bool(scene_ref_ready and depth_upscaled_count >= seg_ref_count)
-                if self._is_pipeline_step_required("depth_upscale")
-                else False
-            ),
             "splatting": bool(scene_ref_ready and splat_count >= seg_ref_count),
             "inpaint": bool(scene_ref_ready and inpaint_count >= seg_ref_count),
             "sharpen": (
@@ -9287,7 +9151,6 @@ class PipelineMasterGUI:
 
         test_seg = test_root / "seg"
         test_depth = test_root / "depthmap"
-        test_depth_up = test_depth / "upscaled"
         test_splat_root = test_root / "splat"
         test_splat_hires = test_splat_root / "hires"
         test_mask = test_root / "mask"
@@ -9299,7 +9162,6 @@ class PipelineMasterGUI:
         for d in (
             test_seg,
             test_depth,
-            test_depth_up,
             test_splat_root,
             test_splat_hires,
             test_mask,
@@ -9317,7 +9179,6 @@ class PipelineMasterGUI:
             self._pipeline_link_or_copy_file(src, dst)
 
         depth_src = prev_paths.get("depth_output_var", "")
-        depth_up_src = prev_paths.get("depth_upscaled_var", "")
         splat_src_root = prev_paths.get("splat_output_var", "")
         if splat_src_root:
             sroot = Path(splat_src_root)
@@ -9333,12 +9194,6 @@ class PipelineMasterGUI:
         self._pipeline_link_scene_files(
             depth_src,
             str(test_depth),
-            ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"],
-            scene_stems,
-        )
-        self._pipeline_link_scene_files(
-            depth_up_src,
-            str(test_depth_up),
             ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"],
             scene_stems,
         )
@@ -9401,7 +9256,6 @@ class PipelineMasterGUI:
         self.scene_output_var.set(str(test_seg))
         self.depth_input_var.set(str(test_seg))
         self.depth_output_var.set(str(test_depth))
-        self.depth_upscaled_var.set(str(test_depth_up))
         self.splat_input_clips_var.set(str(test_seg))
         self._sync_depth_to_splat_input_path()
         self.splat_output_var.set(str(test_splat_root))
@@ -9650,7 +9504,6 @@ class PipelineMasterGUI:
 
         video_patterns = ["*.mp4", "*.mkv", "*.mov", "*.avi", "*.webm"]
         _sync_dir(test_root / "depthmap", "depth_output_var", video_patterns)
-        _sync_dir(test_root / "depthmap" / "upscaled", "depth_upscaled_var", video_patterns)
         _sync_dir(test_root / "mask", "splat_mask_output_var", ["*_replace_mask.*"], must_contain="_replace_mask")
         _sync_dir(
             test_root / "output",
@@ -9920,10 +9773,6 @@ class PipelineMasterGUI:
             before = bool(self._depth_thread and self._depth_thread.is_alive())
             self._run_depth_placeholder()
             return bool(self._depth_thread and self._depth_thread.is_alive()) and not before
-        if step == "depth_upscale":
-            before = bool(self._depth_thread and self._depth_thread.is_alive())
-            self._run_depth_upscale_placeholder()
-            return bool(self._depth_thread and self._depth_thread.is_alive()) and not before
         if step == "splatting":
             before = bool(self._splat_thread and self._splat_thread.is_alive())
             self._run_splat_placeholder()
@@ -9973,8 +9822,6 @@ class PipelineMasterGUI:
             self._start_verify_quick()
         elif step == "depthcrafter":
             self._start_depth_verify_quick()
-        elif step == "depth_upscale":
-            self._start_depth_upscaled_verify_quick()
         elif step == "splatting":
             self._start_splat_verify_quick()
         elif step == "inpaint":
@@ -10144,13 +9991,6 @@ class PipelineMasterGUI:
         os.makedirs(folder, exist_ok=True)
         self._append_depth_log(f"Depth output folder ready: {folder}")
 
-    def _open_depth_upscaled_folder(self) -> None:
-        folder = self.depth_upscaled_var.get().strip()
-        if not folder:
-            return
-        os.makedirs(folder, exist_ok=True)
-        self._append_depth_log(f"Depth upscaled folder ready: {folder}")
-
     def _on_depth_mode_changed(self, _event=None) -> None:
         mode = self.depth_mode_var.get().strip()
         if mode == "Manual":
@@ -10165,9 +10005,6 @@ class PipelineMasterGUI:
         # Fields disabled in Auto mode are informational and update dynamically.
         self.depth_runtime_mode_var.set("original")
         self.depth_worker_script_var.set(self._resolve_depth_worker_script("original"))
-        self.depth_use_realesrgan_upscale_var.set(False)
-        self.depth_realesrgan_scale_var.set("2x")
-        self.depth_realesrgan_workers_var.set(str(self.DEFAULT_DEPTH_REALESRGAN_WORKERS))
         self._update_depth_resolution_preview()
 
     def _on_depth_runtime_mode_selected(self, _event=None) -> None:
@@ -10178,64 +10015,23 @@ class PipelineMasterGUI:
             messagebox.showwarning("DepthCrafter", self.DEPTH_STREAM_WARNING)
         self._preview_depth_command()
 
-    def _normalize_depth_realesrgan_scale(self, value: object) -> str:
-        txt = str(value or "").strip().lower()
-        if txt in {"2", "2x"}:
-            return "2x"
-        if txt in {"4", "4x"}:
-            return "4x"
-        return "2x"
-
-    def _depth_upscale_enabled_in_manual(self) -> bool:
-        return (
-            self.depth_mode_var.get().strip() == "Manual"
-            and bool(self.depth_use_realesrgan_upscale_var.get())
-        )
-
     def _sync_depth_to_splat_input_path(self) -> None:
-        preferred = (
-            self.depth_upscaled_var.get().strip()
-            if self._depth_upscale_enabled_in_manual()
-            else self.depth_output_var.get().strip()
-        )
+        preferred = self.depth_output_var.get().strip()
         self.splat_input_depth_var.set(os.path.normpath(preferred) if preferred else "")
-
-    def _selected_depth_realesrgan_profile(self) -> tuple[str, str, str]:
-        choice = self._normalize_depth_realesrgan_scale(self.depth_realesrgan_scale_var.get())
-        if self.depth_realesrgan_scale_var.get().strip() != choice:
-            self.depth_realesrgan_scale_var.set(choice)
-        profile = self.DEPTH_REALESRGAN_MODEL_MAP.get(
-            choice,
-            self.DEPTH_REALESRGAN_MODEL_MAP["2x"],
-        )
-        return choice, str(profile["scale"]), str(profile["model"])
 
     def _refresh_depth_action_buttons(self, is_running: bool | None = None) -> None:
         if is_running is None:
             is_running = bool(self._depth_thread and self._depth_thread.is_alive())
         verify_active = bool(self._verify_running)
-        manual_upscale_enabled = self._depth_upscale_enabled_in_manual()
         self.depth_preview_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
         self.depth_run_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
-        self.depth_upscale_btn.configure(
-            state=(
-                tk.NORMAL
-                if (not is_running and not verify_active and manual_upscale_enabled)
-                else tk.DISABLED
-            )
-        )
         verify_state = tk.DISABLED if (is_running or verify_active) else tk.NORMAL
         self.depth_verify_quick_btn.configure(state=verify_state)
-        upscale_verify_state = (
-            tk.NORMAL if (verify_state == tk.NORMAL and manual_upscale_enabled) else tk.DISABLED
-        )
-        self.depth_upscaled_verify_quick_btn.configure(state=upscale_verify_state)
 
     def _apply_depth_control_states(self) -> None:
         mode_manual = self.depth_mode_var.get().strip() == "Manual"
         state_auto = tk.NORMAL
         state_res = tk.NORMAL if mode_manual else tk.DISABLED
-        upscale_controls_enabled = self._depth_upscale_enabled_in_manual()
 
         self.depth_chunk_size_entry.configure(state=state_auto)
         self.depth_overlap_entry.configure(state=state_auto)
@@ -10253,18 +10049,6 @@ class PipelineMasterGUI:
         )
         self.depth_res_x_entry.configure(state=state_res)
         self.depth_res_y_entry.configure(state=state_res)
-        self.depth_use_realesrgan_check.configure(
-            state=tk.NORMAL if mode_manual else tk.DISABLED
-        )
-        self.depth_realesrgan_scale_combo.configure(
-            state="readonly" if upscale_controls_enabled else tk.DISABLED
-        )
-        self.depth_realesrgan_workers_entry.configure(
-            state=tk.NORMAL if upscale_controls_enabled else tk.DISABLED
-        )
-        self.depth_realesrgan_source_combo.configure(
-            state="readonly" if upscale_controls_enabled else tk.DISABLED
-        )
 
         self._sync_depth_to_splat_input_path()
         self._update_depth_resolution_preview()
@@ -10272,17 +10056,6 @@ class PipelineMasterGUI:
         self._preview_splat_command()
         self._refresh_depth_action_buttons()
         self._refresh_pipeline_status_panel()
-
-    def _on_depth_realesrgan_toggle(self) -> None:
-        if self.depth_mode_var.get().strip() != "Manual":
-            self.depth_use_realesrgan_upscale_var.set(False)
-        self._apply_depth_control_states()
-
-    def _on_depth_realesrgan_scale_changed(self, _event=None) -> None:
-        self.depth_realesrgan_scale_var.set(
-            self._normalize_depth_realesrgan_scale(self.depth_realesrgan_scale_var.get())
-        )
-        self._preview_depth_command()
 
     def _normalize_depth_scale_factor(self, value) -> float:
         try:
@@ -10536,7 +10309,6 @@ class PipelineMasterGUI:
             "SCALE_FACTOR": f"{scale_factor:.2f}",
             "RESTART_EVERY": self.depth_restart_every_var.get().strip() or "100",
             "PAD_ALIGN_BOTTOM": "True",
-            "USE_REALESRGAN_UPSCALE": "False",
             "SCENE_STRIP_PAD_TOP": str(scene_strip_pad_top),
             "SCENE_STRIP_PAD_BOTTOM": str(scene_strip_pad_bottom),
             "FFMPEG_CODEC": depth_codec,
@@ -10608,53 +10380,6 @@ class PipelineMasterGUI:
             return
         os.makedirs(output_dir, exist_ok=True)
 
-        if env_updates.get("USE_REALESRGAN_UPSCALE", "False").lower() == "true":
-            upscale_script = Path(env_updates.get("REALESRGAN_UPSCALE_SCRIPT", "")).resolve()
-            if not upscale_script.is_file():
-                messagebox.showerror("DepthCrafter", f"RealESRGAN script not found:\n{upscale_script}")
-                return
-
-            runtime_mode = env_updates.get("REALESRGAN_RUNTIME", "local").strip().lower()
-            runtime_bin = env_updates.get("REALESRGAN_BIN", "").strip()
-            if runtime_mode == "bundled":
-                if not runtime_bin or not Path(runtime_bin).is_file():
-                    messagebox.showerror(
-                        "DepthCrafter",
-                        f"Bundled RealESRGAN binary not found:\n{runtime_bin or '(empty)'}",
-                    )
-                    return
-                model_dir = env_updates.get("REALESRGAN_MODEL_DIR", "").strip()
-                if not model_dir or not Path(model_dir).is_dir():
-                    messagebox.showerror(
-                        "DepthCrafter",
-                        f"Bundled RealESRGAN model dir not found:\n{model_dir or '(empty)'}",
-                    )
-                    return
-            else:
-                if runtime_bin:
-                    if not Path(runtime_bin).is_file():
-                        messagebox.showerror(
-                            "DepthCrafter",
-                            f"Local RealESRGAN binary not found:\n{runtime_bin}",
-                        )
-                        return
-                else:
-                    resolved_local = self._resolve_local_realesrgan_bin()
-                    if not resolved_local:
-                        messagebox.showerror(
-                            "DepthCrafter",
-                            (
-                                "Local RealESRGAN runtime not found.\n\n"
-                                "Searched PATH and current venv bin.\n"
-                                "Install `realesrgan-ncnn-vulkan` or switch to Bundled runtime."
-                            ),
-                        )
-                        return
-                    env_updates["REALESRGAN_BIN"] = resolved_local
-                    local_models = self._resolve_realesrgan_model_dir(resolved_local)
-                    if local_models:
-                        env_updates["REALESRGAN_MODEL_DIR"] = local_models
-
         self._depth_stop_requested = False
         self._depth_stop_clicks = 0
         self.depth_status_var.set("Starting...")
@@ -10720,45 +10445,6 @@ class PipelineMasterGUI:
                 except Exception:
                     pass
             self._log_queue.put(("depth_done", {"step": "depthcrafter", "success": step_success}))
-
-    def _resolve_local_realesrgan_bin(self) -> str | None:
-        candidates: list[str] = []
-        env_bin = str(os.environ.get("REALESRGAN_BIN", "")).strip()
-        if env_bin:
-            candidates.append(env_bin)
-        which_bin = shutil.which("realesrgan-ncnn-vulkan")
-        if which_bin:
-            candidates.append(which_bin)
-        try:
-            candidates.append(str((Path(sys.executable).resolve().parent / "realesrgan-ncnn-vulkan")))
-        except Exception:
-            pass
-
-        seen: set[str] = set()
-        for raw in candidates:
-            if not raw:
-                continue
-            if raw in seen:
-                continue
-            seen.add(raw)
-            p = Path(raw).expanduser()
-            try:
-                if p.is_file():
-                    return str(p.resolve())
-            except Exception:
-                continue
-        return None
-
-    @staticmethod
-    def _resolve_realesrgan_model_dir(bin_path: str) -> str:
-        if not bin_path:
-            return ""
-        p = Path(bin_path).expanduser()
-        try:
-            model_dir = p.resolve().parent / "models"
-        except Exception:
-            return ""
-        return str(model_dir) if model_dir.is_dir() else ""
 
     @staticmethod
     def _probe_video_resolution_fast(path: str) -> tuple[int | None, int | None]:
@@ -10854,270 +10540,6 @@ class PipelineMasterGUI:
             return int(src_w), int(src_h)
         return None, None
 
-    def _resolve_depth_upscale_dest(
-        self,
-        scale_factor: float,
-        realesrgan_scale: float = 2.0,
-    ) -> str:
-        if abs(float(scale_factor) * float(realesrgan_scale) - 1.0) <= 1e-9:
-            return ""
-        ref_dir = self.depth_input_var.get().strip()
-        if ref_dir and os.path.isdir(ref_dir):
-            for p in sorted(Path(ref_dir).glob("*.mp4")):
-                if not p.is_file():
-                    continue
-                w, h = self._probe_video_resolution_fast(str(p))
-                if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
-                    return f"{w}x{h}"
-        src_w = self._source_video_info.get("width")
-        src_h = self._source_video_info.get("height")
-        if (
-            isinstance(src_w, int)
-            and isinstance(src_h, int)
-            and src_w > 0
-            and src_h > 0
-            and not self._needs_downscale_to_1080()
-        ):
-            return f"{src_w}x{src_h}"
-        return ""
-
-    @staticmethod
-    def _realesrgan_model_files_exist(model_dir: str, model_name: str) -> bool:
-        if not model_dir or not model_name:
-            return False
-        root = Path(model_dir).expanduser()
-        return (root / f"{model_name}.bin").is_file() and (root / f"{model_name}.param").is_file()
-
-    def _build_depth_upscale_payload(self) -> tuple[list[str], dict[str, str], str]:
-        depth_codec = (self.depth_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC).lower()
-        uses_nvenc = "nvenc" in depth_codec
-        script = "Utilities/upscale_esrgan_nvenc.sh" if uses_nvenc else "Utilities/upscale_esrgan_x264.sh"
-        env_updates: dict[str, str] = {"REALESRGAN_RUNTIME": "local"}
-        if self.depth_realesrgan_source_var.get().strip().startswith("Bundled"):
-            env_updates["REALESRGAN_RUNTIME"] = "bundled"
-            env_updates["REALESRGAN_BIN"] = str(
-                Path("Utilities/realesrgan/realesrgan-ncnn-vulkan").resolve()
-            )
-            env_updates["REALESRGAN_MODEL_DIR"] = str(
-                Path("Utilities/realesrgan/models").resolve()
-            )
-        else:
-            local_bin = self._resolve_local_realesrgan_bin()
-            if local_bin:
-                env_updates["REALESRGAN_BIN"] = local_bin
-                local_models = self._resolve_realesrgan_model_dir(local_bin)
-                if local_models:
-                    env_updates["REALESRGAN_MODEL_DIR"] = local_models
-
-        in_dir = self.depth_output_var.get().strip()
-        out_dir = self.depth_upscaled_var.get().strip()
-        _choice, scale, model = self._selected_depth_realesrgan_profile()
-        tile = "auto"
-        scale_factor = self._get_depth_scale_factor()
-        dest = self._resolve_depth_upscale_dest(scale_factor, float(scale))
-        try:
-            jobs_num = max(
-                1,
-                int(
-                    self.depth_realesrgan_workers_var.get().strip()
-                    or str(self.DEFAULT_DEPTH_REALESRGAN_WORKERS)
-                ),
-            )
-        except Exception:
-            jobs_num = self.DEFAULT_DEPTH_REALESRGAN_WORKERS
-        if self.depth_realesrgan_workers_var.get().strip() != str(jobs_num):
-            self.depth_realesrgan_workers_var.set(str(jobs_num))
-        jobs = str(jobs_num)
-        retries = "3"
-
-        cmd = [
-            "bash",
-            script,
-            in_dir,
-            out_dir,
-            scale,
-            model,
-            tile,
-            dest,
-            jobs,
-            retries,
-        ]
-        preview = " ".join(
-            [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
-            + [shlex.quote(x) for x in cmd]
-        )
-        return cmd, env_updates, preview
-
-    def _run_depth_upscale_placeholder(self) -> None:
-        if self._depth_thread and self._depth_thread.is_alive():
-            messagebox.showinfo("Depth Upscale", "Another depth task is already running.")
-            return
-        if self._verify_running:
-            messagebox.showinfo("Depth Upscale", "Stop verification before running ESRGAN.")
-            return
-        if not self._depth_upscale_enabled_in_manual():
-            messagebox.showinfo(
-                "Depth Upscale",
-                (
-                    "RealESRGAN is available only in Manual mode when "
-                    "`Use RealESRGAN Upscale` is enabled."
-                ),
-            )
-            return
-        try:
-            cmd, env_updates, _preview = self._build_depth_upscale_payload()
-        except Exception as exc:
-            messagebox.showerror("Depth Upscale", f"Invalid ESRGAN options:\n{exc}")
-            return
-
-        script_path = Path(cmd[1]).resolve() if len(cmd) > 1 else Path("").resolve()
-        if not script_path.is_file():
-            messagebox.showerror("Depth Upscale", f"RealESRGAN script not found:\n{script_path}")
-            return
-
-        input_dir = self.depth_output_var.get().strip()
-        output_dir = self.depth_upscaled_var.get().strip()
-        if not input_dir or not os.path.isdir(input_dir):
-            messagebox.showerror("Depth Upscale", f"Depth output folder not found:\n{input_dir or '(empty)'}")
-            return
-        if not output_dir:
-            messagebox.showerror("Depth Upscale", "Upscaled output folder is required.")
-            return
-        os.makedirs(output_dir, exist_ok=True)
-
-        runtime_mode = env_updates.get("REALESRGAN_RUNTIME", "local").strip().lower()
-        runtime_bin = env_updates.get("REALESRGAN_BIN", "").strip()
-        if runtime_mode == "bundled":
-            if not runtime_bin or not Path(runtime_bin).is_file():
-                messagebox.showerror(
-                    "Depth Upscale",
-                    f"Bundled RealESRGAN binary not found:\n{runtime_bin or '(empty)'}",
-                )
-                return
-            model_dir = env_updates.get("REALESRGAN_MODEL_DIR", "").strip()
-            if not model_dir or not Path(model_dir).is_dir():
-                messagebox.showerror(
-                    "Depth Upscale",
-                    f"Bundled RealESRGAN model dir not found:\n{model_dir or '(empty)'}",
-                )
-                return
-            model_name = str(cmd[5]).strip() if len(cmd) > 5 else ""
-            scale_choice, _scale, _model = self._selected_depth_realesrgan_profile()
-            if not self._realesrgan_model_files_exist(model_dir, model_name):
-                if scale_choice == "4x":
-                    messagebox.showerror(
-                        "Depth Upscale",
-                        (
-                            "Bundled RealESRGAN 4x model is not available in this repo.\n\n"
-                            "The 4x model is usually omitted because it is too large and must be "
-                            "downloaded manually.\n\n"
-                            f"Missing model: {model_name}\n"
-                            f"Model dir: {model_dir}\n\n"
-                            f"Download it from:\n{self.REALESRGAN_RELEASES_URL}"
-                        ),
-                    )
-                else:
-                    messagebox.showerror(
-                        "Depth Upscale",
-                        (
-                            "Bundled RealESRGAN model not found.\n\n"
-                            f"Missing model: {model_name}\n"
-                            f"Model dir: {model_dir}"
-                        ),
-                    )
-                return
-        else:
-            if runtime_bin:
-                if not Path(runtime_bin).is_file():
-                    messagebox.showerror(
-                        "Depth Upscale",
-                        f"Local RealESRGAN binary not found:\n{runtime_bin}",
-                    )
-                    return
-            else:
-                resolved_local = self._resolve_local_realesrgan_bin()
-                if not resolved_local:
-                    messagebox.showerror(
-                        "Depth Upscale",
-                        (
-                            "Local RealESRGAN runtime not found.\n\n"
-                            "Searched PATH and current venv bin.\n"
-                            "Install `realesrgan-ncnn-vulkan` or switch to Bundled runtime."
-                        ),
-                    )
-                    return
-                env_updates["REALESRGAN_BIN"] = resolved_local
-                local_models = self._resolve_realesrgan_model_dir(resolved_local)
-                if local_models:
-                    env_updates["REALESRGAN_MODEL_DIR"] = local_models
-
-        self._depth_stop_requested = False
-        self._depth_stop_clicks = 0
-        self.depth_status_var.set("Running ESRGAN upscale...")
-        self.depth_progress_var.set(0.0)
-        self._set_depth_running(True)
-        if not self._pipeline_test_active:
-            self._pipeline_invalidate_from("depth_upscale")
-        self._append_depth_log("=== ESRGAN upscale started ===")
-        self._append_depth_log("CMD: " + " ".join(shlex.quote(x) for x in cmd))
-        if env_updates:
-            self._append_depth_log(
-                "ENV: " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
-            )
-        self._depth_thread = threading.Thread(
-            target=self._run_depth_upscale_worker,
-            args=(cmd, env_updates),
-            daemon=True,
-        )
-        self._depth_thread.start()
-
-    def _run_depth_upscale_worker(self, cmd: list[str], env_updates: dict[str, str]) -> None:
-        proc = None
-        step_success = False
-        try:
-            env = os.environ.copy()
-            env.update({k: str(v) for k, v in env_updates.items()})
-            preexec = os.setsid if hasattr(os, "setsid") else None
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-                env=env,
-                preexec_fn=preexec,
-            )
-            self._depth_process = proc
-            assert proc.stdout is not None
-            for raw_line in proc.stdout:
-                line = raw_line.rstrip("\n")
-                if line:
-                    self._log_queue.put(("depth_line", f"[ESRGAN] {line}"))
-                    if line.startswith("[DONE]"):
-                        self._log_queue.put(("depth_progress", "100"))
-                if self._depth_stop_requested:
-                    break
-            rc = proc.wait()
-            if self._depth_stop_requested:
-                self._log_queue.put(("depth_status", "ESRGAN stopped by user"))
-            elif rc == 0:
-                step_success = True
-                self._log_queue.put(("depth_status", "Upscale completed"))
-                self._log_queue.put(("depth_progress", "100"))
-            else:
-                self._log_queue.put(("depth_status", f"Upscale failed (exit {rc})"))
-        except Exception as exc:
-            self._log_queue.put(("depth_line", f"[ESRGAN][ERROR] {exc}"))
-            self._log_queue.put(("depth_status", "Upscale failed"))
-        finally:
-            self._depth_process = None
-            if proc and proc.stdout:
-                try:
-                    proc.stdout.close()
-                except Exception:
-                    pass
-            self._log_queue.put(("depth_done", {"step": "depth_upscale", "success": step_success}))
 
     def _stop_depth_placeholder(self, prompt_user: bool = True) -> None:
         running = bool(self._depth_thread and self._depth_thread.is_alive())
@@ -13237,292 +12659,6 @@ class PipelineMasterGUI:
             )
             self._log_queue.put(("verify_done", "depth_deep"))
 
-    def _validate_depth_upscaled_verify_inputs(self) -> tuple[bool, str, str]:
-        if not self._depth_upscale_enabled_in_manual():
-            messagebox.showerror(
-                "Verify Upscale",
-                "Enable `Use RealESRGAN Upscale` in Manual mode before verifying the upscaled depth.",
-            )
-            return False, "", ""
-        upscaled_dir = self.depth_upscaled_var.get().strip()
-        ref_dir = self.depth_input_var.get().strip()
-        if not upscaled_dir:
-            messagebox.showerror("Verify Upscale", "Depth upscaled folder is required.")
-            return False, "", ""
-        if not os.path.isdir(upscaled_dir):
-            messagebox.showerror("Verify Upscale", f"Depth upscaled folder not found:\n{upscaled_dir}")
-            return False, "", ""
-        if not ref_dir:
-            messagebox.showerror("Verify Upscale", "Reference scenes folder is required.")
-            return False, "", ""
-        if not os.path.isdir(ref_dir):
-            messagebox.showerror("Verify Upscale", f"Reference scenes folder not found:\n{ref_dir}")
-            return False, "", ""
-        upscaled_dir = self._pipeline_prepare_verify_subset_dir(
-            upscaled_dir, "depth_upscaled_target", ["*.mp4"]
-        )
-        ref_dir = self._pipeline_prepare_verify_subset_dir(
-            ref_dir, "depth_upscaled_reference", ["*.mp4"]
-        )
-        return True, upscaled_dir, ref_dir
-
-    def _start_depth_upscaled_verify_quick(self) -> None:
-        if self._depth_thread and self._depth_thread.is_alive():
-            messagebox.showinfo("Verify Upscale", "Stop depth tasks before running verification.")
-            return
-        if self._verify_running:
-            messagebox.showinfo("Verify Upscale", "Another verification is already running.")
-            return
-        ok, upscaled_dir, ref_dir = self._validate_depth_upscaled_verify_inputs()
-        if not ok:
-            return
-        if shutil.which("ffprobe") is None:
-            messagebox.showerror("Verify Upscale", "ffprobe not found in PATH.")
-            return
-
-        self._set_verify_running(True, mode="depth_upscaled_quick")
-        self.depth_status_var.set("Verify Upscale (Quick) running...")
-        self._append_depth_log("=== Verify Upscale (Quick) started ===")
-        self._verify_thread = threading.Thread(
-            target=self._run_depth_upscaled_verify_quick_worker,
-            args=(upscaled_dir, ref_dir),
-            daemon=True,
-        )
-        self._verify_thread.start()
-
-    def _run_depth_upscaled_verify_quick_worker(self, upscaled_dir: str, ref_dir: str) -> None:
-        try:
-            upscaled_files = sorted([str(p) for p in Path(upscaled_dir).glob("*.mp4") if p.is_file()])
-            ref_files = sorted([str(p) for p in Path(ref_dir).glob("*.mp4") if p.is_file()])
-            if not upscaled_files:
-                self._log_queue.put(("depth_upscaled_verify_quick_result", {
-                    "ok": False,
-                    "message": "No .mp4 files found in depth upscaled folder.",
-                    "broken_upscaled": [],
-                    "broken_reference": [],
-                }))
-                return
-            if not ref_files:
-                self._log_queue.put(("depth_upscaled_verify_quick_result", {
-                    "ok": False,
-                    "message": "No .mp4 files found in reference seg folder.",
-                    "broken_upscaled": [],
-                    "broken_reference": [],
-                }))
-                return
-
-            max_workers = self._get_verify_scenes_workers()
-            self._log_queue.put(
-                ("depth_line", f"[UPSCALE-QUICK] checking upscaled files={len(upscaled_files)} and reference files={len(ref_files)} with {max_workers} workers")
-            )
-            upscaled_stats = self._quick_verify_probe_group(
-                upscaled_files,
-                max_workers,
-                "depth_line",
-                "upscaled",
-                "[UPSCALE-QUICK]",
-            )
-            ref_stats = self._quick_verify_probe_group(
-                ref_files,
-                max_workers,
-                "depth_line",
-                "reference",
-                "[UPSCALE-QUICK]",
-            )
-
-            pair_stats = self._quick_verify_collect_packet_mismatch_targets(
-                upscaled_files,
-                ref_files,
-                upscaled_stats.get("meta_by_path", {}),
-                ref_stats.get("meta_by_path", {}),
-                frame_tol=1,
-            )
-            packet_mismatch_upscaled = pair_stats.get("mismatch_targets") or []
-            unmatched_upscaled = pair_stats.get("unmatched_targets") or []
-            missing_reference = pair_stats.get("missing_reference") or []
-            broken_upscaled = sorted(
-                set((upscaled_stats.get("broken") or []) + packet_mismatch_upscaled)
-            )
-
-            self._log_queue.put(
-                (
-                    "depth_line",
-                    (
-                        "[UPSCALE-QUICK] packet pair check: "
-                        f"compared={int(pair_stats.get('pairs_compared', 0))}, "
-                        f"n.d.={int(pair_stats.get('pairs_packet_nd', 0))}, "
-                        f"mismatch={len(packet_mismatch_upscaled)}, "
-                        f"unmatched_upscaled={len(unmatched_upscaled)}, "
-                        f"missing_reference={len(missing_reference)}"
-                    ),
-                )
-            )
-
-            count_ok = len(upscaled_files) == len(ref_files)
-            count_msg = f"upscaled={len(upscaled_files)} vs reference={len(ref_files)}"
-
-            duration_ok = False
-            duration_msg = "n.d."
-            if upscaled_stats["duration_available"] and ref_stats["duration_available"]:
-                dd = abs(float(upscaled_stats["total_duration"]) - float(ref_stats["total_duration"]))
-                duration_ok = dd <= 0.35
-                duration_msg = (
-                    f"upscaled={float(upscaled_stats['total_duration']):.3f}s vs "
-                    f"reference={float(ref_stats['total_duration']):.3f}s (delta={dd:.3f}s)"
-                )
-
-            frames_ok = False
-            frames_msg = "n.d."
-            if upscaled_stats["frames_available"] and ref_stats["frames_available"]:
-                df = abs(int(upscaled_stats["total_frames"]) - int(ref_stats["total_frames"]))
-                frames_ok = df <= 1
-                frames_msg = (
-                    f"upscaled={int(upscaled_stats['total_frames'])} vs "
-                    f"reference={int(ref_stats['total_frames'])} (delta={df})"
-                )
-
-            self._log_queue.put(("depth_line", f"[UPSCALE-QUICK] file count check: {count_msg}"))
-            self._log_queue.put(("depth_line", f"[UPSCALE-QUICK] duration check: {duration_msg}"))
-            self._log_queue.put(("depth_line", f"[UPSCALE-QUICK] packet check: {frames_msg}"))
-
-            ok_final = (
-                not broken_upscaled
-                and not ref_stats["broken"]
-                and count_ok
-                and not unmatched_upscaled
-                and not missing_reference
-                and (frames_ok or frames_msg == "n.d.")
-            )
-            message = (
-                f"Upscale quick verify completed.\n"
-                f"Broken upscaled files: {len(upscaled_stats['broken'])}\n"
-                f"Packet mismatch upscaled files: {len(packet_mismatch_upscaled)}\n"
-                f"Unmatched upscaled files: {len(unmatched_upscaled)}\n"
-                f"Missing reference files: {len(missing_reference)}\n"
-                f"Broken reference files: {len(ref_stats['broken'])}\n"
-                f"File count match: {'YES' if count_ok else 'NO'} ({count_msg})\n"
-                f"Duration match (informational only): {'YES' if duration_ok else ('N.D.' if duration_msg == 'n.d.' else 'NO')}\n"
-                f"Duration details: {duration_msg}\n"
-                f"Packet match (quick): {'YES' if frames_ok else ('N.D.' if frames_msg == 'n.d.' else 'NO')}\n"
-                f"Packet details: {frames_msg}"
-            )
-            self._log_queue.put(
-                (
-                    "depth_upscaled_verify_quick_result",
-                    {
-                        "ok": ok_final,
-                        "message": message,
-                        "broken_upscaled": broken_upscaled,
-                        "broken_reference": ref_stats["broken"],
-                    },
-                )
-            )
-        except Exception as e:
-            self._log_queue.put(("depth_upscaled_verify_quick_result", {
-                "ok": False,
-                "message": f"Upscale quick verify failed: {type(e).__name__}: {e}",
-                "broken_upscaled": [],
-                "broken_reference": [],
-            }))
-        finally:
-            self._log_queue.put(("verify_done", "depth_upscaled_quick"))
-
-    def _start_depth_upscaled_verify_deep(self) -> None:
-        if self._depth_thread and self._depth_thread.is_alive():
-            messagebox.showinfo("Verify Upscale", "Stop depth tasks before running verification.")
-            return
-        if self._verify_running:
-            messagebox.showinfo("Verify Upscale", "Another verification is already running.")
-            return
-        ok, upscaled_dir, ref_dir = self._validate_depth_upscaled_verify_inputs()
-        if not ok:
-            return
-
-        script_path = Path("Utilities/verifyscenes.py").resolve()
-        if not script_path.is_file():
-            messagebox.showerror("Verify Upscale", f"Script not found:\n{script_path}")
-            return
-
-        workers = self._get_verify_scenes_workers()
-        cmd = [
-            sys.executable,
-            str(script_path),
-            str(Path(upscaled_dir).resolve()),
-            str(Path(ref_dir).resolve()),
-            "--extensions",
-            ".mp4",
-            "--workers",
-            str(workers),
-            "--probe-timeout-sec",
-            str(self.VERIFY_DEEP_FFPROBE_TIMEOUT_SEC),
-            "--probe-timeout-retries",
-            str(self.VERIFY_DEEP_FFPROBE_TIMEOUT_RETRIES),
-            "--delete",
-            "yes",
-            "--no-single-line-progress",
-        ]
-
-        self._set_verify_running(True, mode="depth_upscaled_deep")
-        self.depth_status_var.set("Verify Upscale (Deep) running...")
-        self._append_depth_log("=== Verify Upscale (Deep) started ===")
-        self._append_depth_log("CMD: " + " ".join(shlex.quote(x) for x in cmd))
-
-        self._verify_thread = threading.Thread(
-            target=self._run_depth_upscaled_verify_deep_worker,
-            args=(cmd, str(Path(upscaled_dir).resolve())),
-            daemon=True,
-        )
-        self._verify_thread.start()
-
-    def _run_depth_upscaled_verify_deep_worker(self, cmd: list[str], upscaled_dir: str) -> None:
-        rc = 1
-        bad_files: list[str] = []
-        seen_bad: set[str] = set()
-        try:
-            if self._verify_stop_requested:
-                raise VerifyStopRequested()
-            proc = self._verify_popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
-            assert proc.stdout is not None
-            try:
-                for raw in proc.stdout:
-                    if self._verify_stop_requested:
-                        raise VerifyStopRequested()
-                    line = raw.rstrip("\n")
-                    if line:
-                        self._log_queue.put(("depth_line", f"[UPSCALE-DEEP] {line}"))
-                        bad_path = self._resolve_verifyscenes_bad_path(line, upscaled_dir)
-                        if bad_path and bad_path not in seen_bad:
-                            seen_bad.add(bad_path)
-                            bad_files.append(bad_path)
-                rc = proc.wait()
-            finally:
-                self._unregister_verify_process(proc)
-        except VerifyStopRequested:
-            rc = 1
-        except Exception as e:
-            self._log_queue.put(("depth_line", f"[UPSCALE-DEEP][ERROR] {type(e).__name__}: {e}"))
-            rc = 1
-        finally:
-            self._log_queue.put(
-                (
-                    "depth_upscaled_verify_deep_result",
-                    {
-                        "rc": rc,
-                        "stopped": bool(self._verify_stop_requested),
-                        "upscaled_dir": upscaled_dir,
-                        "bad_files": bad_files,
-                    },
-                )
-            )
-            self._log_queue.put(("verify_done", "depth_upscaled_deep"))
-
     def _browse_scene_input(self) -> None:
         start_dir = os.path.dirname(self.scene_input_var.get().strip()) or "."
         selected = filedialog.askopenfilename(
@@ -13559,10 +12695,8 @@ class PipelineMasterGUI:
         self.scene_output_var.set(os.path.normpath(scene_out))
         depth_in = os.path.join(work_dir, self.STANDARD_SUBDIRS["scenes"])
         depth_out = os.path.join(work_dir, self.STANDARD_SUBDIRS["depth"])
-        depth_upscaled = os.path.join(depth_out, "upscaled")
         self.depth_input_var.set(os.path.normpath(depth_in))
         self.depth_output_var.set(os.path.normpath(depth_out))
-        self.depth_upscaled_var.set(os.path.normpath(depth_upscaled))
         self.splat_input_clips_var.set(os.path.normpath(scene_out))
         self._sync_depth_to_splat_input_path()
         self.splat_output_var.set(
@@ -14293,11 +13427,6 @@ class PipelineMasterGUI:
         return [
             ("scene_verify_quick_btn", "Verify Scenes", self._start_verify_quick),
             ("depth_verify_quick_btn", "Verify Depth", self._start_depth_verify_quick),
-            (
-                "depth_upscaled_verify_quick_btn",
-                "Verify Upscale",
-                self._start_depth_upscaled_verify_quick,
-            ),
             ("splat_verify_quick_btn", "Verify Scenes", self._start_splat_verify_quick),
             ("inpaint_verify_quick_btn", "Verify Scenes", self._start_inpaint_verify_quick),
             ("inpaint_sharpen_verify_quick_btn", "Verify Sharpen", self._start_inpaint_sharpen_verify_quick),
@@ -14316,7 +13445,6 @@ class PipelineMasterGUI:
         return {
             "quick": "scene_verify_quick_btn",
             "depth_quick": "depth_verify_quick_btn",
-            "depth_upscaled_quick": "depth_upscaled_verify_quick_btn",
             "splat_quick": "splat_verify_quick_btn",
             "inpaint_quick": "inpaint_verify_quick_btn",
             "sharpen_quick": "inpaint_sharpen_verify_quick_btn",
@@ -14435,8 +13563,6 @@ class PipelineMasterGUI:
         cur = str(mode or self._verify_mode or "").strip().lower()
         if cur == "quick":
             return self.scene_status_var, self._append_scene_log, "Verify Scenes"
-        if cur.startswith("depth_upscaled"):
-            return self.depth_status_var, self._append_depth_log, "Verify Upscale"
         if cur.startswith("depth_"):
             return self.depth_status_var, self._append_depth_log, "Verify Depth"
         if cur.startswith("splat_"):
@@ -14462,8 +13588,6 @@ class PipelineMasterGUI:
             "verify_deep_result",
             "depth_verify_quick_result",
             "depth_verify_deep_result",
-            "depth_upscaled_verify_quick_result",
-            "depth_upscaled_verify_deep_result",
             "splat_verify_quick_result",
             "splat_verify_deep_result",
             "inpaint_verify_quick_result",
@@ -14485,14 +13609,6 @@ class PipelineMasterGUI:
             "verify_deep_result": (self.scene_status_var, "Verify Scenes (Deep) stopped"),
             "depth_verify_quick_result": (self.depth_status_var, "Verify Depth (Quick) stopped"),
             "depth_verify_deep_result": (self.depth_status_var, "Verify Depth (Deep) stopped"),
-            "depth_upscaled_verify_quick_result": (
-                self.depth_status_var,
-                "Verify Upscale (Quick) stopped",
-            ),
-            "depth_upscaled_verify_deep_result": (
-                self.depth_status_var,
-                "Verify Upscale (Deep) stopped",
-            ),
             "splat_verify_quick_result": (
                 self.splat_status_var,
                 "Verify Splatting (Quick) stopped",
@@ -16429,15 +15545,14 @@ class PipelineMasterGUI:
                         step_name = "depthcrafter"
                         success = "completed" in status_txt
                     self._set_depth_running(False)
-                    if step_name in {"depthcrafter", "depth_upscale"}:
+                    if step_name == "depthcrafter":
                         self._pipeline_on_run_finished(step_name, success)
                     else:
                         self._pipeline_on_run_finished("depthcrafter", "completed" in status_txt)
                         step_name = "depthcrafter"
                     if stop_requested:
-                        stop_label = "Depth Upscale" if step_name == "depth_upscale" else "DepthCrafter"
-                        self._append_depth_log(f"[STOP] {stop_label} stopped.")
-                        self._finalize_pipeline_stop(stop_label)
+                        self._append_depth_log("[STOP] DepthCrafter stopped.")
+                        self._finalize_pipeline_stop("DepthCrafter")
                 elif kind == "splat_done":
                     stop_requested = bool(self._splat_stop_requested)
                     self._set_splat_running(False)
@@ -16775,79 +15890,6 @@ class PipelineMasterGUI:
                             ),
                         )
                     self._pipeline_on_verify_finished("depthcrafter", rc == 0, "deep")
-                elif kind == "depth_upscaled_verify_quick_result" and isinstance(payload, dict):
-                    ok = bool(payload.get("ok", False))
-                    msg = str(payload.get("message", "Upscale quick verification finished."))
-                    broken_upscaled = [
-                        str(p) for p in (payload.get("broken_upscaled") or []) if str(p).strip()
-                    ]
-                    broken_reference = [
-                        str(p) for p in (payload.get("broken_reference") or []) if str(p).strip()
-                    ]
-                    if ok:
-                        self.depth_status_var.set("Verify Upscale (Quick) completed")
-                        messagebox.showinfo("Verify Upscale (Quick)", msg)
-                    else:
-                        self.depth_status_var.set("Verify Upscale (Quick) failed")
-                        deleted = 0
-                        cleanup_err = 0
-                        cleanup_skipped = False
-                        cleanup_total = 0
-                        if broken_upscaled:
-                            deleted, cleanup_err, cleanup_skipped, cleanup_total = (
-                                self._cleanup_broken_files_with_confirmation(
-                                    broken_upscaled,
-                                    self._append_depth_log,
-                                    "depth upscaled",
-                                    "Verify Upscale (Quick)",
-                                )
-                            )
-                        if cleanup_skipped:
-                            msg = (
-                                f"{msg}\n\n"
-                                f"Cleanup skipped by user: {cleanup_total} file(s) flagged for deletion."
-                            )
-                        elif deleted or cleanup_err:
-                            msg = (
-                                f"{msg}\n\n"
-                                f"Auto-cleanup: deleted {deleted} broken file(s), "
-                                f"errors={cleanup_err}."
-                            )
-                        if broken_upscaled:
-                            msg += self._format_corrupted_files_block(
-                                broken_upscaled,
-                                "Corrupted upscaled files",
-                            )
-                        if broken_reference:
-                            msg += self._format_corrupted_files_block(
-                                broken_reference,
-                                "Corrupted reference files",
-                            )
-                        messagebox.showwarning("Verify Upscale (Quick)", msg)
-                    self._pipeline_on_verify_finished("depth_upscale", ok, "quick")
-                elif kind == "depth_upscaled_verify_deep_result" and isinstance(payload, dict):
-                    rc = int(payload.get("rc", 1))
-                    bad_files = [str(p) for p in (payload.get("bad_files") or []) if str(p).strip()]
-                    if rc == 0:
-                        self.depth_status_var.set("Verify Upscale (Deep) completed")
-                        messagebox.showinfo(
-                            "Verify Upscale (Deep)",
-                            "Deep verification completed successfully.",
-                        )
-                    else:
-                        self.depth_status_var.set(f"Verify Upscale (Deep) failed (exit {rc})")
-                        messagebox.showwarning(
-                            "Verify Upscale (Deep)",
-                            (
-                                "Deep verification failed.\n\n"
-                                "Broken files were auto-deleted by verifier where possible."
-                            )
-                            + self._format_corrupted_files_block(
-                                bad_files,
-                                "Corrupted upscaled files",
-                            ),
-                        )
-                    self._pipeline_on_verify_finished("depth_upscale", rc == 0, "deep")
                 elif kind == "splat_verify_quick_result" and isinstance(payload, dict):
                     ok = bool(payload.get("ok", False))
                     msg = str(payload.get("message", "Splat quick verification finished."))
@@ -17378,10 +16420,6 @@ class PipelineMasterGUI:
             "depth_res_x": self.depth_res_x_var.get().strip(),
             "depth_res_y": self.depth_res_y_var.get().strip(),
             "depth_codec": self.depth_codec_var.get().strip(),
-            "depth_realesrgan_source": self.depth_realesrgan_source_var.get().strip(),
-            "depth_use_realesrgan_upscale": bool(self.depth_use_realesrgan_upscale_var.get()),
-            "depth_realesrgan_scale": self.depth_realesrgan_scale_var.get().strip(),
-            "depth_realesrgan_workers": self.depth_realesrgan_workers_var.get().strip(),
             "splat_mode": self.splat_mode_var.get().strip(),
             "splat_batch_size": self.splat_batch_size_var.get().strip(),
             "splat_workers": self.splat_workers_var.get().strip(),
