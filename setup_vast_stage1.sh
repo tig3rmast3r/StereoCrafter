@@ -5,7 +5,7 @@ set -euo pipefail
 # - System deps
 # - Use current cloned repo
 # - Install Python deps WITHOUT torch stack
-# - Build/install Forward-Warp CUDA extension
+# - Optional Forward-Warp CUDA extension (disabled by default)
 
 SCRIPT_DIR="$(
   cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1
@@ -16,6 +16,7 @@ VENV_PATH="${VENV_PATH:-/venv/main}"
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
 MAX_JOBS="${MAX_JOBS:-8}"
 REQ_FILE_REL="requirements.docker.no_torch.txt"
+BUILD_FORWARD_WARP=false
 
 if [[ -x "${VENV_PATH}/bin/activate" ]]; then
   # shellcheck disable=SC1090
@@ -34,7 +35,16 @@ echo "[INFO] Installing system packages..."
 export DEBIAN_FRONTEND=noninteractive
 ${SUDO} apt-get update
 ${SUDO} apt-get install -y software-properties-common
-${SUDO} apt-get install -y git git-lfs ffmpeg build-essential cmake ninja-build pkg-config libgl1 libglib2.0-0
+runtime_packages=(git git-lfs ffmpeg libgl1 libglib2.0-0)
+build_packages=()
+if [[ "${BUILD_FORWARD_WARP}" == "true" ]]; then
+  build_packages=(build-essential cmake ninja-build pkg-config)
+fi
+${SUDO} apt-get install -y "${runtime_packages[@]}"
+if (( ${#build_packages[@]} > 0 )); then
+  echo "[INFO] Installing optional Forward-Warp build packages..."
+  ${SUDO} apt-get install -y "${build_packages[@]}"
+fi
 
 echo "[INFO] Using repository at: ${REPO_DIR}"
 if [[ ! -d "${REPO_DIR}/.git" ]]; then
@@ -88,33 +98,37 @@ PY
 echo "[INFO] Installing Python dependencies (no torch reinstall)..."
 python -m pip install -r "${REQ_FILE_REL}" -c /tmp/torch_stack_constraints.txt
 
-echo "[INFO] Building Forward-Warp CUDA extension..."
-export TORCH_CUDA_ARCH_LIST
-export MAX_JOBS
-export TORCH_LIB="$(
+if [[ "${BUILD_FORWARD_WARP}" == "true" ]]; then
+  echo "[INFO] Building Forward-Warp CUDA extension..."
+  export TORCH_CUDA_ARCH_LIST
+  export MAX_JOBS
+  export TORCH_LIB="$(
 python - <<'PY'
 import os
 import torch
 print(os.path.join(os.path.dirname(torch.__file__), "lib"))
 PY
 )"
-export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+  export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
 
-cd "${REPO_DIR}/dependency/Forward-Warp/Forward_Warp/cuda"
-python -m pip install -v --no-build-isolation .
-python - <<'PY'
+  cd "${REPO_DIR}/dependency/Forward-Warp/Forward_Warp/cuda"
+  python -m pip install -v --no-build-isolation .
+  python - <<'PY'
 import forward_warp_cuda as m
 print("[OK] forward_warp_cuda:", m.__file__)
 PY
 
-cd "${REPO_DIR}/dependency/Forward-Warp"
-python -m pip install -v --no-build-isolation --no-cache-dir .
+  cd "${REPO_DIR}/dependency/Forward-Warp"
+  python -m pip install -v --no-build-isolation --no-cache-dir .
 
-if ! grep -q '^source /venv/main/bin/activate$' "${HOME}/.bashrc" 2>/dev/null; then
-  echo 'source /venv/main/bin/activate' >> "${HOME}/.bashrc"
-fi
-if ! grep -q '/venv/main/lib/python3.10/site-packages/torch/lib' "${HOME}/.bashrc" 2>/dev/null; then
-  echo 'export LD_LIBRARY_PATH=/venv/main/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH:-}' >> "${HOME}/.bashrc"
+  if ! grep -q '^source /venv/main/bin/activate$' "${HOME}/.bashrc" 2>/dev/null; then
+    echo 'source /venv/main/bin/activate' >> "${HOME}/.bashrc"
+  fi
+  if ! grep -q '/venv/main/lib/python3.10/site-packages/torch/lib' "${HOME}/.bashrc" 2>/dev/null; then
+    echo 'export LD_LIBRARY_PATH=/venv/main/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH:-}' >> "${HOME}/.bashrc"
+  fi
+else
+  echo "[INFO] BUILD_FORWARD_WARP=false -> skipping optional Forward-Warp CUDA build."
 fi
 
 cd "${REPO_DIR}"

@@ -13,14 +13,192 @@ TARGET_TORCHAUDIO="2.9.1"
 TARGET_CUDA="12.8"
 TARGET_TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
 TARGET_MAX_JOBS="${MAX_JOBS:-8}"
+BUILD_FORWARD_WARP=false
+INSTALL_DISTRO_FFMPEG=1
+TORCH_LIB=""
+export BUILD_FORWARD_WARP
 
-if ! command -v uv >/dev/null 2>&1; then
-  echo "[ERR] uv not found. Install uv first: https://docs.astral.sh/uv/"
-  exit 1
-fi
+print_uv_install_suggestion() {
+  echo "[INFO] Suggested install:"
+  if command -v curl >/dev/null 2>&1; then
+    echo '       curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh'
+    echo '       export PATH="$HOME/.local/bin:$PATH"'
+  elif command -v wget >/dev/null 2>&1; then
+    echo '       wget -qO- https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh'
+    echo '       export PATH="$HOME/.local/bin:$PATH"'
+  else
+    echo '       curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh'
+    echo '       # or'
+    echo '       wget -qO- https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh'
+    echo '       export PATH="$HOME/.local/bin:$PATH"'
+  fi
+}
+
+is_wsl() {
+  grep -qiE '(microsoft|wsl)' /proc/version 2>/dev/null || grep -qiE '(microsoft|wsl)' /proc/sys/kernel/osrelease 2>/dev/null
+}
 
 run_py() {
   uv run python "$@"
+}
+
+resolve_realpath() {
+  local path="$1"
+  if command -v readlink >/dev/null 2>&1; then
+    readlink -f "$path" 2>/dev/null || printf '%s\n' "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+ffmpeg_version_line() {
+  local ffmpeg_bin="$1"
+  local line=""
+  line="$("$ffmpeg_bin" -version 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$line" ]]; then
+    printf '%s\n' "$line"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+ffmpeg_nvenc_status() {
+  local ffmpeg_bin="$1"
+  local encoders=""
+  local has_h264="0"
+  local has_hevc="0"
+  local encoder_label=""
+
+  encoders="$("$ffmpeg_bin" -hide_banner -encoders 2>/dev/null || true)"
+  if grep -q '\<h264_nvenc\>' <<< "$encoders"; then
+    has_h264="1"
+  fi
+  if grep -q '\<hevc_nvenc\>' <<< "$encoders"; then
+    has_hevc="1"
+  fi
+
+  if [[ "$has_h264" != "1" && "$has_hevc" != "1" ]]; then
+    printf 'not available\n'
+    return 0
+  fi
+
+  if [[ "$has_h264" == "1" && "$has_hevc" == "1" ]]; then
+    encoder_label="h264_nvenc, hevc_nvenc"
+  elif [[ "$has_h264" == "1" ]]; then
+    encoder_label="h264_nvenc"
+  else
+    encoder_label="hevc_nvenc"
+  fi
+
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    printf 'encoders present (%s); runtime not verified (nvidia-smi not found)\n' "$encoder_label"
+    return 0
+  fi
+
+  local smoke_encoder="h264_nvenc"
+  if [[ "$has_h264" != "1" && "$has_hevc" == "1" ]]; then
+    smoke_encoder="hevc_nvenc"
+  fi
+
+  if "$ffmpeg_bin" -hide_banner -loglevel error -f lavfi -i color=c=black:s=256x144:d=0.1 -frames:v 1 -c:v "$smoke_encoder" -f null - >/dev/null 2>&1; then
+    printf 'encoders present (%s); runtime ok (%s)\n' "$encoder_label" "$smoke_encoder"
+  else
+    printf 'encoders present (%s); runtime FAILED (%s)\n' "$encoder_label" "$smoke_encoder"
+  fi
+}
+
+discover_ffmpeg_candidates() {
+  FFMPEG_CANDIDATE_DISPLAYS=()
+  FFMPEG_CANDIDATE_REALS=()
+
+  local old_ifs="$IFS"
+  local dir=""
+  local candidate=""
+  local real=""
+  local seen="|"
+  IFS=':'
+  for dir in $PATH; do
+    [[ -n "$dir" ]] || dir="."
+    candidate="$dir/ffmpeg"
+    if [[ -x "$candidate" && ! -d "$candidate" ]]; then
+      real="$(resolve_realpath "$candidate")"
+      if [[ "$seen" != *"|${real}|"* ]]; then
+        seen="${seen}${real}|"
+        FFMPEG_CANDIDATE_DISPLAYS+=("$candidate")
+        FFMPEG_CANDIDATE_REALS+=("$real")
+      fi
+    fi
+  done
+  IFS="$old_ifs"
+}
+
+prompt_ffmpeg_policy_if_found() {
+  discover_ffmpeg_candidates
+
+  if (( ${#FFMPEG_CANDIDATE_REALS[@]} == 0 )); then
+    INSTALL_DISTRO_FFMPEG=1
+    echo "[INFO] No ffmpeg found in PATH."
+    echo "[INFO] Distro ffmpeg will be installed via apt if you keep the apt step enabled."
+    echo "[WARN] NVENC compatibility depends on the actual ffmpeg build provided by your distro/repo."
+    echo "[WARN] If you specifically need NVENC and the installed binary still lacks it, you may need to install or build an NVENC-capable ffmpeg manually."
+    return 0
+  fi
+
+  echo "[INFO] Found ffmpeg binaries in PATH:"
+  local idx=0
+  local display=""
+  local real=""
+  local version=""
+  local nvenc=""
+  local nvenc_capable_count=0
+  for idx in "${!FFMPEG_CANDIDATE_REALS[@]}"; do
+    display="${FFMPEG_CANDIDATE_DISPLAYS[$idx]}"
+    real="${FFMPEG_CANDIDATE_REALS[$idx]}"
+    version="$(ffmpeg_version_line "$display")"
+    nvenc="$(ffmpeg_nvenc_status "$display")"
+    echo "       [$((idx + 1))] path=${display}"
+    if [[ "$real" != "$display" ]]; then
+      echo "           real=${real}"
+    fi
+    echo "           version=${version}"
+    echo "           nvenc=${nvenc}"
+    if [[ "$nvenc" != "not available" ]]; then
+      nvenc_capable_count=$((nvenc_capable_count + 1))
+    fi
+  done
+
+  echo "[INFO] Active ffmpeg is the first match in PATH:"
+  echo "       ${FFMPEG_CANDIDATE_DISPLAYS[0]}"
+  echo "[INFO] If a custom ffmpeg comes before /usr/bin, 'apt install ffmpeg' may not change the binary actually used at runtime."
+  if (( nvenc_capable_count == 0 )); then
+    echo "[WARN] None of the ffmpeg binaries currently found in PATH report NVENC encoders."
+    echo "[WARN] Installing distro ffmpeg via apt may or may not add NVENC support, depending on the distro/repo build."
+    echo "[WARN] If you need NVENC and still do not get it, install or build an NVENC-capable ffmpeg manually."
+  fi
+
+  while true; do
+    read -r -p "ffmpeg already found. Use current PATH ffmpeg, install distro ffmpeg anyway, or stop installer? [U/i/s]: " FFMPEG_CHOICE
+    case "${FFMPEG_CHOICE:-U}" in
+      u|U|use|USE)
+        INSTALL_DISTRO_FFMPEG=0
+        echo "[INFO] Keeping the current PATH ffmpeg."
+        return 0
+        ;;
+      i|I|install|INSTALL)
+        INSTALL_DISTRO_FFMPEG=1
+        echo "[INFO] Distro ffmpeg will be installed via apt."
+        echo "[INFO] This does not guarantee NVENC support or that /usr/bin/ffmpeg becomes the active binary if another ffmpeg stays earlier in PATH."
+        return 0
+        ;;
+      s|S|stop|STOP)
+        echo "[INFO] Installer stopped by user."
+        exit 1
+        ;;
+      *)
+        echo "[WARN] Invalid choice. Use 'U', 'i', or 's'."
+        ;;
+    esac
+  done
 }
 
 install_system_packages_if_requested() {
@@ -39,7 +217,14 @@ install_system_packages_if_requested() {
     fi
   fi
 
-  read -r -p "Install required Linux build/runtime packages via apt? [Y/n]: " APT_CHOICE
+  prompt_ffmpeg_policy_if_found
+
+  local package_label="runtime"
+  if [[ "$BUILD_FORWARD_WARP" == "true" ]]; then
+    package_label="runtime/build"
+  fi
+
+  read -r -p "Install required Linux ${package_label} packages via apt? [Y/n]: " APT_CHOICE
   case "${APT_CHOICE}" in
     n|N|no|NO)
       echo "[INFO] Skipping apt package installation."
@@ -47,23 +232,51 @@ install_system_packages_if_requested() {
       ;;
   esac
 
-  echo "[STEP] Installing Linux packages required for Forward-Warp build and runtime..."
-  ${sudo_cmd} apt-get update
-  ${sudo_cmd} apt-get install -y \
-    software-properties-common \
-    git \
-    git-lfs \
-    ffmpeg \
-    mkvtoolnix \
-    build-essential \
-    cmake \
-    ninja-build \
-    pkg-config \
-    libgl1 \
+  local runtime_packages=(
+    software-properties-common
+    git
+    git-lfs
+    mkvtoolnix
+    libgl1
     libglib2.0-0
+  )
+  local build_packages=()
+
+  if [[ "$INSTALL_DISTRO_FFMPEG" == "1" ]]; then
+    runtime_packages+=(ffmpeg)
+  else
+    echo "[INFO] Skipping distro ffmpeg install and keeping PATH ffmpeg."
+  fi
+
+  if [[ "$BUILD_FORWARD_WARP" == "true" ]]; then
+    build_packages+=(build-essential cmake ninja-build pkg-config)
+  fi
+
+  echo "[STEP] Installing Linux packages required for the standard runtime..."
+  ${sudo_cmd} apt-get update
+  ${sudo_cmd} apt-get install -y "${runtime_packages[@]}"
+  if (( ${#build_packages[@]} > 0 )); then
+    echo "[STEP] Installing optional Forward-Warp build packages..."
+    ${sudo_cmd} apt-get install -y "${build_packages[@]}"
+  fi
 }
 
-echo "[INFO] Syncing project dependencies (no forced torch reinstall)..."
+if is_wsl; then
+  echo "[INFO] WSL detected."
+  if [[ "$BUILD_FORWARD_WARP" == "true" ]]; then
+    echo "[WARN] BUILD_FORWARD_WARP=true on WSL expects a WSL-safe CUDA toolkit setup."
+  else
+    echo "[INFO] Standard install will not touch Linux CUDA drivers/toolkit. The optional Forward-Warp build stays disabled."
+  fi
+fi
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "[ERR] uv not found."
+  print_uv_install_suggestion
+  exit 1
+fi
+
+echo "[INFO] Syncing project dependencies with uv (no forced torch reinstall)..."
 uv sync --inexact
 
 version_lt() {
@@ -92,7 +305,6 @@ install_recommended_torch() {
     "torchaudio==${TARGET_TORCHAUDIO}"
 }
 
-TORCH_LIB=""
 export_torch_lib_path() {
   TORCH_LIB="$(
     run_py - <<'PY'
@@ -114,7 +326,12 @@ PY
   fi
 }
 
-build_forward_warp_if_requested() {
+build_forward_warp_if_enabled() {
+  if [[ "$BUILD_FORWARD_WARP" != "true" ]]; then
+    echo "[INFO] BUILD_FORWARD_WARP=false -> skipping optional Forward-Warp CUDA build."
+    return 0
+  fi
+
   local cuda_dir="dependency/Forward-Warp/Forward_Warp/cuda"
   local fw_root="dependency/Forward-Warp"
   if [[ ! -d "${cuda_dir}" || ! -d "${fw_root}" ]]; then
@@ -122,14 +339,7 @@ build_forward_warp_if_requested() {
     return 0
   fi
 
-  read -r -p "Build Forward-Warp CUDA extension now? [Y/n]: " FW_CHOICE
-  case "${FW_CHOICE}" in
-    n|N|no|NO)
-      echo "[INFO] Skipping Forward-Warp build."
-      return 0
-      ;;
-  esac
-
+  export_torch_lib_path
   export TORCH_CUDA_ARCH_LIST="${TARGET_TORCH_CUDA_ARCH_LIST}"
   export MAX_JOBS="${TARGET_MAX_JOBS}"
   echo "[STEP] Building Forward-Warp with TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}, MAX_JOBS=${MAX_JOBS}..."
@@ -169,6 +379,7 @@ install_system_packages_if_requested
 TORCH_INFO="$(
   run_py - <<'PY'
 import importlib.metadata as md
+import os
 import re
 import shutil
 import subprocess
@@ -195,7 +406,7 @@ if torch_v:
         torch_cuda = ""
 
 nvcc_release = ""
-if shutil.which("nvcc"):
+if os.environ.get("BUILD_FORWARD_WARP", "").lower() == "true" and shutil.which("nvcc"):
     try:
         out = subprocess.check_output(["nvcc", "--version"], text=True, stderr=subprocess.STDOUT)
         m = re.search(r"release\s+([0-9]+\.[0-9]+)", out)
@@ -246,7 +457,9 @@ echo "       torch=${TORCH_VER:-n.d.}"
 echo "       torchvision=${TORCHVISION_VER:-n.d.}"
 echo "       torchaudio=${TORCHAUDIO_VER:-n.d.}"
 echo "       torch cuda=${TORCH_CUDA:-n.d.}"
-echo "       nvcc release=${NVCC_RELEASE:-n.d.}"
+if [[ "$BUILD_FORWARD_WARP" == "true" ]]; then
+  echo "       nvcc release=${NVCC_RELEASE:-n.d.}"
+fi
 echo "       target torch=${TARGET_TORCH} torchvision=${TARGET_TORCHVISION} torchaudio=${TARGET_TORCHAUDIO} cuda=${TARGET_CUDA}"
 echo
 
@@ -293,13 +506,12 @@ else
   fi
 fi
 
-export_torch_lib_path
-build_forward_warp_if_requested
+build_forward_warp_if_enabled
 
 echo
 echo "[DONE] Linux setup completed."
 echo "[NEXT] Close and reopen your terminal, then reactivate your preferred Python environment."
-if [[ -n "${TORCH_LIB}" && -d "${TORCH_LIB}" ]]; then
+if [[ "$BUILD_FORWARD_WARP" == "true" && -n "${TORCH_LIB}" && -d "${TORCH_LIB}" ]]; then
   echo "[INFO] If needed, persist this line in your shell rc (~/.bashrc or ~/.zshrc):"
   echo "       export LD_LIBRARY_PATH=\"${TORCH_LIB}:\${LD_LIBRARY_PATH:-}\""
 fi

@@ -1,6 +1,6 @@
-# Linux Install (Fork)
+# Linux/WSL Install (Fork)
 
-Linux only for this fork. Windows may still work, but it is not supported here.<br>
+Linux and WSL only for this fork atm. Windows partially works (only gui-nogui versions without sh batches, pipeline_master_gui not working as is tied to sh runners), and is not supported here.<br>
 <br>
 Preset values in this fork are tuned for this reference machine: Intel 265K, 48 GB RAM, RTX 4090. On different hardware, expect to adjust settings.
 
@@ -27,15 +27,16 @@ Run:
 ```
 
 This script will:
-- optionally install Linux system packages needed for runtime and Forward-Warp build (`apt`);
-  includes `ffmpeg` and `mkvtoolnix`;
+- require `uv` as a prerequisite; if missing, it stops and prints a suggested install command instead of auto-installing it;
+- optionally install Linux system packages needed for the standard runtime (`apt`);
+- detect `ffmpeg` binaries already found in `PATH`, show path/version/NVENC status, and ask whether to keep the current one, install distro `ffmpeg` anyway, or stop;
 - sync project dependencies with `uv` without forcing a torch reinstall;
 - check current torch/cuda in the project environment;
 - if missing, install the recommended stack automatically;
 - if different, ask whether you want to align to the recommended stack;
 - warn when older stacks (especially CUDA 11.8) are detected because they are usually slower;
-- export `LD_LIBRARY_PATH` for the current shell using the detected torch lib directory;
-- optionally build Forward-Warp CUDA extension and print the detected `.so` path.
+- skip the optional Forward-Warp CUDA build by default (`BUILD_FORWARD_WARP=false`);
+- show an informational WSL note without installing Linux CUDA drivers/toolkit in the standard flow.
 
 Recommended target stack for this fork:
 - `torch==2.9.1`
@@ -60,6 +61,7 @@ find ./Utilities -type f -name "*.sh" -print0 | xargs -0 chmod +x
 
 Notes:
 - Stage 1 installs system deps, validates preinstalled torch stack, and installs Python deps from `requirements.docker.no_torch.txt`.
+- The standard Vast flow now skips the optional Forward-Warp CUDA build (`BUILD_FORWARD_WARP=false`).
 - Stage 2 downloads model weights from Hugging Face.
 
 ## 4) Launch Pipeline GUI
