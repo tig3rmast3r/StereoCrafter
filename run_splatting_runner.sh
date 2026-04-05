@@ -6,7 +6,6 @@ set -euo pipefail
 # --------------------------------------------
 PYTHON="${PYTHON:-python3}"
 RUNNER="${RUNNER:-batch_splatting_runner.py}"
-GUI_SCRIPT="${GUI_SCRIPT:-splatting_gui.py}"
 
 INPUT_SOURCE_CLIPS="${INPUT_SOURCE_CLIPS:-./work/seg/}"
 INPUT_DEPTH_MAPS="${INPUT_DEPTH_MAPS:-./work/depthmap/}"
@@ -65,7 +64,6 @@ CURRENT_PID=""
 
 CMD=(
   "$PYTHON" "$RUNNER"
-  --gui_script "$GUI_SCRIPT"
   --input_source_clips "$INPUT_SOURCE_CLIPS"
   --input_depth_maps "$INPUT_DEPTH_MAPS"
   --output_splatted "$OUTPUT_SPLATTED"
@@ -202,11 +200,7 @@ run_once() {
     return 0
   fi
 
-  if [[ -z "${DISPLAY:-}" ]] && command -v xvfb-run >/dev/null 2>&1; then
-    (trap '' INT TERM; xvfb-run -a "${CMD[@]}") &
-  else
-    (trap '' INT TERM; "${CMD[@]}") &
-  fi
+  (trap '' INT TERM; "${CMD[@]}") &
 
   CURRENT_PID="$!"
   wait_for_pid "$CURRENT_PID"

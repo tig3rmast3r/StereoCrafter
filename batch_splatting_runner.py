@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Headless-ish batch runner for Stereocrafter Splatting GUI (splatting_gui.py).
+Headless batch runner for StereoCrafter splatting.
 
-- Keeps SplatterGUI logic (sidecars, task loop, encoding) but runs without mainloop.
-- Disables move-to-finished by default (can be changed in HARD-CODED SETTINGS below).
-- Adds SKIP/retry behavior by monkey-patching BatchProcessor/RenderProcessor.
+- Uses the modular `core.splatting` batch/render pipeline directly.
+- Avoids instantiating `SplatterGUI`, so no Tk/display is required.
+- Keeps the existing skip/retry/progress behavior used by Pipeline Master.
 
 Usage:
   python3 batch_splatting_runner.py
@@ -20,9 +20,13 @@ import csv
 import logging
 import queue
 import threading
+from types import MethodType
 import numpy as np
 import re
 from pathlib import Path
+
+from dependency.stereocrafter_util import set_util_logger_level
+from core.splatting.batch_processing import BatchProcessor, ProcessingSettings
 
 
 def _normalize_output_root(p: Path) -> Path:
@@ -37,7 +41,7 @@ def _normalize_output_root(p: Path) -> Path:
 # -------------------------
 # HARD-CODED SETTINGS
 # -------------------------
-SPLAT_GUI_PY = "./splatting_gui.py"  # path to your splatting GUI script
+SPLAT_GUI_PY = "./splatting_gui.py"  # legacy compatibility arg, ignored by the headless runner
 
 INPUT_SOURCE_CLIPS = "./work/seg/"
 INPUT_DEPTH_MAPS   = "./work/depthmap/"
@@ -160,8 +164,12 @@ def _normalize_auto_convergence_mode(value: str) -> str:
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="Batch runner for splatting_gui.py (Tk-based; use xvfb-run if headless).")
-    p.add_argument("--gui_script", default=SPLAT_GUI_PY, help="Path to GUI script (splatting_gui.py).")
+    p = argparse.ArgumentParser(description="Headless batch runner for the core splatting pipeline.")
+    p.add_argument(
+        "--gui_script",
+        default=SPLAT_GUI_PY,
+        help="Deprecated compatibility arg. Ignored by the headless runner.",
+    )
     p.add_argument("--input_source_clips", default=INPUT_SOURCE_CLIPS, help="Folder with source clip segments.")
     p.add_argument("--input_depth_maps", default=INPUT_DEPTH_MAPS, help="Folder with depth map videos.")
     p.add_argument("--output_splatted", default=OUTPUT_SPLATTED, help="Output folder root for splatted videos.")
@@ -244,9 +252,9 @@ def _parse_args():
     )
     p.add_argument(
         "--sidecar-policy",
-        default=SIDECAR_POLICY,
+        default="keep",
         choices=["keep", "warn", "prompt-delete", "delete-all"],
-        help="How to handle existing sidecar files before processing.",
+        help="Deprecated compatibility arg. Ignored by the headless runner.",
     )
     p.add_argument(
         "--auto-convergence-csv",
@@ -260,16 +268,6 @@ def _parse_args():
         help="How CSV convergence should interact with sidecar anchors.",
     )
     return p.parse_args()
-
-def _import_module_from_path(py_path: Path):
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(py_path.stem, str(py_path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot import: {py_path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore
-    return mod
-
 
 def _normalize_output_layout(value, fallback_dual: bool = False) -> str:
     raw = str(value or "").strip().lower().replace("-", " ").replace("_", " ")
@@ -496,6 +494,13 @@ def _handle_sidecar_policy(sidecar_folder: str, sidecar_ext: str, policy: str) -
     print(f"[INFO] Deleted {deleted}/{len(sidecars)} sidecar file(s).")
 
 
+def _default_sidecar_folder(input_depth_maps: str) -> str:
+    path = Path(input_depth_maps).resolve()
+    if path.is_dir():
+        return str(path)
+    return str(path.parent)
+
+
 def main():
     args = _parse_args()
     log_level = logging.DEBUG if bool(args.log_verbose) else logging.INFO
@@ -513,7 +518,6 @@ def main():
     global SPLAT_STAIR_SMOOTH_ENABLED, SPLAT_BLUR_KERNEL, SPLAT_STAIR_EDGE_X_OFFSET, SPLAT_STAIR_STRIP_PX, SPLAT_STAIR_STRENGTH
     global REPLACE_MASK_ENABLED, REPLACE_MASK_SCALE, REPLACE_MASK_MIN_PX, REPLACE_MASK_MAX_PX, REPLACE_MASK_GAP_TOL, REPLACE_MASK_DRAW_EDGE, REPLACE_MASK_CODEC
     global FFMPEG_CODEC, ENCODER_MODE, FFMPEG_EXTRA_ARGS, STOP_MARKER
-    SPLAT_GUI_PY = args.gui_script
     INPUT_SOURCE_CLIPS = args.input_source_clips
     INPUT_DEPTH_MAPS = args.input_depth_maps
     OUTPUT_SPLATTED = args.output_splatted
@@ -560,64 +564,10 @@ def main():
             f"mode={ENCODER_MODE or 'default'} "
             f"extra={'set' if FFMPEG_EXTRA_ARGS else 'none'}"
         )
-    gui_path = Path(SPLAT_GUI_PY).resolve()
-    if not gui_path.exists():
-        raise FileNotFoundError(f"Cannot find splatting_gui.py at: {gui_path}")
-
-    mod = _import_module_from_path(gui_path)
     try:
-        if hasattr(mod, "set_util_logger_level"):
-            mod.set_util_logger_level(log_level)
+        set_util_logger_level(log_level)
     except Exception as ex:
         print(f"[WARN] failed applying util logger level: {ex}")
-
-    # -------------------------
-    # Apply module-level knobs (blur + replace mask)
-    # -------------------------
-    # These are read as globals inside the splatting script during processing.
-    for k, v in {
-        # Blur/Stair smoothing
-        "SPLAT_STAIR_SMOOTH_ENABLED": bool(SPLAT_STAIR_SMOOTH_ENABLED),
-        "SPLAT_BLUR_KERNEL": int(SPLAT_BLUR_KERNEL),
-        "SPLAT_STAIR_EDGE_X_OFFSET": int(SPLAT_STAIR_EDGE_X_OFFSET),
-        "SPLAT_STAIR_STRIP_PX": int(SPLAT_STAIR_STRIP_PX),
-        "SPLAT_STAIR_STRENGTH": float(SPLAT_STAIR_STRENGTH),
-
-        # Replace mask export
-        "REPLACE_MASK_ENABLED": bool(REPLACE_MASK_ENABLED),
-        "MASK_OUTPUT": str(MASK_OUTPUT),
-        "REPLACE_MASK_SCALE": float(REPLACE_MASK_SCALE),
-        "REPLACE_MASK_MIN_PX": int(REPLACE_MASK_MIN_PX),
-        "REPLACE_MASK_MAX_PX": int(REPLACE_MASK_MAX_PX),
-        "REPLACE_MASK_GAP_TOL": int(REPLACE_MASK_GAP_TOL),
-        "REPLACE_MASK_DRAW_EDGE": bool(REPLACE_MASK_DRAW_EDGE),
-    }.items():
-        if hasattr(mod, k):
-            setattr(mod, k, v)
-        else:
-            print(f"[WARN] splatting module does not define '{k}' (ignored)")
-    if not hasattr(mod, "SplatterGUI"):
-        raise AttributeError("splatting_gui.py must expose class SplatterGUI")
-
-    # Instantiate GUI app but don't mainloop.
-    # Withdraw to avoid popping a window (still requires a display).
-    app = mod.SplatterGUI()
-    if bool(args.log_verbose):
-        try:
-            app.debug_mode_var.set(True)
-            app._configure_logging()
-        except Exception as ex:
-            print(f"[WARN] failed enabling GUI debug logging mode: {ex}")
-    try:
-        app.withdraw()
-    except Exception:
-        pass
-
-    # Force move-to-finished OFF (belt & suspenders)
-    try:
-        app.move_to_finished_var.set(bool(MOVE_TO_FINISHED))
-    except Exception:
-        pass
 
     # Optional ffmpeg output-override hook (used by pipeline master overrides).
     import core.splatting.render_processor as _render_mod
@@ -642,6 +592,13 @@ def main():
 
     orig_render_video = RenderProcessor.render_video
     progress_tracker = {"done": 0, "total": 0}
+    progress_queue: queue.Queue = queue.Queue()
+    stop_event = threading.Event()
+    batch_processor = BatchProcessor(
+        progress_queue=progress_queue,
+        stop_event=stop_event,
+        sidecar_manager=None,
+    )
 
     def _emit_task_progress(delta: int = 1) -> None:
         progress_tracker["done"] = max(0, int(progress_tracker["done"]) + int(delta))
@@ -734,10 +691,10 @@ def main():
     RenderProcessor.render_video = render_video_wrapper  # type: ignore
 
     # Monkey-patch BatchProcessor orchestration for early skip of whole video.
-    if SKIP_IF_OUTPUT_EXISTS and hasattr(app, "batch_processor"):
-        orig_orchestration = app.batch_processor._process_single_video_orchestration
+    if SKIP_IF_OUTPUT_EXISTS:
+        orig_orchestration = batch_processor._process_single_video_orchestration
 
-        def _process_single_video_orchestration_skip_wrapper(*args, **kwargs):
+        def _process_single_video_orchestration_skip_wrapper(self, *args, **kwargs):
             try:
                 video_path = kwargs.get("video_path", None)
                 settings = kwargs.get("settings", None)
@@ -748,9 +705,9 @@ def main():
 
                 if video_path is not None and settings is not None and getattr(settings, "enable_full_resolution", False):
                     if STOP_MARKER and os.path.exists(STOP_MARKER):
-                        app.stop_event.set()
+                        stop_event.set()
                         print("[STOP] stop marker detected before next clip. Exiting batch loop.")
-                        return len(app.batch_processor.get_defined_tasks(settings))
+                        return len(self.get_defined_tasks(settings))
                     out_root = Path(getattr(settings, "output_splatted", OUTPUT_SPLATTED)).resolve()
                     base_name = Path(str(video_path)).stem
                     suffix = _output_layout_suffix(
@@ -762,7 +719,7 @@ def main():
                     final_out = out_root / "hires" / f"{base_name}_{int(HIRES_SKIP_WIDTH)}{suffix}.mp4"
                     if final_out.exists() and final_out.stat().st_size > 0:
                         print(f"[SKIP] whole video (hires exists): {final_out}")
-                        skipped = len(app.batch_processor.get_defined_tasks(settings))
+                        skipped = len(self.get_defined_tasks(settings))
                         _emit_task_progress(skipped)
                         return skipped
             except Exception as ex:
@@ -770,27 +727,24 @@ def main():
 
             result = orig_orchestration(*args, **kwargs)
             if STOP_MARKER and os.path.exists(STOP_MARKER):
-                app.stop_event.set()
+                stop_event.set()
                 print("[STOP] stop marker detected after current clip. Stopping before next clip.")
             return result
 
-        app.batch_processor._process_single_video_orchestration = _process_single_video_orchestration_skip_wrapper  # type: ignore
+        batch_processor._process_single_video_orchestration = MethodType(  # type: ignore[method-assign]
+            _process_single_video_orchestration_skip_wrapper,
+            batch_processor,
+        )
 
-    sidecar_folder = ""
-    try:
-        sidecar_folder = app._get_sidecar_base_folder()
-    except Exception:
-        sidecar_folder = str(Path(INPUT_DEPTH_MAPS).resolve())
-    sidecar_ext = getattr(app, "APP_CONFIG_DEFAULTS", {}).get("SIDECAR_EXT", ".fssidecar")
-
-    _handle_sidecar_policy(sidecar_folder=sidecar_folder, sidecar_ext=sidecar_ext, policy=str(args.sidecar_policy))
+    sidecar_folder = _default_sidecar_folder(INPUT_DEPTH_MAPS)
+    sidecar_ext = ".fssidecar"
 
     conv_overrides = _read_convergence_overrides(str(args.auto_convergence_csv).strip())
-    if conv_overrides and hasattr(app, "batch_processor"):
-        orig_get_video_specific_settings = app.batch_processor._get_video_specific_settings
+    if conv_overrides:
+        orig_get_video_specific_settings = batch_processor._get_video_specific_settings
         csv_policy = str(args.auto_convergence_csv_policy)
 
-        def _get_video_specific_settings_csv_wrapper(*g_args, **g_kwargs):
+        def _get_video_specific_settings_csv_wrapper(self, *g_args, **g_kwargs):
             res = orig_get_video_specific_settings(*g_args, **g_kwargs)
             if not isinstance(res, dict) or res.get("error"):
                 return res
@@ -818,11 +772,14 @@ def main():
             print(f"[INFO] CSV convergence override: {clip_name} -> {float(csv_conv):.4f}")
             return res
 
-        app.batch_processor._get_video_specific_settings = _get_video_specific_settings_csv_wrapper  # type: ignore
+        batch_processor._get_video_specific_settings = MethodType(  # type: ignore[method-assign]
+            _get_video_specific_settings_csv_wrapper,
+            batch_processor,
+        )
 
     normalized_output_layout = _normalize_output_layout(OUTPUT_LAYOUT, fallback_dual=bool(DUAL_OUTPUT))
 
-    settings = mod.ProcessingSettings(
+    settings = ProcessingSettings(
         input_source_clips=str(Path(INPUT_SOURCE_CLIPS).resolve()),
         input_depth_maps=str(Path(INPUT_DEPTH_MAPS).resolve()),
         output_splatted=str(_normalize_output_root(Path(OUTPUT_SPLATTED).resolve())),
@@ -852,8 +809,10 @@ def main():
         depth_blur_left=float(DEPTH_BLUR_LEFT),
         depth_blur_left_mix=float(args.blur_balance),
         auto_convergence_mode=str(AUTO_CONVERGENCE_MODE),
-        enable_sidecar_gamma=bool(ENABLE_SIDECAR_GAMMA),
-        enable_sidecar_blur_dilate=bool(ENABLE_SIDECAR_BLUR_DILATE),
+        enable_sidecar_gamma=False,
+        enable_sidecar_blur_dilate=False,
+        multi_map=False,
+        selected_depth_map="",
         sidecar_ext=sidecar_ext,
         sidecar_folder=sidecar_folder,
         stair_smooth_enabled=bool(SPLAT_STAIR_SMOOTH_ENABLED),
@@ -872,8 +831,8 @@ def main():
     )
 
     try:
-        setup_preview = app.batch_processor.setup_batch_processing(settings)
-        task_defs = app.batch_processor.get_defined_tasks(settings)
+        setup_preview = batch_processor.setup_batch_processing(settings)
+        task_defs = batch_processor.get_defined_tasks(settings)
         if not setup_preview.error:
             progress_tracker["total"] = max(0, len(setup_preview.input_videos) * len(task_defs))
             if progress_tracker["total"] > 0:
@@ -891,7 +850,7 @@ def main():
     def _progress_monitor() -> None:
         while not monitor_stop.is_set():
             try:
-                msg = app.progress_queue.get(timeout=0.25)
+                msg = progress_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
             if msg == "finished":
@@ -928,7 +887,7 @@ def main():
 
     t0 = time.time()
     try:
-        app._run_batch_process(settings)
+        batch_processor.run_batch_process(settings)
     except Exception as e:
         print(f"[ERR ] batch failed: {type(e).__name__}: {e}")
         traceback.print_exc()
@@ -941,10 +900,6 @@ def main():
             pass
         dt = time.time() - t0
         print(f"[DONE] elapsed={dt:.1f}s")
-        try:
-            app.destroy()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":

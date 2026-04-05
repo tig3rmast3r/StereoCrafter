@@ -11371,7 +11371,6 @@ class PipelineMasterGUI:
         env_updates: dict[str, str] = {
             "PYTHON": sys.executable,
             "RUNNER": "batch_splatting_runner.py",
-            "GUI_SCRIPT": "splatting_gui.py",
             "INPUT_SOURCE_CLIPS": self.splat_input_clips_var.get().strip(),
             "INPUT_DEPTH_MAPS": self.splat_input_depth_var.get().strip(),
             "OUTPUT_SPLATTED": self.splat_output_var.get().strip(),
@@ -11466,11 +11465,6 @@ class PipelineMasterGUI:
         runner_script = Path(env_updates.get("RUNNER", "batch_splatting_runner.py")).resolve()
         if not runner_script.is_file():
             messagebox.showerror("Splatting", f"Runner not found:\n{runner_script}")
-            return
-
-        gui_script = Path(env_updates.get("GUI_SCRIPT", "splatting_gui.py")).resolve()
-        if not gui_script.is_file():
-            messagebox.showerror("Splatting", f"GUI script not found:\n{gui_script}")
             return
 
         input_clips = self.splat_input_clips_var.get().strip()
