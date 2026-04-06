@@ -76,6 +76,35 @@ run_py() {
   uv run python "$@"
 }
 
+project_venv_python() {
+  local venv_python="${SCRIPT_DIR}/.venv/bin/python"
+  if [[ -x "${venv_python}" ]]; then
+    printf '%s\n' "${venv_python}"
+    return 0
+  fi
+
+  venv_python="$(
+    uv run python - <<'PY'
+import sys
+print(sys.executable)
+PY
+  )"
+
+  if [[ -n "${venv_python}" && -x "${venv_python}" ]]; then
+    printf '%s\n' "${venv_python}"
+    return 0
+  fi
+
+  echo "[ERR] Could not resolve the project virtualenv Python for uv pip installs." >&2
+  return 1
+}
+
+run_uv_pip() {
+  local venv_python=""
+  venv_python="$(project_venv_python)"
+  uv pip install --python "${venv_python}" "$@"
+}
+
 resolve_realpath() {
   local path="$1"
   if command -v readlink >/dev/null 2>&1; then
@@ -271,6 +300,7 @@ install_system_packages_if_requested() {
     git
     git-lfs
     mkvtoolnix
+    python3-tk
     libgl1
     libglib2.0-0
   )
@@ -331,7 +361,7 @@ version_gt() {
 
 install_recommended_torch() {
   echo "[STEP] Installing recommended torch stack (cu128)..."
-  run_py -m pip install \
+  run_uv_pip \
     --index-url https://download.pytorch.org/whl/cu128 \
     --extra-index-url https://pypi.org/simple \
     "torch==${TARGET_TORCH}" \
@@ -380,11 +410,11 @@ build_forward_warp_if_enabled() {
 
   (
     cd "${cuda_dir}"
-    run_py -m pip install -v --no-build-isolation .
+    run_uv_pip -v --no-build-isolation .
   )
   (
     cd "${fw_root}"
-    run_py -m pip install -v --no-build-isolation --no-cache-dir .
+    run_uv_pip -v --no-build-isolation --no-cache-dir .
   )
 
   local fw_so
@@ -511,6 +541,11 @@ else
   else
     older_stack="0"
     newer_stack="0"
+    incomplete_stack="0"
+
+    if [[ -z "$TORCHVISION_BASE" || -z "$TORCHAUDIO_BASE" ]]; then
+      incomplete_stack="1"
+    fi
 
     if version_lt "$TORCH_BASE" "$TARGET_TORCH" || version_lt "$TORCHVISION_BASE" "$TARGET_TORCHVISION" || version_lt "$TORCHAUDIO_BASE" "$TARGET_TORCHAUDIO" || version_lt "$TORCH_CUDA" "$TARGET_CUDA"; then
       older_stack="1"
@@ -519,7 +554,10 @@ else
       newer_stack="1"
     fi
 
-    if [[ "$TORCH_CUDA" == "11.8" || "$older_stack" == "1" ]]; then
+    if [[ "$incomplete_stack" == "1" ]]; then
+      echo "[WARN] Incomplete torch runtime detected in the project env."
+      echo "[WARN] Missing torchvision and/or torchaudio. Align to the full recommended stack to avoid runtime issues."
+    elif [[ "$TORCH_CUDA" == "11.8" || "$older_stack" == "1" ]]; then
       echo "[WARN] Older torch/cuda stack detected. CUDA 11.8 is usually much slower for this fork."
       echo "[WARN] Recommended target is torch ${TARGET_TORCH} + cu${TARGET_CUDA}."
     elif [[ "$newer_stack" == "1" ]]; then

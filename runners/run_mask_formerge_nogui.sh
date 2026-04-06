@@ -264,8 +264,16 @@ poll_all_worker_logs() {
 
 should_retry() {
   local _code="${1:-1}"
-  # Retry on any non-zero exit code; MAX_RETRIES still applies.
-  return 0
+  local retry_code
+  if ! [[ "$_code" =~ ^[0-9]+$ ]] || [ "$_code" -eq 0 ]; then
+    return 1
+  fi
+  for retry_code in $RETRY_CODES; do
+    if [ "$retry_code" = "$_code" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 output_path_for_input() {

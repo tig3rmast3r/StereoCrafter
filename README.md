@@ -1,13 +1,14 @@
 # Fork Info
 
-This fork is tested only with Linux (ubuntu 22.04 and 24.04 in my case), Windows "should" work for gui versions but pipeline_master_gui and all auto batches uses bash scripts that needs to be reimplemented using powershell <br>
+This fork is tested only with Linux (ubuntu 22.04 and 24.04 in my case) and WSL 24.04 on Windows, pure Windows "should" work for gui versions but pipeline_master_gui and all auto batches uses bash scripts that needs to be reimplemented using powershell. <br>
+All GUI works too in WSL so moving to Windows is quite pointless<br>
 Aim to this Fork is to create a full sbs 1080p 3d content as result with a one-click solution but keeping ways to customize it.<br>
 Supports only 8 bit format (inpainting is 8 bit anyway so it's actually impossible to get 10 bit hdr end to end) with hardcoded yuv444p during all steps to preserve colors transitions.
 All runner scripts are tuned for intel 265k, 48GB ram and RTX 4090 and specifically for 1920*800 content<br>
 Most of the job is done by VIBE CODING using VS code + Codex 5.3/5.4<br>
 All the extra scripts are made multithreading/parallel when possible, helping reducing time (but is still a very very slow process)
 
-## Install (linux only)
+## Install (linux/WSL)
 
 [Install Linux guide](install_linux_readme.md)
 

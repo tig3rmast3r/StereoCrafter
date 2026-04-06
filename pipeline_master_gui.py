@@ -423,6 +423,7 @@ class PipelineMasterGUI:
         self._pipeline_test_prev_paths: dict[str, str] = {}
         self._pipeline_test_step_state = self._default_pipeline_step_state()
         self._pipeline_test_recovery_attempted = False
+        self._pipeline_test_restore_scheduled = False
         self._pipeline_skip_notice_steps: set[str] = set()
         self._pipeline_ui_noninteractive = False
         self._pipeline_popup_log_buffer: list[str] = []
@@ -8071,6 +8072,33 @@ class PipelineMasterGUI:
                 prev_paths[var_name] = str(var_obj.get()).strip()
         return prev_paths
 
+    def _pipeline_test_restore_should_wait(self) -> bool:
+        if not self._pipeline_test_active:
+            return False
+        if self._any_pipeline_activity():
+            return True
+        pending = self._pipeline_pending_action
+        if isinstance(pending, tuple) and len(pending) >= 2:
+            step_name = str(pending[0]).strip().lower()
+            action = str(pending[1]).strip().lower()
+            if step_name and action in {"run", "verify"}:
+                return True
+        return False
+
+    def _schedule_pipeline_test_restore(self, delay_ms: int = 150) -> None:
+        if not self._pipeline_test_active or self._pipeline_test_restore_scheduled:
+            return
+        self._pipeline_test_restore_scheduled = True
+
+        def _deferred_restore() -> None:
+            self._pipeline_test_restore_scheduled = False
+            self._restore_test_scene_subset()
+
+        try:
+            self.root.after(max(0, int(delay_ms)), _deferred_restore)
+        except Exception:
+            self._pipeline_test_restore_scheduled = False
+
     def _save_pipeline_test_resume_state(self, test_root: Path | str) -> None:
         test_root_path = Path(test_root).expanduser().resolve()
         payload = {
@@ -8196,6 +8224,7 @@ class PipelineMasterGUI:
         self._pipeline_test_source_dir = str(meta.get("source_dir") or current_prev_paths.get("scene_output_var") or "").strip()
         self._pipeline_test_dir = str(test_root)
         self._pipeline_test_prev_paths = dict(prev_paths)
+        self._pipeline_test_restore_scheduled = False
         self._pipeline_test_step_state = {
             key: {
                 "completed": bool((self._pipeline_step_state.get(key) or {}).get("completed", False)),
@@ -9325,6 +9354,7 @@ class PipelineMasterGUI:
         self._pipeline_test_source_dir = str(source_seg)
         self._pipeline_test_dir = str(test_root)
         self._pipeline_test_prev_paths = dict(prev_paths)
+        self._pipeline_test_restore_scheduled = False
         self._pipeline_test_step_state = {
             key: {
                 "completed": bool((self._pipeline_step_state.get(key) or {}).get("completed", False)),
@@ -9608,9 +9638,14 @@ class PipelineMasterGUI:
 
         return copied_total, csv_merged_total, error_total
 
-    def _restore_test_scene_subset(self) -> None:
+    def _restore_test_scene_subset(self, *, force: bool = False) -> bool:
         if not self._pipeline_test_active:
-            return
+            self._pipeline_test_restore_scheduled = False
+            return False
+        if not force and self._pipeline_test_restore_should_wait():
+            self._schedule_pipeline_test_restore()
+            return False
+        self._pipeline_test_restore_scheduled = False
         prev_paths = dict(self._pipeline_test_prev_paths)
         test_root = Path(self._pipeline_test_dir) if self._pipeline_test_dir else None
         copied_count, csv_rows_count, sync_errors = self._sync_test_scene_subset_to_real(
@@ -9663,6 +9698,7 @@ class PipelineMasterGUI:
                 )
             )
         self._pipeline_sync_noninteractive_mode()
+        return True
 
     def _pipeline_start_resume(self) -> None:
         if self._any_pipeline_activity():
@@ -16597,7 +16633,7 @@ class PipelineMasterGUI:
         if self._join_thread and self._join_thread.is_alive():
             self._stop_join(prompt_user=False)
         if self._pipeline_test_active:
-            self._restore_test_scene_subset()
+            self._restore_test_scene_subset(force=True)
         self.root.destroy()
 
 

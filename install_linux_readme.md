@@ -75,3 +75,18 @@ After the installer script completes:
 ```bash
 python pipeline_master_gui.py
 ```
+
+WSL GUI note:
+- The standard Linux installer now includes `python3-tk`, so Tkinter should be available after setup.
+- If you are on WSL and the GUI still does not open even though `tkinter` imports correctly, the issue is usually WSLg/session state rather than a missing repo dependency.
+- Quick check:
+
+```bash
+python -c "import tkinter; print('tk ok')"
+```
+
+- If that check passes but GUI windows still do not appear, restart WSL from Windows
+
+```bash
+wsl --shutdown
+```

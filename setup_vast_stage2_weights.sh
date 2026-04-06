@@ -16,7 +16,6 @@ Modes:
   1 | depth | depthcrafter            Download only DepthCrafter + shared SVD base
   2 | inpaint | inpainting            Download only StereoCrafter inpaint + shared SVD base
   3 | both | depth+inpaint            Download DepthCrafter + StereoCrafter inpaint + shared SVD base
-  4 | all                             Download all Stage 2 weights (currently same model set as mode 3)
 
 Token:
   Actual downloads always use a Hugging Face token.
@@ -45,9 +44,6 @@ normalize_mode() {
       ;;
     3|both|depth+inpaint|depthcrafter+inpaint|depth-and-inpaint|depthcrafter-and-inpaint)
       echo "both"
-      ;;
-    4|all)
-      echo "all"
       ;;
     *)
       return 1
@@ -83,9 +79,8 @@ Select Stage 2 download mode:
   1) depthcrafter only
   2) inpaint only
   3) depthcrafter + inpaint
-  4) all
 EOF
-  read -r -p "Choice [1-4]: " MODE_RAW
+  read -r -p "Choice [1-3]: " MODE_RAW
 fi
 
 if ! MODE="$(normalize_mode "${MODE_RAW}")"; then
@@ -105,7 +100,7 @@ PY
 then
   echo "[ERR] Missing Python module: huggingface_hub"
   echo "[ERR] Install it first, then rerun:"
-  echo "       source ~/venv-vast291-cu128/bin/activate && python -m pip install -U huggingface_hub"
+  echo "       source \"${REPO_DIR}/.venv/bin/activate\" && python -m pip install -U huggingface_hub"
   exit 2
 fi
 
@@ -176,7 +171,6 @@ MODE_TARGETS = {
     "depth": ["stable-video-diffusion-img2vid-xt-1-1", "DepthCrafter"],
     "inpaint": ["stable-video-diffusion-img2vid-xt-1-1", "StereoCrafter"],
     "both": ["stable-video-diffusion-img2vid-xt-1-1", "DepthCrafter", "StereoCrafter"],
-    "all": ["stable-video-diffusion-img2vid-xt-1-1", "DepthCrafter", "StereoCrafter"],
 }
 
 
@@ -282,8 +276,6 @@ selected = MODE_TARGETS[MODE]
 print(f"[INFO] Repo dir: {REPO_DIR}")
 print(f"[INFO] Weights dir: {WEIGHTS_DIR}")
 print(f"[INFO] Mode: {MODE}")
-if MODE == "all":
-    print("[INFO] 'all' currently resolves to the full Stage 2 set: SVD base + DepthCrafter + StereoCrafter")
 if DRY_RUN:
     print("[INFO] Dry run only; no Hugging Face requests will be made.")
 
