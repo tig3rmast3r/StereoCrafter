@@ -25,6 +25,7 @@ import platform
 from typing import Optional, Tuple, Any, Dict
 from PIL import Image
 import math
+from dependency.repo_paths import config_path, repo_path
 
 # --- Depth Map Visualization Levels ---
 # These affect ONLY depth-map visualization (Preview 'Depth Map' and Map Test images),
@@ -172,7 +173,7 @@ class SplatterGUI(ThemedTk):
         # File Extensions
         "SIDECAR_EXT": ".fssidecar",
         "OUTPUT_SIDECAR_EXT": ".spsidecar",
-        "DEFAULT_CONFIG_FILENAME": "config_splat.splatcfg",
+        "DEFAULT_CONFIG_FILENAME": str(config_path("config_splat.json")),
         # GUI/Processing Defaults (Used for reset/fallback)
         "MAX_DISP": "30.0",
         "CONV_POINT": "0.5",
@@ -3516,7 +3517,7 @@ class SplatterGUI(ThemedTk):
     def _load_help_texts(self):
         """Loads help texts from a JSON file."""
         try:
-            with open(os.path.join("dependency", "splatter_help.json"), "r", encoding="utf-8") as f:
+            with open(repo_path("dependency", "splatter_help.json"), "r", encoding="utf-8") as f:
                 self.help_texts = json.load(f)
         except FileNotFoundError:
             logger.error("Error: splatter_help.json not found. Tooltips will not be available.")
@@ -3528,9 +3529,10 @@ class SplatterGUI(ThemedTk):
     def load_settings(self):
         """Loads settings from a user-selected JSON file using ConfigManager."""
         filename = filedialog.askopenfilename(
-            defaultextension=".splatcfg",
-            filetypes=[("Splat Config", "*.splatcfg"), ("JSON files", "*.json")],
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
             title="Load Settings from File",
+            initialdir=os.path.dirname(self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]),
         )
         if not filename:
             return
@@ -6055,9 +6057,10 @@ class SplatterGUI(ThemedTk):
     def save_settings(self):
         """Saves current GUI settings to a user-selected JSON file using ConfigManager."""
         filename = filedialog.asksaveasfilename(
-            defaultextension=".splatcfg",
-            filetypes=[("Splat Config", "*.splatcfg"), ("JSON files", "*.json")],
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
             title="Save Settings to File",
+            initialdir=os.path.dirname(self.APP_CONFIG_DEFAULTS["DEFAULT_CONFIG_FILENAME"]),
         )
         if not filename:
             return

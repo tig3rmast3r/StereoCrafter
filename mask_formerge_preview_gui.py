@@ -22,7 +22,8 @@ import torch
 from decord import VideoReader, cpu  # type: ignore
 from PIL import Image, ImageTk
 
-from mask_formerge_nogui import (
+from dependency.repo_paths import config_path
+from runners.mask_formerge_nogui import (
     apply_gaussian_blur,
     apply_mask_dilation,
     apply_shadow_blur,
@@ -73,8 +74,10 @@ class MaskForMergePreviewGUI(tk.Tk):
     DEFAULT_WARMUP_FRAMES = 8
     WARMUP_MAX_FRAMES = 120
     PLAY_INTERVAL_MS = 40
-    SETTINGS_FILENAME = "config_mask_formerge_preview_gui.json"
-    MOTION_DEFAULTS_FILENAME = "config_mask_formerge_nogui_motion_defaults.json"
+    SETTINGS_FILENAME = str(config_path("config_mask_formerge_preview_gui.json"))
+    MOTION_DEFAULTS_FILENAME = str(
+        config_path("config_mask_formerge_nogui_motion_defaults.json")
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -694,6 +697,7 @@ class MaskForMergePreviewGUI(tk.Tk):
         self._schedule_preview(10)
 
     def _write_json_atomic(self, target_path: str, payload: Dict[str, Any]) -> None:
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
         tmp_path = f"{target_path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=True, sort_keys=True)
@@ -952,6 +956,7 @@ class MaskForMergePreviewGUI(tk.Tk):
 
     def _save_settings(self) -> None:
         data = self._build_settings_dict()
+        os.makedirs(os.path.dirname(self._settings_path), exist_ok=True)
         tmp_path = f"{self._settings_path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=True, sort_keys=True)

@@ -1,3 +1,4 @@
+import argparse
 import json
 import math
 import os
@@ -14,7 +15,7 @@ import threading
 import concurrent.futures
 import glob
 import tkinter as tk
-from typing import Sequence
+from typing import Optional, Sequence
 from datetime import datetime
 from collections import Counter
 from pathlib import Path
@@ -32,6 +33,13 @@ from dependency.ffmpeg_encoding_profiles import (
     resolve_mask_for_merge_grayscale_profile,
     resolve_replace_mask_binary_profile,
 )
+from dependency.repo_paths import (
+    config_path,
+    repo_root,
+    resolve_repo_path,
+    runner_path,
+    utilities_path,
+)
 
 try:
     from ttkthemes import ThemedTk
@@ -39,6 +47,8 @@ except Exception:
     ThemedTk = None
 
 GUI_VERSION = "2026-04-01"
+REPO_ROOT = repo_root()
+DEFAULT_PIPELINE_MASTER_CONFIG_PATH = config_path("config_pipeline_master_gui.json")
 
 
 class VerifyStopRequested(Exception):
@@ -46,7 +56,7 @@ class VerifyStopRequested(Exception):
 
 
 class PipelineMasterGUI:
-    CONFIG_FILENAME = "config_pipeline_master_gui.json"
+    CONFIG_FILENAME = str(DEFAULT_PIPELINE_MASTER_CONFIG_PATH)
     DEFAULT_SCENE_BACKEND = "OpenCV"
     DEFAULT_SCENE_CODEC = "libx264"
     DEFAULT_WINDOW_GEOMETRY = "1400x1050"
@@ -64,8 +74,8 @@ class PipelineMasterGUI:
     DEFAULT_PIPELINE_TEST_RUN_FILES = 5
     DEPTH_RUNTIME_MODE_CHOICES = ("original", "stream")
     DEPTH_RUNTIME_MODE_TO_SCRIPT = {
-        "original": "./depthcrafter_nogui_batch.py",
-        "stream": "./depthcrafter_nogui_stream_carry.py",
+        "original": "./runners/depthcrafter_nogui_batch.py",
+        "stream": "./runners/depthcrafter_nogui_stream_carry.py",
     }
     RETRY_POLICY_PROFILES = ("run", "retry1", "retry2", "retry3")
     RETRY_POLICY_MAX_SPLIT_CHOICES = ("off", "64", "128", "256", "512")
@@ -316,11 +326,26 @@ class PipelineMasterGUI:
         "Hable (brighter SDR style, available only for 10-bit input source)": "hable",
     }
 
-    def __init__(self, root: tk.Tk):
+    def __init__(
+        self,
+        root: tk.Tk,
+        *,
+        config_file: Optional[str] = None,
+        work_dir_override: Optional[str] = None,
+    ):
         self.root = root
         self.root.title(f"StereoCrafter Pipeline GUI {GUI_VERSION}")
+        config_target = str(config_file or self.CONFIG_FILENAME).strip() or self.CONFIG_FILENAME
+        self._config_file = str(Path(config_target).expanduser().resolve())
+        self._work_dir_override = (
+            str(Path(work_dir_override).expanduser().resolve())
+            if work_dir_override
+            else ""
+        )
         self._config_save_ready = False
         self._config = self._load_config()
+        if self._work_dir_override and not self._config.get("work_folder"):
+            self._config["work_folder"] = self._work_dir_override
         saved_geometry = str(self._config.get("window_geometry", "")).strip()
         if saved_geometry:
             try:
@@ -440,10 +465,10 @@ class PipelineMasterGUI:
 
     def _init_vars(self) -> None:
         self.work_folder_var = tk.StringVar(
-            value=self._config.get("work_folder", os.path.normpath("./work"))
+            value=self._config.get("work_folder", str(REPO_ROOT / "work"))
         )
         self.scene_input_var = tk.StringVar(
-            value=self._config.get("scene_input", os.path.normpath("./work/source.mkv"))
+            value=self._config.get("scene_input", str(REPO_ROOT / "work" / "source.mkv"))
         )
         self.scene_output_var = tk.StringVar(value="")
 
@@ -2317,7 +2342,7 @@ class PipelineMasterGUI:
 
         env_updates: dict[str, str] = {
             "PYTHON": sys.executable,
-            "RUNNER": "batch_inpainting_runner.py",
+            "RUNNER": str(runner_path("batch_inpainting_runner.py")),
             "INPUT_DIR": input_dir,
             "OUTPUT_DIR": output_dir,
             "GLOB": "*.mp4",
@@ -2350,7 +2375,7 @@ class PipelineMasterGUI:
             ),
         }
 
-        cmd = ["bash", "run_inpainting_runner.sh"]
+        cmd = ["bash", str(runner_path("run_inpainting_runner.sh"))]
         preview = " ".join(
             [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
             + [shlex.quote(x) for x in cmd]
@@ -2388,12 +2413,14 @@ class PipelineMasterGUI:
             messagebox.showerror("Inpainting", f"Invalid inpainting options:\n{exc}")
             return
 
-        launcher_script = Path("run_inpainting_runner.sh").resolve()
+        launcher_script = runner_path("run_inpainting_runner.sh")
         if not launcher_script.is_file():
             messagebox.showerror("Inpainting", f"Launcher not found:\n{launcher_script}")
             return
 
-        runner_script = Path(env_updates.get("RUNNER", "batch_inpainting_runner.py")).resolve()
+        runner_script = resolve_repo_path(
+            env_updates.get("RUNNER", str(runner_path("batch_inpainting_runner.py")))
+        )
         if not runner_script.is_file():
             messagebox.showerror("Inpainting", f"Runner not found:\n{runner_script}")
             return
@@ -2549,7 +2576,7 @@ class PipelineMasterGUI:
             messagebox.showinfo("Inpainting", "Stop verification before creating sharpness CSV.")
             return
 
-        script_path = Path("Utilities/analyze_inpaint_sharpness.py").resolve()
+        script_path = utilities_path("analyze_inpaint_sharpness.py")
         if not script_path.is_file():
             messagebox.showerror("Inpainting", f"Script not found:\n{script_path}")
             return
@@ -2679,7 +2706,7 @@ class PipelineMasterGUI:
         output_dir = self.inpaint_sharpen_output_var.get().strip()
         env_updates: dict[str, str] = {
             "PYTHON": sys.executable,
-            "RUNNER": "batch_inpaint_sharpen_runner.py",
+            "RUNNER": str(runner_path("batch_inpaint_sharpen_runner.py")),
             "INPUT_DIR": self.inpaint_output_var.get().strip(),
             "MASK_DIR": self.inpaint_mask_var.get().strip(),
             "OUTPUT_DIR": output_dir,
@@ -2700,7 +2727,7 @@ class PipelineMasterGUI:
             "OUTPUT_CRF": "0",
             "OUTPUT_EXTRA_ARGS": "",
         }
-        cmd = ["bash", "run_inpaint_sharpen_runner.sh"]
+        cmd = ["bash", str(runner_path("run_inpaint_sharpen_runner.sh"))]
         preview = " ".join(
             [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
             + [shlex.quote(x) for x in cmd]
@@ -2724,11 +2751,13 @@ class PipelineMasterGUI:
             messagebox.showerror("Sharpen", f"Invalid sharpen options:\n{exc}")
             return
 
-        launcher_script = Path("run_inpaint_sharpen_runner.sh").resolve()
+        launcher_script = runner_path("run_inpaint_sharpen_runner.sh")
         if not launcher_script.is_file():
             messagebox.showerror("Sharpen", f"Launcher not found:\n{launcher_script}")
             return
-        runner_script = Path(env_updates.get("RUNNER", "batch_inpaint_sharpen_runner.py")).resolve()
+        runner_script = resolve_repo_path(
+            env_updates.get("RUNNER", str(runner_path("batch_inpaint_sharpen_runner.py")))
+        )
         if not runner_script.is_file():
             messagebox.showerror("Sharpen", f"Runner not found:\n{runner_script}")
             return
@@ -3142,7 +3171,7 @@ class PipelineMasterGUI:
             self._pipeline_on_verify_finished("sharpen", False, "deep")
             return
 
-        script_path = Path("Utilities/verifyscenes.py").resolve()
+        script_path = utilities_path("verifyscenes.py")
         if not script_path.is_file():
             messagebox.showerror("Verify Sharpen", f"Script not found:\n{script_path}")
             return
@@ -3554,7 +3583,7 @@ class PipelineMasterGUI:
         if not ok:
             return
 
-        script_path = Path("Utilities/verifyscenes.py").resolve()
+        script_path = utilities_path("verifyscenes.py")
         if not script_path.is_file():
             messagebox.showerror("Verify Inpainting", f"Script not found:\n{script_path}")
             return
@@ -4108,7 +4137,11 @@ class PipelineMasterGUI:
         self.merge_codec_var.set(codec_value)
         env_updates: dict[str, str] = {
             "PYTHON": sys.executable,
-            "RUNNER": "merging_nogui_batch_parallel.py" if use_parallel else "merging_nogui_batch.py",
+            "RUNNER": str(
+                runner_path(
+                    "merging_nogui_batch_parallel.py" if use_parallel else "merging_nogui_batch.py"
+                )
+            ),
             "INPAINTED_FOLDER": self.merge_inpainted_var.get().strip(),
             "PREFERRED_INPAINTED_FOLDER": preferred_inpainted_dir,
             "SPLATTED_FOLDER": self.merge_splatted_var.get().strip(),
@@ -4143,7 +4176,16 @@ class PipelineMasterGUI:
         }
         if use_parallel:
             env_updates["WORKERS"] = str(workers)
-        cmd = ["bash", "run_merging_nogui_batch_parallel.sh" if use_parallel else "run_merging_nogui_batch.sh"]
+        cmd = [
+            "bash",
+            str(
+                runner_path(
+                    "run_merging_nogui_batch_parallel.sh"
+                    if use_parallel
+                    else "run_merging_nogui_batch.sh"
+                )
+            ),
+        ]
         preview = " ".join(
             [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
             + [shlex.quote(x) for x in cmd]
@@ -4182,7 +4224,7 @@ class PipelineMasterGUI:
             self.merge_mask_formerge_workers_var.set(str(mask_workers))
         env_updates: dict[str, str] = {
             "PYTHON": sys.executable,
-            "RUNNER": "mask_formerge_nogui.py",
+            "RUNNER": str(runner_path("mask_formerge_nogui.py")),
             "REPLACE_MASK_FOLDER": self.merge_replace_mask_var.get().strip(),
             "OUTPUT_FOLDER": self.merge_mask_formerge_var.get().strip(),
             "INPUT_GLOB": "*_replace_mask.*",
@@ -4197,7 +4239,7 @@ class PipelineMasterGUI:
             "SHADOW_WIDTH_ADAPTIVE": "1" if bool(self.merge_dynamic_shadow_width_var.get()) else "0",
             "SKIP_EXISTING": "1",
         }
-        cmd = ["/usr/bin/env", "bash", "run_mask_formerge_nogui.sh"]
+        cmd = ["/usr/bin/env", "bash", str(runner_path("run_mask_formerge_nogui.sh"))]
         preview = (
             " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
             + " "
@@ -4218,7 +4260,7 @@ class PipelineMasterGUI:
             messagebox.showerror("Merging", f"Invalid mask-for-merge options:\n{exc}")
             return
 
-        launcher_script = Path("run_mask_formerge_nogui.sh").resolve()
+        launcher_script = runner_path("run_mask_formerge_nogui.sh")
         if not launcher_script.is_file():
             messagebox.showerror("Merging", f"Launcher not found:\n{launcher_script}")
             return
@@ -4319,7 +4361,9 @@ class PipelineMasterGUI:
             messagebox.showerror("Merging", f"Invalid merging options:\n{exc}")
             return
 
-        launcher_script = Path(cmd[1]).resolve() if len(cmd) > 1 else Path("run_merging_nogui_batch.sh").resolve()
+        launcher_script = (
+            resolve_repo_path(cmd[1]) if len(cmd) > 1 else runner_path("run_merging_nogui_batch.sh")
+        )
         if not launcher_script.is_file():
             messagebox.showerror("Merging", f"Launcher not found:\n{launcher_script}")
             return
@@ -4534,7 +4578,7 @@ class PipelineMasterGUI:
             messagebox.showinfo("Merging", "Stop verification before creating autoct.csv.")
             return
 
-        script_path = Path("Utilities/analyze_auto_ct_csv.py").resolve()
+        script_path = utilities_path("analyze_auto_ct_csv.py")
         if not script_path.is_file():
             messagebox.showerror("Merging", f"Script not found:\n{script_path}")
             return
@@ -5085,7 +5129,7 @@ class PipelineMasterGUI:
         if not ok:
             return
 
-        script_path = Path("Utilities/verifyscenes.py").resolve()
+        script_path = utilities_path("verifyscenes.py")
         if not script_path.is_file():
             messagebox.showerror("Verify Mask", f"Script not found:\n{script_path}")
             return
@@ -5428,7 +5472,7 @@ class PipelineMasterGUI:
         if not ok:
             return
 
-        script_path = Path("Utilities/verifyscenes.py").resolve()
+        script_path = utilities_path("verifyscenes.py")
         if not script_path.is_file():
             messagebox.showerror("Verify Merging", f"Script not found:\n{script_path}")
             return
@@ -5882,7 +5926,7 @@ class PipelineMasterGUI:
             # if shorter -> pad, if taller (e.g. temporary crop pad) -> crop.
             "VF": "pad=iw:max(ih\\,1080):0:(max(ih\\,1080)-ih)/2:black,crop=iw:1080:0:(ih-1080)/2",
         }
-        cmd = ["bash", "Utilities/Rejoin_HEVC_NVENC.sh"]
+        cmd = ["bash", str(utilities_path("Rejoin_HEVC_NVENC.sh"))]
         preview = " ".join(
             [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
             + [shlex.quote(x) for x in cmd]
@@ -5911,7 +5955,7 @@ class PipelineMasterGUI:
             "MKVMERGE_BIN": "mkvmerge",
             "OVERWRITE": "1",
         }
-        cmd = ["bash", "Utilities/remux_replace_video_mkvtoolnix.sh"]
+        cmd = ["bash", str(utilities_path("remux_replace_video_mkvtoolnix.sh"))]
         preview = " ".join(
             [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
             + [shlex.quote(x) for x in cmd]
@@ -5926,7 +5970,7 @@ class PipelineMasterGUI:
         self.merge_codec_var.set(merge_codec)
         return [
             sys.executable,
-            str(Path("Utilities/prepare_seg_mono_to_sbs.py").resolve()),
+            str(utilities_path("prepare_seg_mono_to_sbs.py")),
             "--seg-mono-dir",
             str(Path(self.join_seg_mono_var.get().strip()).resolve()),
             "--sbs-dir",
@@ -5977,7 +6021,7 @@ class PipelineMasterGUI:
             messagebox.showerror("Joining", f"Invalid joining options:\n{exc}")
             return
 
-        join_script = Path("Utilities/Rejoin_HEVC_NVENC.sh").resolve()
+        join_script = utilities_path("Rejoin_HEVC_NVENC.sh")
         if not join_script.is_file():
             messagebox.showerror("Joining", f"Join script not found:\n{join_script}")
             return
@@ -6058,7 +6102,7 @@ class PipelineMasterGUI:
             messagebox.showerror("Mono->SBS", f"Invalid Mono->SBS options:\n{exc}")
             return
 
-        prep_script = Path("Utilities/prepare_seg_mono_to_sbs.py").resolve()
+        prep_script = utilities_path("prepare_seg_mono_to_sbs.py")
         if not prep_script.is_file():
             messagebox.showerror("Mono->SBS", f"Script not found:\n{prep_script}")
             return
@@ -6207,7 +6251,7 @@ class PipelineMasterGUI:
             messagebox.showerror("Remux", f"Invalid remux options:\n{exc}")
             return
 
-        remux_script = Path("Utilities/remux_replace_video_mkvtoolnix.sh").resolve()
+        remux_script = utilities_path("remux_replace_video_mkvtoolnix.sh")
         if not remux_script.is_file():
             messagebox.showerror("Remux", f"Remux script not found:\n{remux_script}")
             return
@@ -8372,7 +8416,7 @@ class PipelineMasterGUI:
         self.depth_scale_factor_var.set(self.DEFAULT_DEPTH_SCALE_FACTOR)
         self.depth_glob_var.set("*.mp4")
         self.depth_runtime_mode_var.set("original")
-        self.depth_worker_script_var.set("./depthcrafter_nogui_batch.py")
+        self.depth_worker_script_var.set("./runners/depthcrafter_nogui_batch.py")
         self.depth_codec_var.set(self.DEFAULT_SCENE_CODEC)
         self._on_depth_mode_changed()
 
@@ -10318,7 +10362,7 @@ class PipelineMasterGUI:
             ),
         }
 
-        cmd = ["bash", "run_depthcrafter_nogui_batch.sh"]
+        cmd = ["bash", str(runner_path("run_depthcrafter_nogui_batch.sh"))]
         preview = " ".join(
             [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
             + [shlex.quote(x) for x in cmd]
@@ -10356,13 +10400,14 @@ class PipelineMasterGUI:
             messagebox.showerror("DepthCrafter", f"Invalid depth options:\n{exc}")
             return
 
-        launcher_script = Path("run_depthcrafter_nogui_batch.sh").resolve()
+        launcher_script = runner_path("run_depthcrafter_nogui_batch.sh")
         if not launcher_script.is_file():
             messagebox.showerror("DepthCrafter", f"Launcher not found:\n{launcher_script}")
             return
 
-        worker_script = Path(self.depth_worker_script_var.get().strip() or "./depthcrafter_nogui_batch.py")
-        worker_abs = worker_script.resolve()
+        worker_abs = resolve_repo_path(
+            self.depth_worker_script_var.get().strip() or "./runners/depthcrafter_nogui_batch.py"
+        )
         if not worker_abs.is_file():
             messagebox.showerror("DepthCrafter", f"Worker script not found:\n{worker_abs}")
             return
@@ -10792,7 +10837,7 @@ class PipelineMasterGUI:
 
         env_updates: dict[str, str] = {
             "PYTHON": sys.executable,
-            "RUNNER": "batch_splatting_runner.py",
+            "RUNNER": str(runner_path("batch_splatting_runner.py")),
             "INPUT_SOURCE_CLIPS": self.splat_input_clips_var.get().strip(),
             "INPUT_DEPTH_MAPS": self.splat_input_depth_var.get().strip(),
             "OUTPUT_SPLATTED": self.splat_output_var.get().strip(),
@@ -10837,9 +10882,9 @@ class PipelineMasterGUI:
         }
 
         launcher_name = (
-            "run_splatting_runner_parallel.sh"
+            str(runner_path("run_splatting_runner_parallel.sh"))
             if workers >= 2
-            else "run_splatting_runner.sh"
+            else str(runner_path("run_splatting_runner.sh"))
         )
         cmd = ["bash", launcher_name]
         preview = " ".join(
@@ -10879,12 +10924,16 @@ class PipelineMasterGUI:
             messagebox.showerror("Splatting", f"Invalid splatting options:\n{exc}")
             return
 
-        launcher_script = Path(cmd[1]).resolve() if len(cmd) > 1 else Path("run_splatting_runner.sh").resolve()
+        launcher_script = (
+            resolve_repo_path(cmd[1]) if len(cmd) > 1 else runner_path("run_splatting_runner.sh")
+        )
         if not launcher_script.is_file():
             messagebox.showerror("Splatting", f"Launcher not found:\n{launcher_script}")
             return
 
-        runner_script = Path(env_updates.get("RUNNER", "batch_splatting_runner.py")).resolve()
+        runner_script = resolve_repo_path(
+            env_updates.get("RUNNER", str(runner_path("batch_splatting_runner.py")))
+        )
         if not runner_script.is_file():
             messagebox.showerror("Splatting", f"Runner not found:\n{runner_script}")
             return
@@ -12156,7 +12205,7 @@ class PipelineMasterGUI:
         if not ok:
             return
 
-        script_path = Path("Utilities/verifyscenes.py").resolve()
+        script_path = utilities_path("verifyscenes.py")
         if not script_path.is_file():
             messagebox.showerror("Verify Splatting", f"Script not found:\n{script_path}")
             return
@@ -12574,7 +12623,7 @@ class PipelineMasterGUI:
         if not ok:
             return
 
-        script_path = Path("Utilities/verifyscenes.py").resolve()
+        script_path = utilities_path("verifyscenes.py")
         if not script_path.is_file():
             messagebox.showerror("Verify Depth", f"Script not found:\n{script_path}")
             return
@@ -13350,7 +13399,7 @@ class PipelineMasterGUI:
         scene_csv_path = str(Path(self._scene_csv_path()).resolve())
         workers = self._get_scene_split_workers()
         ffmpeg_tokens = self._build_scene_split_ffmpeg_tokens()
-        script_path = Path("Utilities/split_scenes_from_csv.py").resolve()
+        script_path = utilities_path("split_scenes_from_csv.py")
         return [
             sys.executable,
             str(script_path),
@@ -14433,7 +14482,7 @@ class PipelineMasterGUI:
         ok, source_path, seg_dir = self._validate_verify_inputs()
         if not ok:
             return
-        script_path = Path("Utilities/verifyscenes.py").resolve()
+        script_path = utilities_path("verifyscenes.py")
         if not script_path.is_file():
             messagebox.showerror("Verify Scenes", f"Script not found:\n{script_path}")
             return
@@ -15278,7 +15327,7 @@ class PipelineMasterGUI:
                 ),
             )
             return
-        script_path = Path("Utilities/split_scenes_from_csv.py").resolve()
+        script_path = utilities_path("split_scenes_from_csv.py")
         if not script_path.is_file():
             messagebox.showerror("Split Scenes", f"Script not found:\n{script_path}")
             return
@@ -16507,10 +16556,10 @@ class PipelineMasterGUI:
             return self.DEFAULT_WINDOW_GEOMETRY
 
     def _load_config(self) -> dict:
-        if not os.path.isfile(self.CONFIG_FILENAME):
+        if not os.path.isfile(self._config_file):
             return {}
         try:
-            with open(self.CONFIG_FILENAME, "r", encoding="utf-8") as f:
+            with open(self._config_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
                 return data
@@ -16521,7 +16570,8 @@ class PipelineMasterGUI:
     def _save_config(self) -> None:
         data = self._collect_config()
         try:
-            with open(self.CONFIG_FILENAME, "w", encoding="utf-8") as f:
+            os.makedirs(os.path.dirname(self._config_file), exist_ok=True)
+            with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception:
             pass
@@ -16561,8 +16611,21 @@ def create_root() -> tk.Tk:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="StereoCrafter Pipeline GUI")
+    parser.add_argument(
+        "--work_dir",
+        default="",
+        help="Optional work directory. When provided, config is loaded/saved as <work_dir>/config_pipeline_master_gui.json.",
+    )
+    args = parser.parse_args()
+    work_dir = str(args.work_dir or "").strip()
+    config_file = (
+        str(Path(work_dir).expanduser().resolve() / "config_pipeline_master_gui.json")
+        if work_dir
+        else str(DEFAULT_PIPELINE_MASTER_CONFIG_PATH)
+    )
     root = create_root()
-    PipelineMasterGUI(root)
+    PipelineMasterGUI(root, config_file=config_file, work_dir_override=work_dir or None)
     root.mainloop()
 
 

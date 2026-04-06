@@ -35,8 +35,11 @@ from pipelines.stereo_video_inpainting import (
     tensor2vid,
     load_inpainting_pipeline
 )
+from dependency.repo_paths import config_path, repo_path
 
 GUI_VERSION = "26-01-13.0"
+CONFIG_FILENAME = str(config_path("config_inpaint.json"))
+INPAINT_HELP_PATH = str(repo_path("dependency", "inpaint_help.json"))
 
 _ACTIVE_FFMPEG_WRITERS: set[subprocess.Popen] = set()
 _ACTIVE_FFMPEG_LOCK = threading.Lock()
@@ -2889,17 +2892,17 @@ class InpaintingGUI(ThemedTk):
 
     def load_config(self):
         try:
-            with open("config_inpaint.json", "r") as f:
+            with open(CONFIG_FILENAME, "r", encoding="utf-8") as f:
                 return json.load(f)
         except FileNotFoundError:
             return {}
 
     def load_help_data(self):
         try:
-            with open(os.path.join("dependency", "inpaint_help.json"), "r", encoding="utf-8") as f:
+            with open(INPAINT_HELP_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
         except FileNotFoundError:
-            logger.warning("dependency/inpaint_help.json not found. No help tips will be available.")
+            logger.warning(f"{INPAINT_HELP_PATH} not found. No help tips will be available.")
             return {}
         except json.JSONDecodeError as e:
             logger.error(f"Error decoding inpaint_help.json: {e}")
@@ -2957,7 +2960,8 @@ class InpaintingGUI(ThemedTk):
     def save_config(self):
         config = self._get_current_config()
         try:
-            with open("config_inpaint.json", "w", encoding='utf-8') as f: # Added encoding for robustness
+            os.makedirs(os.path.dirname(CONFIG_FILENAME), exist_ok=True)
+            with open(CONFIG_FILENAME, "w", encoding='utf-8') as f: # Added encoding for robustness
                 json.dump(config, f, indent=4)
             logger.info("Configuration saved successfully.")
         except Exception as e:

@@ -9,12 +9,16 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
+from dependency.repo_paths import config_path
+
 logger = logging.getLogger(__name__)
+
+DEFAULT_SPLAT_CONFIG_PATH = str(config_path("config_splat.json"))
 
 
 # Default configuration for Splatting GUI
 SPLATTER_DEFAULT_CONFIG = {
-    "DEFAULT_CONFIG_FILENAME": "config_splat.splatcfg",
+    "DEFAULT_CONFIG_FILENAME": DEFAULT_SPLAT_CONFIG_PATH,
     "input_source_clips": "./input_source_clips",
     "input_depth_maps": "./input_depth_maps",
     "multi_map_enabled": False,
@@ -85,7 +89,7 @@ SPLATTER_DEFAULT_CONFIG = {
 
 
 def load_config(
-    config_filename: str = "config_splat.splatcfg",
+    config_filename: str = DEFAULT_SPLAT_CONFIG_PATH,
     defaults: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Load configuration from a JSON file with defaults.
@@ -104,7 +108,7 @@ def load_config(
         return config
 
     try:
-        with open(config_filename, "r") as f:
+        with open(config_filename, "r", encoding="utf-8") as f:
             loaded_config = json.load(f)
         
         # Apply loaded values, preserving structure
@@ -125,7 +129,7 @@ def load_config(
 
 def save_config(
     config: Dict[str, Any],
-    config_filename: str = "config_splat.splatcfg",
+    config_filename: str = DEFAULT_SPLAT_CONFIG_PATH,
 ) -> bool:
     """Save configuration to a JSON file.
 
@@ -137,7 +141,10 @@ def save_config(
         True if successful, False otherwise
     """
     try:
-        with open(config_filename, "w") as f:
+        parent = os.path.dirname(config_filename)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(config_filename, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
         logger.info(f"Saved config to: {config_filename}")
         return True
@@ -160,7 +167,7 @@ def load_settings_from_file(
         Dictionary of loaded settings
     """
     try:
-        with open(filename, "r") as f:
+        with open(filename, "r", encoding="utf-8") as f:
             loaded_config = json.load(f)
         
         # Apply to tkinter variables if provided
@@ -193,7 +200,10 @@ def save_settings_to_file(
         True if successful, False otherwise
     """
     try:
-        with open(filename, "w") as f:
+        parent = os.path.dirname(str(filename))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(filename, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
         logger.info(f"Saved settings to: {filename}")
         return True
@@ -334,7 +344,7 @@ class ConfigManager:
     def __init__(
         self,
         defaults: Optional[Dict[str, Any]] = None,
-        config_filename: str = "config_splat.splatcfg",
+        config_filename: str = DEFAULT_SPLAT_CONFIG_PATH,
     ):
         """Initialize the configuration manager.
 

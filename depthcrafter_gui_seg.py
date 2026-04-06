@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import logging # Import standard logging
 import random
+from dependency.repo_paths import config_path, repo_path
 
 # Configure a logger for this module
 _logger = logging.getLogger(__name__)
@@ -133,8 +134,8 @@ class Tooltip:
         self.tooltip_window = None
         
 class DepthCrafterGUI:
-    CONFIG_FILENAME = "config_depthcrafter.json"
-    HELP_CONTENT_FILENAME = os.path.join("depthcrafter", "help_content.json")
+    CONFIG_FILENAME = str(config_path("config_depthcrafter.json"))
+    HELP_CONTENT_FILENAME = str(repo_path("depthcrafter", "help_content.json"))
     MOVE_ORIGINAL_TO_FINISHED_FOLDER_ON_COMPLETION = True
     SETTINGS_FILETYPES = [("JSON files", "*.json"), ("All files", "*.*")]
     LAST_SETTINGS_DIR_CONFIG_KEY = "last_settings_dir"
@@ -1874,7 +1875,7 @@ class DepthCrafterGUI:
     def load_config(self):
         if os.path.exists(self.CONFIG_FILENAME):
             try:
-                with open(self.CONFIG_FILENAME, "r") as f: config = json.load(f)
+                with open(self.CONFIG_FILENAME, "r", encoding="utf-8") as f: config = json.load(f)
                 loaded_settings_for_tkvars = {k: v for k, v in config.items() if k in self.all_tk_vars}
                 for key, value in loaded_settings_for_tkvars.items():
                     if key in self.all_tk_vars:
@@ -2413,7 +2414,8 @@ class DepthCrafterGUI:
         config["single_file_mode_active"] = self.single_file_mode_active
         
         try:
-            with open(self.CONFIG_FILENAME, "w") as f: json.dump(config, f, indent=4)
+            os.makedirs(os.path.dirname(self.CONFIG_FILENAME), exist_ok=True)
+            with open(self.CONFIG_FILENAME, "w", encoding="utf-8") as f: json.dump(config, f, indent=4)
         except Exception as e: 
             _logger.warning(f"Warning (GUI save_config): Could not save config: {e}")
 

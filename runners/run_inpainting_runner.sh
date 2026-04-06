@@ -2,8 +2,13 @@
 set -euo pipefail
 
 # Edit these paths/values as needed.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$REPO_ROOT"
+
 PYTHON="${PYTHON:-python3}"
-RUNNER="${RUNNER:-batch_inpainting_runner.py}"
+RUNNER="${RUNNER:-$SCRIPT_DIR/batch_inpainting_runner.py}"
 INPUT_DIR="${INPUT_DIR:-./work/splat/}"
 INPUT_VIDEO="${INPUT_VIDEO:-}"                       # if set (non-empty), overrides INPUT_DIR
 OUTPUT_DIR="${OUTPUT_DIR:-./work/output/}"

@@ -1,6 +1,6 @@
 # Changes in this Fork
 
-This fork is tested only with Linux (ubuntu 22.04 and 24.04 in my case), Windows "should" work for gui versions but pipeline_master_gui and all auto batches uses bash scripts that needs to be reimplemented using powershell <br>
+This fork is tested only with Linux and now WSL (ubuntu 22.04 and 24.04 in my case), Windows "should" work for gui versions but pipeline_master_gui and all auto batches uses bash scripts that needs to be reimplemented using powershell <br>
 Aim to this Fork is to create a full sbs 1080p 3d content as result with a one-click solution but keeping ways to customize it.<br>
 Supports only 8 bit format (inpainting is 8 bit anyway so it's actually impossible to get 10 bit hdr end to end) with hardcoded yuv444p during all steps to preserve colors transitions.
 All runner scripts are tuned for intel 265k, 48GB ram and RTX 4090 and specifically for 1920*800 content<br>
@@ -13,6 +13,7 @@ All the extra scripts are made multithreading/parallel when possible, helping re
 - upgrade numpy!! v2.x is much faster and totally compatible with this workflow
 - updated pyproject.toml for linux and added sh script for quick install
 - Pytorch/cuda will not be overwritten automatically
+- Forward-Warp CUDA build is now treated as optional/experimental and is skipped by default in the standard Linux/Vast install flow
 - changed xformers and Triton-Windows platform dependant (Win)
 - added SceneDetect
 - added scripts for quick install on docker (tested vast.ai only)
@@ -172,3 +173,11 @@ Long live to 3D!!
 - [fix] Scene names are back with 4 digits to avoid incorrect clip sequence during steps
 - [fix] Some fields on Merge step was resetting to default on GUI reload
 - [fix] Several other minor fixes
+
+2026-04-05 (WSL ready)
+- [change] removed display dependency from splatting step
+- [change] Forward Warp build now optional (default: off)
+- [change] improved install script + WSL friendly + ffmpeg checks
+- [change] removed RealESRGAN step completely
+- [change] repo mini refactor, log files into /logs, configs into /configs, sh scripts and batch runners into /runners
+- [change] pipeline_master_gui now supports multiple configurations, in order to work with more projects simultaneously, to enable custom config (json will be saved and honored into the work folder) launch with arg --work_folder "work path"

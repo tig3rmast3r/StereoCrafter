@@ -4,8 +4,13 @@ set -euo pipefail
 # --------------------------------------------
 # User-editable parameters (env-overridable)
 # --------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$REPO_ROOT"
+
 PYTHON="${PYTHON:-python3}"
-RUNNER="${RUNNER:-batch_splatting_runner.py}"
+RUNNER="${RUNNER:-$SCRIPT_DIR/batch_splatting_runner.py}"
 
 INPUT_SOURCE_CLIPS="${INPUT_SOURCE_CLIPS:-./work/seg/}"
 INPUT_DEPTH_MAPS="${INPUT_DEPTH_MAPS:-./work/depthmap/}"

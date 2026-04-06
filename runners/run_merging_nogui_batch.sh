@@ -4,11 +4,15 @@ set -euo pipefail
 # --------------------------------------------
 # User-editable parameters (PATHS ONLY)
 # --------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$REPO_ROOT"
 
 PYTHON="${PYTHON:-python3}"
 
 # Headless merging runner (the CT version also includes replace-mask streaming)
-RUNNER="${RUNNER:-merging_nogui_batch.py}"
+RUNNER="${RUNNER:-$SCRIPT_DIR/merging_nogui_batch.py}"
 
 # Folder containing the inpainted outputs (e.g. *_inpainted_right_eye.mp4 or *_inpainted_sbs.mp4)
 INPAINTED_FOLDER="${INPAINTED_FOLDER:-./work/output/}"

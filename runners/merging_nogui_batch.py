@@ -26,8 +26,10 @@ import shutil
 import threading
 import time
 import faulthandler
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -35,6 +37,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from decord import VideoReader, cpu  # type: ignore
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # These utilities are already used by merging_gui.py
 from dependency.stereocrafter_util import (  # type: ignore
@@ -45,31 +51,25 @@ from dependency.stereocrafter_util import (  # type: ignore
     start_ffmpeg_pipe_process,
     apply_color_transfer,
 )
+from dependency.repo_paths import log_path
 
 LOG = logging.getLogger("merge_runner")
 _FAULTHANDLER_LOG = None
 PLANNED_RESTART_CODE = 99
 
 
-def _enable_debug_faulthandler(worker_id: Optional[int] = None) -> None:
+def _enable_debug_faulthandler() -> None:
     """Enable crash stack dumps for nogui runs when debug mode is enabled."""
     global _FAULTHANDLER_LOG
     try:
-        os.makedirs("logs", exist_ok=True)
-        if worker_id is None:
-            log_name = "merging_nogui_batch_parallel_faulthandler.log"
-        else:
-            log_name = (
-                f"merging_nogui_batch_parallel_faulthandler_w{int(worker_id)}.log"
-            )
-        log_path = os.path.join("logs", log_name)
-        _FAULTHANDLER_LOG = open(log_path, "a", buffering=1)
+        log_file = log_path("merging_nogui_batch_faulthandler.log", create_dir=True)
+        _FAULTHANDLER_LOG = open(log_file, "a", buffering=1)
         _FAULTHANDLER_LOG.write(
             f"\n=== debug session {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} ===\n"
         )
         _FAULTHANDLER_LOG.flush()
         faulthandler.enable(file=_FAULTHANDLER_LOG, all_threads=True)
-        LOG.info(f"Debug faulthandler active: {log_path}")
+        LOG.info(f"Debug faulthandler active: {log_file}")
     except Exception as e:
         LOG.warning(f"Failed to enable debug faulthandler: {e}")
 
@@ -104,9 +104,8 @@ def _clear_stop_marker(path: str) -> None:
         pass
 
 
-def _resume_state_path(output_folder: str, worker_id: int, num_workers: int) -> str:
-    suffix = f".w{int(worker_id)}of{int(num_workers)}"
-    return os.path.join(os.path.abspath(output_folder), f".merge_resume_state{suffix}.json")
+def _resume_state_path(output_folder: str) -> str:
+    return os.path.join(os.path.abspath(output_folder), ".merge_resume_state.json")
 
 
 def _load_resume_state(path: str) -> Optional[Dict[str, object]]:
@@ -580,6 +579,7 @@ CT_CSV_BLEND_OSC_ALPHA = 0.80
 CT_CSV_BLEND_OSC_WINDOW = 6
 CT_CSV_BLEND_MAX_ACTIVE_PRESETS = 4
 CT_CSV_BLEND_PRUNE_EPS = 1e-3
+CT_MIN_MASK_PIXELS = 64
 
 
 def _resolve_ct_auto_mode_label(value: Any) -> str:
@@ -2226,6 +2226,7 @@ def process_one_job(
     device = torch.device("cuda" if use_gpu else "cpu")
     use_gpu_mask_ops = bool(settings.get("use_gpu_mask_ops", use_gpu)) and use_gpu
     ct_usage_counts = {int(p["id"]): 0.0 for p in CT_PRESETS}
+    ct_low_mask_frames = 0
     selected_ct_label = _resolve_ct_preset_label(
         str(settings.get("ct_preset", CT_PRESET_DEFAULT_LABEL))
     )
@@ -2445,6 +2446,12 @@ def process_one_job(
                         original_left_3 = original_left[fi].cpu()
                         warped_3 = warped_original[fi].cpu()
                         mask_bin_1hw = mask_bin[fi].cpu()
+                        mask_pixels = int((mask_bin_1hw > 0.5).sum().item())
+
+                        if mask_pixels < CT_MIN_MASK_PIXELS:
+                            ct_low_mask_frames += 1
+                            adjusted_frames.append(inpainted_3.to(device))
+                            continue
 
                         if ct_auto_mode == CT_AUTO_MODE_ON:
                             best_frame, best_preset_id = _select_best_auto_ct_preset_frame(
@@ -2610,6 +2617,11 @@ def process_one_job(
                     ]
                 )
                 LOG.info(f"CT usage [{inpainted_base_name}] {ct_line}")
+            elif ct_low_mask_frames > 0:
+                LOG.info(
+                    f"CT skipped on low-mask frames [{inpainted_base_name}] "
+                    f"frames={ct_low_mask_frames} min_mask_pixels={CT_MIN_MASK_PIXELS}"
+                )
 
         # 6) Finalize ffmpeg
         try:
@@ -2693,7 +2705,7 @@ def process_one_job(
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Headless parallel batch runner for merging_gui pipeline (streaming)."
+        description="Headless single-worker batch runner for merging_gui pipeline (streaming)."
     )
     ap.add_argument("--inpainted-folder", required=True, help="Fallback folder containing *_inpainted_right_eye.mp4 or *_inpainted_sbs.mp4")
     ap.add_argument("--preferred-inpainted-folder", default="", help="Optional preferred folder checked before --inpainted-folder (used for sharpened outputs).")
@@ -2701,12 +2713,10 @@ def main() -> int:
     ap.add_argument("--original-folder", required=True, help="Folder containing original left-eye videos (single/dual-input case)")
     ap.add_argument("--output-folder", required=True, help="Output folder for merged files")
     ap.add_argument("--stop-marker", default="", help="Path to a marker file used for graceful stop-after-current-file behavior.")
-    ap.add_argument("--restart-every", type=int, default=0, help="Planned process restart after this many successfully processed non-skip files per worker (0=disabled).")
+    ap.add_argument("--restart-every", type=int, default=0, help="Planned process restart after this many successfully processed non-skip files (0=disabled).")
     ap.add_argument("--only", default=None, help="Process only one file (basename or prefix match)")
     ap.add_argument("--debug", action="store_true", default=False, help="Enable debug mode (or set MERGE_DEBUG=1).")
     ap.add_argument("--verbosity", type=int, default=None, help="0=warnings,1=info,2=debug")
-    ap.add_argument("--num-workers", type=int, default=1, help="Total parallel workers (processes).")
-    ap.add_argument("--worker-id", type=int, default=0, help="This worker index in [0, num-workers-1].")
 
     # Overrides for the most relevant knobs (everything else stays in DEFAULTS above)
     ap.add_argument("--output-format", choices=OUTPUT_FORMAT_CHOICES, default=None)
@@ -2759,7 +2769,7 @@ def main() -> int:
     verbosity = int(args.verbosity) if args.verbosity is not None else (2 if debug_enabled else 1)
     setup_logging(verbosity)
     if debug_enabled:
-        _enable_debug_faulthandler(args.worker_id)
+        _enable_debug_faulthandler()
         LOG.info("Debug mode enabled (MERGE_DEBUG/--debug).")
 
     # Build settings
@@ -2852,6 +2862,7 @@ def main() -> int:
         else _default_stop_marker_path(args.output_folder)
     )
     restart_every = max(0, int(args.restart_every or 0))
+    resume_path = _resume_state_path(args.output_folder)
 
     # Collect jobs
     pairs = collect_jobs(
@@ -2862,15 +2873,6 @@ def main() -> int:
         output_folder=args.output_folder,
         only=args.only,
     )
-    nw = max(1, int(args.num_workers))
-    wid = int(args.worker_id)
-    if wid < 0 or wid >= nw:
-        LOG.error(f"Invalid --worker-id {wid} for --num-workers {nw}")
-        return 2
-    resume_path = _resume_state_path(args.output_folder, worker_id=wid, num_workers=nw)
-    if nw > 1:
-        pairs = [p for i, p in enumerate(pairs) if (i % nw) == wid]
-        LOG.info(f"[SHARD] worker {wid}/{nw} will process {len(pairs)} jobs")
     if not pairs:
         LOG.warning("No matching jobs found.")
         _clear_resume_state(resume_path)
@@ -2879,24 +2881,20 @@ def main() -> int:
     resume_state = _load_resume_state(resume_path)
     resume_start_idx = 0
     if resume_state:
-        same_worker = (
-            int(resume_state.get("worker_id", -1)) == wid
-            and int(resume_state.get("num_workers", -1)) == nw
-        )
         last_ok_idx = resume_state.get("last_ok_idx")
-        if same_worker and isinstance(last_ok_idx, int) and 0 <= last_ok_idx < len(pairs):
+        if isinstance(last_ok_idx, int) and 0 <= last_ok_idx < len(pairs):
             resume_start_idx = last_ok_idx + 1
             if resume_start_idx < len(pairs):
                 LOG.info(
-                    f"[RESUME] worker {wid}/{nw} fast resume enabled. "
-                    f"Starting from job {resume_start_idx + 1}/{len(pairs)} without recheck."
+                    f"[RESUME] Fast resume enabled. Starting from job "
+                    f"{resume_start_idx + 1}/{len(pairs)} without recheck."
                 )
             else:
-                LOG.info(f"[RESUME] worker {wid}/{nw} checkpoint already points past the last job. Clearing stale state.")
+                LOG.info("[RESUME] Checkpoint already points past the last job. Clearing stale state.")
                 _clear_resume_state(resume_path)
                 return 0
         else:
-            LOG.warning(f"[RESUME] worker {wid}/{nw} invalid merge resume state, clearing: {resume_state}")
+            LOG.warning(f"[RESUME] Invalid merge resume state, clearing: {resume_state}")
             _clear_resume_state(resume_path)
 
     try:
@@ -3008,8 +3006,6 @@ def main() -> int:
                 resume_path,
                 {
                     "kind": "merge_resume",
-                    "worker_id": wid,
-                    "num_workers": nw,
                     "last_ok_idx": local_idx,
                     "last_ok_input": inpainted_path,
                     "updated_at": int(time.time()),
@@ -3020,7 +3016,6 @@ def main() -> int:
                 if restart_every > 0 and processed_this_run >= restart_every and (local_idx + 1) < len(pairs):
                     LOG.info(
                         "[PLANNED RESTART] "
-                        f"worker={wid}/{nw} "
                         f"processed_this_run={processed_this_run} "
                         f"last_ok_idx={local_idx} "
                         f"code={PLANNED_RESTART_CODE}"

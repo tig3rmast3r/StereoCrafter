@@ -18,6 +18,7 @@ from .stereocrafter_util import (
     release_cuda_memory,
     get_video_stream_info,
 )
+from .repo_paths import config_path
 
 VERSION = "26-01-30.0"
 
@@ -102,18 +103,9 @@ class VideoPreviewer(ttk.Frame):
         self.loop_playback_var = tk.BooleanVar(value=False)
         # Restore Loop state from the main GUI config file (lightweight; safe if missing)
         try:
-            # Prefer the canonical .splatcfg default config file; fall back to legacy .json
-            cfg_path = (
-                "config_splat.splatcfg"
-                if os.path.exists("config_splat.splatcfg")
-                else (
-                    "config_splat.json"
-                    if os.path.exists("config_splat.json")
-                    else "config_splat.splatcfg"
-                )
-            )
+            cfg_path = str(config_path("config_splat.json"))
             if os.path.exists(cfg_path):
-                with open(cfg_path, "r") as f:
+                with open(cfg_path, "r", encoding="utf-8") as f:
                     _cfg = json.load(f) or {}
                 if "loop_playback" in _cfg:
                     self.loop_playback_var.set(bool(_cfg.get("loop_playback", False)))
@@ -146,22 +138,14 @@ class VideoPreviewer(ttk.Frame):
         """Public method to be called when the parent GUI is closing."""
         # Persist Loop state back into the main GUI config file (merge; do not clobber)
         try:
-            # Prefer the canonical .splatcfg default config file; fall back to legacy .json
-            cfg_path = (
-                "config_splat.splatcfg"
-                if os.path.exists("config_splat.splatcfg")
-                else (
-                    "config_splat.json"
-                    if os.path.exists("config_splat.json")
-                    else "config_splat.splatcfg"
-                )
-            )
+            cfg_path = str(config_path("config_splat.json"))
             _cfg = {}
             if os.path.exists(cfg_path):
-                with open(cfg_path, "r") as f:
+                with open(cfg_path, "r", encoding="utf-8") as f:
                     _cfg = json.load(f) or {}
             _cfg["loop_playback"] = bool(self.loop_playback_var.get())
-            with open(cfg_path, "w") as f:
+            os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+            with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(_cfg, f, indent=4)
         except Exception:
             pass

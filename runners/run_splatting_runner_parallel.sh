@@ -6,8 +6,14 @@ set -euo pipefail
 # - Build source/depth pairs
 # - Shard pairs round-robin into per-worker temp folders (symlinks)
 # - Launch one run_splatting_runner.sh per worker with isolated INPUT_* and STOP_MARKER
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOG_DIR="$REPO_ROOT/logs"
+mkdir -p "$LOG_DIR"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$REPO_ROOT"
 
-RUN_SCRIPT="${RUN_SCRIPT:-run_splatting_runner.sh}"
+RUN_SCRIPT="${RUN_SCRIPT:-$SCRIPT_DIR/run_splatting_runner.sh}"
 WORKERS="${WORKERS:-2}"
 
 INPUT_SOURCE_CLIPS="${INPUT_SOURCE_CLIPS:-./work/seg/}"
@@ -16,7 +22,7 @@ OUTPUT_SPLATTED="${OUTPUT_SPLATTED:-./work/splat/}"
 
 SHARD_ROOT="${SHARD_ROOT:-${TMPDIR:-/tmp}/splat_parallel_${USER:-user}_$$}"
 KEEP_SHARDS="${KEEP_SHARDS:-0}"   # 1 keeps shard folders for debugging
-LOG_PREFIX="${LOG_PREFIX:-splat_worker}"
+LOG_PREFIX="${LOG_PREFIX:-$LOG_DIR/splat_worker}"
 
 STOP_REQUEST_FILE="${TMPDIR:-/tmp}/splat_parallel_stop_${$}.flag"
 INTERRUPT_COUNT=0

@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from merging_nogui_batch import (
+from runners.merging_nogui_batch import (
     CT_AUTO_EVAL_MAX_WORKERS,
     _select_best_auto_ct_preset_frame,
     collect_jobs,

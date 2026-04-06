@@ -37,6 +37,10 @@ import time
 import traceback
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from dependency.ffmpeg_encoding_profiles import (
     normalize_codec_strict,
     resolve_depth_final_grayscale_profile,
@@ -292,7 +296,7 @@ def _postprocess_depth(
 
 
 def run(
-    worker_script: str = "./depthcrafter_nogui_batch.py",
+    worker_script: str = "./runners/depthcrafter_nogui_batch.py",
     input_dir: str = ".",
     output_dir: str = "./out",
     glob: str = "*.mp4",
@@ -1061,7 +1065,7 @@ def _apply_allocator_conf(conf: str) -> None:
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--worker_script", default="./depthcrafter_nogui_batch.py")
+    ap.add_argument("--worker_script", default="./runners/depthcrafter_nogui_batch.py")
     ap.add_argument("--input_dir", default=".")
     ap.add_argument("--output_dir", default="./out")
     ap.add_argument("--glob", default="*.mp4")

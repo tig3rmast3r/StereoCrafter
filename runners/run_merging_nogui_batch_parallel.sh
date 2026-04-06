@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOG_DIR="$REPO_ROOT/logs"
+mkdir -p "$LOG_DIR"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$REPO_ROOT"
+
 PYTHON="${PYTHON:-python3}"
-RUNNER="${RUNNER:-merging_nogui_batch_parallel.py}"
+RUNNER="${RUNNER:-$SCRIPT_DIR/merging_nogui_batch_parallel.py}"
 
 INPAINTED_FOLDER="${INPAINTED_FOLDER:-./work/output/}"
 PREFERRED_INPAINTED_FOLDER="${PREFERRED_INPAINTED_FOLDER:-}"
@@ -148,8 +155,8 @@ echo "[DBG] MERGE_DEBUG=$MERGE_DEBUG"
 
 if [ "$WORKERS" -eq 1 ]; then
   echo "[INFO] WORKERS=1 -> switching to single-run launcher: run_merging_nogui_batch.sh"
-  export RUNNER="merging_nogui_batch.py"
-  exec bash run_merging_nogui_batch.sh
+  export RUNNER="$SCRIPT_DIR/merging_nogui_batch.py"
+  exec bash "$SCRIPT_DIR/run_merging_nogui_batch.sh"
 fi
 
 cleanup_runtime() {
@@ -488,7 +495,7 @@ trap cleanup_runtime EXIT
 
 for ((wid=0; wid<WORKERS; wid++)); do
   wids+=("$wid")
-  log_file="merge_worker_${wid}.log"
+  log_file="$LOG_DIR/merge_worker_${wid}.log"
   worker_logs+=("$log_file")
   worker_line_offsets[$wid]=0
   worker_done_counts[$wid]=0
@@ -530,7 +537,7 @@ while [ "$remaining" -gt 0 ]; do
     wid="${wids[$i]}"
 
     if [ "$code" -ne 0 ]; then
-      echo "[ERR ][CRASH] worker $wid exit_code=$code (log: merge_worker_${wid}.log)"
+      echo "[ERR ][CRASH] worker $wid exit_code=$code (log: $LOG_DIR/merge_worker_${wid}.log)"
       fail=1
       if [ "$fail_code" -eq 0 ]; then
         fail_code="$code"

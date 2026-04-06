@@ -87,13 +87,16 @@ segmenting_WIP/
 sharpen_WIP/
 temp/
 work/
-logs/
+logs/*
+!logs/.gitkeep
 *temp.sh
 *.log
 *.csv
 context/
 Utilities/realesrgan/models/realesrgan-x4plus.bin
 Utilities/realesrgan/models/realesrgan-x4plus.param
+configs/*
+!configs/.gitkeep
 config*.json
 yolo12s.pt
 yolo12n.pt
@@ -103,7 +106,5 @@ models/res10_300x300_ssd_iter_140000.caffemodel
 models/deploy.prototxt.txt
 convergence_tool_config.json
 sidecaredit_config.json
-config_merging.mergecfg
-config_splat.splatcfg
 nul
 AGENTS.md

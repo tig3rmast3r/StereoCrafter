@@ -4,9 +4,14 @@ set -euo pipefail
 # --------------------------------------------
 # User-editable parameters (via env override)
 # --------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$REPO_ROOT"
+
 PYTHON="${PYTHON:-python}"
-RUNNER="${RUNNER:-batch_depthcrafter_runner.py}"
-WORKER_SCRIPT="${WORKER_SCRIPT:-./depthcrafter_nogui_batch.py}"
+RUNNER="${RUNNER:-$SCRIPT_DIR/batch_depthcrafter_runner.py}"
+WORKER_SCRIPT="${WORKER_SCRIPT:-$SCRIPT_DIR/depthcrafter_nogui_batch.py}"
 
 INPUT_DIR="${INPUT_DIR:-./work/seg/}"
 OUTPUT_DIR="${OUTPUT_DIR:-./work/depthmap/}"

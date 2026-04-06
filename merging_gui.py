@@ -21,7 +21,10 @@ import queue
 import faulthandler
 import signal
 from concurrent.futures import ThreadPoolExecutor
-from mask_formerge_nogui import load_motion_defaults as load_mask_formerge_motion_defaults
+from dependency.repo_paths import config_path, log_path
+from runners.mask_formerge_nogui import (
+    load_motion_defaults as load_mask_formerge_motion_defaults,
+)
 from dependency.stereocrafter_util import (
     Tooltip,
     logger,
@@ -52,9 +55,8 @@ def _enable_debug_faulthandler() -> None:
     """Enable crash stack dumps when debug mode is enabled."""
     global _FAULTHANDLER_LOG
     try:
-        os.makedirs("logs", exist_ok=True)
-        log_path = os.path.join("logs", "merging_gui_faulthandler.log")
-        _FAULTHANDLER_LOG = open(log_path, "a", buffering=1)
+        log_file = log_path("merging_gui_faulthandler.log", create_dir=True)
+        _FAULTHANDLER_LOG = open(log_file, "a", buffering=1)
         _FAULTHANDLER_LOG.write(
             f"\n=== debug session {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} ===\n"
         )
@@ -67,7 +69,7 @@ def _enable_debug_faulthandler() -> None:
         except Exception:
             # Keep crash dumping even if signal registration is not available.
             pass
-        logger.info(f"Debug faulthandler active: {log_path}")
+        logger.info(f"Debug faulthandler active: {log_file}")
     except Exception as e:
         logger.warning(f"Failed to enable debug faulthandler: {e}")
 
@@ -1661,7 +1663,10 @@ def _apply_ct_preset_frame(
 
 
 class MergingGUI(ThemedTk):
-    MOTION_DEFAULTS_CONFIG_PATH = "config_mask_formerge_nogui_motion_defaults.json"
+    MOTION_DEFAULTS_CONFIG_PATH = str(
+        config_path("config_mask_formerge_nogui_motion_defaults.json")
+    )
+    CONFIG_FILENAME = str(config_path("config_merging.json"))
     PREVIEW_SHADOW_WARMUP_MAX_FRAMES = 20
     PREVIEW_SHADOW_WARMUP_RESIDUAL = 0.05
     OUTPUT_FORMAT_CHOICES = [
@@ -6105,7 +6110,8 @@ class MergingGUI(ThemedTk):
             # so these stray lines are removed.
 
             try:
-                with open("config_merging.mergecfg", "w") as f:
+                os.makedirs(os.path.dirname(self.CONFIG_FILENAME), exist_ok=True)
+                with open(self.CONFIG_FILENAME, "w", encoding="utf-8") as f:
                     json.dump(config, f, indent=4)
                 logger.info("Merging GUI configuration saved.")
             except Exception as e:
@@ -6114,7 +6120,7 @@ class MergingGUI(ThemedTk):
     def _load_config(self):
         """Loads configuration from a JSON file."""
         try:
-            with open("config_merging.mergecfg", "r") as f:
+            with open(self.CONFIG_FILENAME, "r", encoding="utf-8") as f:
                 return json.load(f)
         except FileNotFoundError:
             return {}
@@ -6125,14 +6131,15 @@ class MergingGUI(ThemedTk):
     def load_settings_dialog(self):
         """Loads settings from a user-selected JSON file."""
         filepath = filedialog.askopenfilename(
-            defaultextension=".mergecfg",
-            filetypes=[("Merge Config Files", "*.mergecfg"), ("All files", "*.*")],
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
             title="Load Settings from File",
+            initialdir=os.path.dirname(self.CONFIG_FILENAME),
         )
         if not filepath:
             return
         try:
-            with open(filepath, "r") as f:
+            with open(filepath, "r", encoding="utf-8") as f:
                 settings_to_load = json.load(f)
 
             self._apply_settings(settings_to_load)
@@ -6150,14 +6157,15 @@ class MergingGUI(ThemedTk):
             return  # get_current_settings failed validation
 
         filepath = filedialog.asksaveasfilename(
-            defaultextension=".mergecfg",
-            filetypes=[("Merge Config Files", "*.mergecfg"), ("All files", "*.*")],
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
             title="Save Settings to File",
+            initialdir=os.path.dirname(self.CONFIG_FILENAME),
         )
         if not filepath:
             return
         try:
-            with open(filepath, "w") as f:
+            with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(config_to_save, f, indent=4)
             logger.info(f"Settings saved to {filepath}")
         except Exception as e:

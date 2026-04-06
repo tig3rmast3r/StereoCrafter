@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$REPO_ROOT"
+
 PYTHON="${PYTHON:-python3}"
-RUNNER="${RUNNER:-batch_inpaint_sharpen_runner.py}"
+RUNNER="${RUNNER:-$SCRIPT_DIR/batch_inpaint_sharpen_runner.py}"
 INPUT_DIR="${INPUT_DIR:-./work/output/}"
 MASK_DIR="${MASK_DIR:-./work/mask/}"
 OUTPUT_DIR="${OUTPUT_DIR:-./work/output-sharpen/}"

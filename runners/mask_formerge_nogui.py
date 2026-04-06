@@ -21,7 +21,9 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -30,7 +32,12 @@ import torch
 import torch.nn.functional as F
 from decord import VideoReader, cpu  # type: ignore
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from dependency.ffmpeg_encoding_profiles import resolve_mask_for_merge_grayscale_profile
+from dependency.repo_paths import config_path
 
 LOG = logging.getLogger("mask_formerge")
 
@@ -50,7 +57,7 @@ SHADOW_AREA_RESET_ABS_PX_DEFAULT = 0.0
 SHADOW_COMPONENT_MERGE_Y_TOL_PX_DEFAULT = 4
 SHADOW_MOTION_GAIN_DEFAULT = 1.0
 SHADOW_MOTION_DEADZONE_PX_DEFAULT = 20.0
-MOTION_DEFAULTS_FILENAME = "config_mask_formerge_nogui_motion_defaults.json"
+MOTION_DEFAULTS_FILENAME = str(config_path("config_mask_formerge_nogui_motion_defaults.json"))
 MOTION_DEFAULTS_ENV = "MASK_FORMERGE_MOTION_DEFAULTS_JSON"
 MOTION_DEFAULTS_FALLBACK: Dict[str, Any] = {
     "shadow_motion_gain": SHADOW_MOTION_GAIN_DEFAULT,
@@ -116,7 +123,7 @@ def load_motion_defaults() -> Dict[str, Any]:
     if os.path.isabs(cfg_raw):
         cfg_path = cfg_raw
     else:
-        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), cfg_raw)
+        cfg_path = str(Path(REPO_ROOT, cfg_raw))
     cfg_path = os.path.abspath(cfg_path)
     if not os.path.isfile(cfg_path):
         return defaults

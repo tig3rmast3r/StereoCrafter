@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOG_DIR="$REPO_ROOT/logs"
+mkdir -p "$LOG_DIR"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$REPO_ROOT"
+
 PYTHON="${PYTHON:-python3}"
-RUNNER="${RUNNER:-mask_formerge_nogui.py}"
+RUNNER="${RUNNER:-$SCRIPT_DIR/mask_formerge_nogui.py}"
 
 # Input replace-mask folder from merge defaults
 REPLACE_MASK_FOLDER="${REPLACE_MASK_FOLDER:-./work/mask/}"
@@ -484,7 +491,7 @@ run_worker_with_retries() {
 
 for ((wid=0; wid<WORKERS; wid++)); do
   wids+=("$wid")
-  log_file="mask_formerge_worker_${wid}.log"
+  log_file="$LOG_DIR/mask_formerge_worker_${wid}.log"
   worker_logs+=("$log_file")
   worker_line_offsets[$wid]=0
   worker_done_counts[$wid]=0
@@ -526,7 +533,7 @@ while [ "$remaining" -gt 0 ]; do
     wid="${wids[$i]}"
 
     if [ "$code" -ne 0 ]; then
-      echo "[ERR ][CRASH] worker $wid exit_code=$code (log: mask_formerge_worker_${wid}.log)"
+      echo "[ERR ][CRASH] worker $wid exit_code=$code (log: $LOG_DIR/mask_formerge_worker_${wid}.log)"
       fail=1
       if [ "$fail_code" -eq 0 ]; then
         fail_code="$code"
