@@ -174,10 +174,11 @@ Long live to 3D!!
 - [fix] Some fields on Merge step was resetting to default on GUI reload
 - [fix] Several other minor fixes
 
-2026-04-05 (WSL ready)
+2026-04-06 (WSL ready)
 - [change] removed display dependency from splatting step
 - [change] Forward Warp build now optional (default: off)
 - [change] improved install script + WSL friendly + ffmpeg checks
 - [change] removed RealESRGAN step completely
 - [change] repo mini refactor, log files into /logs, configs into /configs, sh scripts and batch runners into /runners
-- [change] pipeline_master_gui now supports multiple configurations, in order to work with more projects simultaneously, to enable custom config (json will be saved and honored into the work folder) launch with arg --work_folder "work path"
+- [change] pipeline_master_gui now supports multiple configurations, in order to work with more projects simultaneously, to enable custom config (json will be saved and honored into the work folder) launch with arg --work_dir "work path"
+- [fix] test run suddenly stops on merge step in some cases

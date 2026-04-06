@@ -1,6 +1,6 @@
 # Linux/WSL Install (Fork)
 
-Linux and WSL only for this fork atm. Windows partially works (only gui-nogui versions without sh batches, pipeline_master_gui not working as is tied to sh runners), and is not supported here.<br>
+Linux and WSL only for this fork atm. Windows partially works (only gui-nogui versions without sh batches, pipeline_master_gui not working as is tied to sh runners), and is not supported here. I strongly suggest using WSL anyway, it works already and have no downsides<br>
 <br>
 Preset values in this fork are tuned for this reference machine: Intel 265K, 48 GB RAM, RTX 4090. On different hardware, expect to adjust settings.
 
@@ -14,8 +14,7 @@ cd StereoCrafter
 Run from repo root:
 
 ```bash
-find . -maxdepth 1 -type f -name "*.sh" -print0 | xargs -0 chmod +x
-find ./Utilities -type f -name "*.sh" -print0 | xargs -0 chmod +x
+find . -maxdepth 2 -type f -name "*.sh" -print0 | xargs -0 chmod +x
 ```
 
 ## 2) Install Dependencies (Linux)
@@ -46,15 +45,14 @@ Recommended target stack for this fork:
 
 ## 3) Mini Guide for Vast.ai
 
-Tested only inpaint job with docker vastai/pytorch:2.9.1-cuda-12.8.1-py310-24.04
+Tested only inpaint and depthcrafting job with docker vastai/pytorch:2.9.1-cuda-12.8.1-py310-24.04
 
 From repo root:
 
 ```bash
 git clone https://github.com/tig3rmast3r/StereoCrafter --recursive
 cd StereoCrafter
-find . -maxdepth 1 -type f -name "*.sh" -print0 | xargs -0 chmod +x
-find ./Utilities -type f -name "*.sh" -print0 | xargs -0 chmod +x
+find . -maxdepth 2 -type f -name "*.sh" -print0 | xargs -0 chmod +x
 ./setup_vast_stage1.sh
 ./setup_vast_stage2_weights.sh
 ```
@@ -76,7 +74,7 @@ After the installer script completes:
 python pipeline_master_gui.py
 ```
 
-WSL GUI note:
+## 5) WSL GUI note:
 - The standard Linux installer now includes `python3-tk`, so Tkinter should be available after setup.
 - If you are on WSL and the GUI still does not open even though `tkinter` imports correctly, the issue is usually WSLg/session state rather than a missing repo dependency.
 - Quick check:
@@ -88,5 +86,13 @@ python -c "import tkinter; print('tk ok')"
 - If that check passes but GUI windows still do not appear, restart WSL from Windows
 
 ```bash
+wsl --shutdown
+```
+
+- If you have not insalled GUI for WSL yet:
+
+```bash
+sudo apt install x11-apps -y
+sudo apt install gedit -y
 wsl --shutdown
 ```

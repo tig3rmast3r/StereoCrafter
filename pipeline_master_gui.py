@@ -46,7 +46,7 @@ try:
 except Exception:
     ThemedTk = None
 
-GUI_VERSION = "2026-04-01"
+GUI_VERSION = "2026-04-06"
 REPO_ROOT = repo_root()
 DEFAULT_PIPELINE_MASTER_CONFIG_PATH = config_path("config_pipeline_master_gui.json")
 
