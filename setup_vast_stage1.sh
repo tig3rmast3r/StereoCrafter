@@ -18,6 +18,40 @@ MAX_JOBS="${MAX_JOBS:-8}"
 REQ_FILE_REL="requirements.docker.no_torch.txt"
 BUILD_FORWARD_WARP=false
 
+print_weights_followup() {
+  cat <<'EOF'
+[NEXT] Weights are not downloaded by Stage 1.
+[NEXT] If you have a Hugging Face token, run Stage 2 from repo root:
+       ./setup_vast_stage2_weights.sh depth
+       ./setup_vast_stage2_weights.sh inpaint
+       ./setup_vast_stage2_weights.sh both
+[INFO] If you do not have an HF token, you can also place the minimum required weights manually.
+[INFO] Minimum full-pipeline tree:
+       weights/
+       ├── stable-video-diffusion-img2vid-xt-1-1/
+       │   ├── model_index.json
+       │   ├── feature_extractor/
+       │   │   └── preprocessor_config.json
+       │   ├── image_encoder/
+       │   │   ├── config.json
+       │   │   └── model.fp16.safetensors
+       │   ├── scheduler/
+       │   │   └── scheduler_config.json
+       │   └── vae/
+       │       ├── config.json
+       │       └── diffusion_pytorch_model.fp16.safetensors
+       ├── DepthCrafter/
+       │   ├── config.json
+       │   └── diffusion_pytorch_model.safetensors
+       └── StereoCrafter/
+           ├── config.json
+           └── diffusion_pytorch_model.safetensors
+[INFO] Minimum by mode:
+       depth only   = stable-video-diffusion-img2vid-xt-1-1 + DepthCrafter
+       inpaint only = stable-video-diffusion-img2vid-xt-1-1 + StereoCrafter
+EOF
+}
+
 if [[ -x "${VENV_PATH}/bin/activate" ]]; then
   # shellcheck disable=SC1090
   source "${VENV_PATH}/bin/activate"
@@ -137,3 +171,4 @@ mkdir -p work
 
 echo "[DONE] Stage 1 complete."
 echo "[NEXT] Run: ./setup_vast_stage2_weights.sh"
+print_weights_followup
