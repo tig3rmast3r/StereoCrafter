@@ -33,8 +33,8 @@ REPLACE_MASK_FOLDER="${REPLACE_MASK_FOLDER:-./work/mask/}"
 
 # Behavior toggles (non-path)
 CT_PRESET="${CT_PRESET:-1}"               # 1..8 or full preset label
-CT_AUTO_MODE="${CT_AUTO_MODE:-On}"        # Off | On | CSV Blend
-CT_CSV_BLEND_PATH="${CT_CSV_BLEND_PATH:-./autoct.csv}"
+CT_AUTO_MODE="${CT_AUTO_MODE:-CSV Blend}"        # Off | On | CSV Blend
+CT_CSV_BLEND_PATH="${CT_CSV_BLEND_PATH:-./work/autoct.csv}"
 ENABLE_COLOR_TRANSFER="${ENABLE_COLOR_TRANSFER:-1}"  # 1=on,0=off
 ADD_BORDERS="${ADD_BORDERS:-0}"           # 1=apply sidecar borders, 0=disable
 PAD_TO_16_9="${PAD_TO_16_9:-0}"           # 1=pad to 16:9, 0=disable
@@ -53,8 +53,8 @@ CT_CLAMP_L_MAX="${CT_CLAMP_L_MAX:-2}"
 CT_CLAMP_AB_MIN="${CT_CLAMP_AB_MIN:-0.1}"
 CT_CLAMP_AB_MAX="${CT_CLAMP_AB_MAX:-3}"
 CT_EXCLUDE_BLACK_IN_TARGET="${CT_EXCLUDE_BLACK_IN_TARGET:-1}"
-FFMPEG_CODEC="${FFMPEG_CODEC:-}"
-ENCODING_MODE="${ENCODING_MODE:-}"
+FFMPEG_CODEC="${FFMPEG_CODEC:-libx264}"
+ENCODING_MODE="${ENCODING_MODE:-lossless}"
 FFMPEG_EXTRA_ARGS="${FFMPEG_EXTRA_ARGS:-}"
 RESTART_EVERY="${RESTART_EVERY:-1}"
 PLANNED_RESTART_CODE="${PLANNED_RESTART_CODE:-99}"

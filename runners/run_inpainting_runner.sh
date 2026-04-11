@@ -15,17 +15,17 @@ OUTPUT_DIR="${OUTPUT_DIR:-./work/output/}"
 GLOB="${GLOB:-*.mp4}"
 
 HIRES_BLEND_FOLDER="${HIRES_BLEND_FOLDER:-}"                # optional
-REPLACE_MASK_FOLDER="${REPLACE_MASK_FOLDER:-}"              # optional; folder with <splatted_stem>_replace_mask.*
-USE_REPLACE_MASK="${USE_REPLACE_MASK:-0}"                   # 1 => use external replace mask (fast-fail if missing/mismatch)
-OFFLOAD_TYPE="${OFFLOAD_TYPE:-model}"                       # none | model | sequential
+REPLACE_MASK_FOLDER="${REPLACE_MASK_FOLDER:-./work/mask/}"              # optional; folder with <splatted_stem>_replace_mask.*
+USE_REPLACE_MASK="${USE_REPLACE_MASK:-1}"                   # 1 => use external replace mask (fast-fail if missing/mismatch)
+OFFLOAD_TYPE="${OFFLOAD_TYPE:-none}"                       # none | model | sequential
 
 TILE_NUM="${TILE_NUM:-2}"
-FRAMES_CHUNK="${FRAMES_CHUNK:-50}"
+FRAMES_CHUNK="${FRAMES_CHUNK:-55}"
 OVERLAP="${OVERLAP:-3}"
 TAIL_PAD="${TAIL_PAD:-2}"
 ORIGINAL_INPUT_BLEND_STRENGTH="${ORIGINAL_INPUT_BLEND_STRENGTH:-0}"
-OUTPUT_CODEC="${OUTPUT_CODEC:-}"                       # optional override (e.g. libx264, h264_nvenc, hevc_nvenc)
-OUTPUT_ENCODING_MODE="${OUTPUT_ENCODING_MODE:-}"       # shared encoder mode for color outputs
+OUTPUT_CODEC="${OUTPUT_CODEC:-libx264}"                # optional override (e.g. libx264, h264_nvenc, hevc_nvenc)
+OUTPUT_ENCODING_MODE="${OUTPUT_ENCODING_MODE:-lossless}"       # shared encoder mode for color outputs
 OUTPUT_EXTRA_ARGS="${OUTPUT_EXTRA_ARGS:-}"             # optional extra ffmpeg args
 PROCESS_LENGTH="${PROCESS_LENGTH:--1}"
 
