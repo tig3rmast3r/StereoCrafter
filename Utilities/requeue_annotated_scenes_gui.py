@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import tkinter as tk
@@ -19,6 +20,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Callable
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from dependency.repo_paths import config_path
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
@@ -80,7 +86,6 @@ STEP_TO_SUBSET_PREV_DIRS = {
 
 CSV_BASENAME_FIELDS = ("file_name", "filename", "file", "video", "file_path", "path")
 OPTIONAL_MISSING_MATCH_DIRS = {"output-sharpen"}
-REPO_ROOT = Path(__file__).resolve().parents[1]
 PIPELINE_MASTER_CONFIG_PATH = config_path("config_pipeline_master_gui.json")
 JOIN_DEFAULT_PRESET = "p7"
 JOIN_DEFAULT_QUALITY = "16"
