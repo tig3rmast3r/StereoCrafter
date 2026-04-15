@@ -1,6 +1,7 @@
 # Changes in this Fork
 
-This fork is tested only with Linux and now WSL (ubuntu 22.04 and 24.04 in my case), Windows "should" work for gui versions but pipeline_master_gui and all auto batches uses bash scripts that needs to be reimplemented using powershell <br>
+This fork is tested only with Linux (ubuntu 22.04 and 24.04 in my case) and WSL 24.04 on Windows, pure Windows "should" work for gui versions but pipeline_master_gui and all auto batches uses bash scripts that needs to be reimplemented using powershell. <br>
+All GUI works too in WSL so moving to Windows is quite pointless<br>
 Aim to this Fork is to create a full sbs 1080p 3d content as result with a one-click solution but keeping ways to customize it.<br>
 Supports only 8 bit format (inpainting is 8 bit anyway so it's actually impossible to get 10 bit hdr end to end) with hardcoded yuv444p during all steps to preserve colors transitions.
 All runner scripts are tuned for intel 265k, 48GB ram and RTX 4090 and specifically for 1920*800 content<br>
@@ -40,19 +41,20 @@ All the extra scripts are made multithreading/parallel when possible, helping re
 - runners for no_gui version, will autostart/retry from errors, skip if done already and supports ctrl-c graceful stop
 - works perfectly on vast.ai docker
 - Implemented full stream end-to-end, will only load required frames for the current chunk, greatly reducing Vram usage on longer files, it basically doesn't matter how long it is.
-- Cherry picked chunk overlap from commit https://github.com/Billynom8/StereoCrafter/commit/708bdba3cb86b30ccaa7c6e281e650ec09a7f7ea adapted for my workflow
+- Cherry picked chunk overlap from commit https://github.com/Billynom8/StereoCrafter/commit/708bdba3cb86b30ccaa7c6e281e650ec09a7f7ea adapted for my workflow (now reverted with no crossfade during overlap)
 - Tail-pad will create extra frames for every chunk and at the end of file and then discard them, last generated frame(s) from chunks suffer from terrible color mismatch, with tail pad those frames are discarded and not used for overlap, greatly decreasing color "flashes" on chunk junctions and on the last frame of each scene. Will increase inpaint time a bit but totally worth it
 - Option to use Replace Mask as source
 - in this Fork mask is not Pre-Processed and used "as is" for the inference.
-- Optional (but recommended) scene analysis, will predict inpaint sharpness to csv and it will be used to regulate inpaint steps automatically, it will basically increase steps only when needed, result are still far from being perfect in some cases, but is a good tradeoff (based on my tests to get near perfect quality you should inpaint at double size, basically MONTHS of encoding with current tech, it's already quite slow as it is).
+- Optional (but recommended) scene analysis, will predict inpaint sharpness to csv and it will be used to regulate inpaint steps automatically, it will basically increase steps only when needed, result are still far from being perfect in some cases, but is a good tradeoff.
+- Dynamic Chunk based on scene sharpness and mask persistence
 
 ### Merging
-- due to many improvements, and to avoid crashes, and to speed up time, merging is now split in 3 phases, autoct csv (optional), processed mask and merge, you can still use merging_gui as previewer but i strongly discourage processing with it, it will crash.
+- due to many improvements, and to speed up time, merging is now split in 3 phases, autoct csv (optional), processed mask and merge.
 - Requires Replace Mask for full functionality
 - Sliders revamp for mask processing, removed some and improved others, you can now set shadow mask by pixels, binarize mask is not needed (has no effect) for Replace Mask,there is no noise to remove (but i kept it if you want to use the legacy one), also with binary mask you need much less dilate/blur most of the times.
 - new option dynamic shadow based on mask thickness, less thick, less shadow, will reduce unneeded inpaint merge zones.
 - new option to increase shadow on fast movements, will counter reduced warp precision on fast moving objects automatically
-- New mask preprocessing script, will preprocess mask in a separate step, this way you will be able to use more workers and it will take a fraction compared to keeping it into the merging step, also it's stable.
+- New mask preprocessing script, will preprocess mask in a separate step, this way you will be able to use more workers and it will take a fraction compared to keeping it into the merging step.
 - New GUI Mask For Merge to analyze mask with the new features, with this previewer you change the motion mask behaviour and store settings on the other scripts
 - new shadow feature for auto inverting direction, it will invert shadow when mask is touching the right border, we need that when the right border is inpainted
 - New Color Transfer panel with 3 working modes and 8 curated presets (ordered by my own tests, the upper ones has more chances to be the good ones)
@@ -152,7 +154,7 @@ Long live to 3D!!
 - [fix] Sharpen clips had incorrect fps causing join step to fail
 - [fix] seg-mono to flat sbs clips was not identical to merged clips
 
-2026-04-01 (lof of stuff)
+2026-04-01 (lot of stuff)
 - [new] the old crf/qp 1 preset is too lossy if the content is already on the 10mps compress range, so from now on the default preset is lossless for all intermediate steps, with fixed yuv444p, there is now a global preset under "Options and run", the old crf/qp is still available with value 0 and 1, but with hardcoded yuv444p so it will be better than before.
 - [new] there is now a global unified script for intermediate steps encoding (dependency/ffmpeg_encoding_profiles.py)
 - [new] "Codec Validation" button will test all codec combinations used in the script, run this check to make sure your system ffmpeg will work for every step.
@@ -182,3 +184,15 @@ Long live to 3D!!
 - [change] repo mini refactor, log files into /logs, configs into /configs, sh scripts and batch runners into /runners
 - [change] pipeline_master_gui now supports multiple configurations, in order to work with more projects simultaneously, to enable custom config (json will be saved and honored into the work folder) launch with arg --work_dir "work path"
 - [fix] test run suddenly stops on merge step in some cases
+
+2026-04-16 (Inpainting Changes)
+- [new/change/fix] i want to talk about inpaint and its flaws, there are mainly 2 problems with inpaint atm:
+1 - color flashes: at first i tought that color flashes was only on the last frame of each chunk and i fixed it by adding tail_pad so the last frame for every chunk and at the end of each clip is calculated but not sent into the stream. I've discovered later that the same identical color flash is present also on the last overlap frame of the following chunks, so when i've cherry picked the crossfade commit the problem has arised again. for this reason i've removed crossfade when is overlapping and the new chunk starts to be seen after the overlap has done. There are still some traces on the following frames but at least the huge flash is now gone again.<br>
+2 - blurry inpaint: when the warped zone is detailed there is a very visible difference between the inpainted zone and the surroudings, the inpainted zone is really blurry compared to the rest, with the older auto setting this issue was more prominent, as the blurry ratio is directly proportioal to the chunk size, switching back to tile 1 and shorter chunks helped a lot but there's a downside to this, it may happen that for static and long scenes the inpainted zone tends to become worse overtime, for this other reason some scenes are better using longer chunks, so in order to let everything going "automatically", the script has to decide if it's better to use shorter or longer chunks depending on 2 factors:<br>
+-length of static mask areas<br>
+-expected amount of sharpness for the warp areas<br>
+when a main mask area is static the max chunk size will be adjusted to avoid the degratation for that area, if the chunk can be used with tile 1 it will be used, (it's faster with tile 1), but if the chunk will require more frames it will fallback to tile 2, you can set the maximum possible frames for your current Vram pool with tile 1 and 2, in my case with 4090 in Linux is 22 and 55 (+1 tail_pad) so this is the default value in pipeline_master_gui<br>
+If no static Masks are detected (or are short), chunk size will be inversely proportional to the expected sharpness, paired with number of steps it will give best results.<br>
+Still testing, may need some fine tuning<br>
+- [fix] Requeue annotated scenes now copy all files from the previous steps and not just the ones required by the selected step
+- [fix] stand-alone script settings are now aligned with pipeline_master_gui

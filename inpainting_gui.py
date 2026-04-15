@@ -4,10 +4,11 @@ import json
 import shutil
 import threading
 import atexit
+import math
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, Toplevel, Label
 from ttkthemes import ThemedTk
-from typing import Optional, Tuple, Callable 
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -34,6 +35,15 @@ from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
     tensor2vid,
     load_inpainting_pipeline
+)
+from dependency.mask_static_hold import (
+    DEFAULT_ANCHOR_OVERLAP_MIN_RATIO,
+    DEFAULT_BORDER_TOLERANCE_PX,
+    DEFAULT_COMPONENT_MERGE_Y_TOL_PX,
+    DEFAULT_MIN_AREA_PX,
+    DEFAULT_THRESHOLD_U8,
+    analyze_embedded_mask_video,
+    analyze_mask_video,
 )
 from dependency.repo_paths import config_path, repo_path
 
@@ -195,10 +205,32 @@ class InpaintingGUI(ThemedTk):
         self.input_folder_var = tk.StringVar(value=self.app_config.get("input_folder", "./output_splatted"))
         self.output_folder_var = tk.StringVar(value=self.app_config.get("output_folder", "./completed_output"))
         self.num_inference_steps_var = tk.StringVar(value=str(self.app_config.get("num_inference_steps", 5)))
-        self.tile_num_var = tk.StringVar(value=str(self.app_config.get("tile_num", 2)))
+        if "tile_mode" in self.app_config:
+            tile_mode_default = self._normalize_tile_mode(
+                self.app_config.get("tile_mode"),
+                tile_num=2,
+            )
+        elif "tile_num" in self.app_config:
+            try:
+                legacy_tile_num = max(1, int(self.app_config.get("tile_num", 2)))
+            except Exception:
+                legacy_tile_num = 2
+            tile_mode_default = "1" if legacy_tile_num <= 1 else "2"
+        else:
+            tile_mode_default = "1 and 2"
+        self.enable_dynamic_chunk_var = tk.BooleanVar(
+            value=bool(self.app_config.get("enable_dynamic_chunk", True))
+        )
+        self.tile_mode_var = tk.StringVar(value=tile_mode_default)
+        self.tile1_max_size_var = tk.StringVar(
+            value=str(self.app_config.get("tile1_max_size", 22))
+        )
+        self.tile2_max_size_var = tk.StringVar(
+            value=str(self.app_config.get("tile2_max_size", 55))
+        )
         self.frames_chunk_var = tk.StringVar(value=str(self.app_config.get("frames_chunk", 23)))
-        self.overlap_var = tk.StringVar(value=str(self.app_config.get("frame_overlap", 3)))
-        self.tail_pad_var = tk.StringVar(value=str(self.app_config.get("tail_pad", 3)))
+        self.overlap_var = tk.StringVar(value=str(self.app_config.get("frame_overlap", 2)))
+        self.tail_pad_var = tk.StringVar(value=str(self.app_config.get("tail_pad", 1)))
         self.original_input_blend_strength_var = tk.StringVar(value=str(self.app_config.get("original_input_blend_strength", 0.0)))
         self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
         self.process_length_var = tk.StringVar(value=str(self.app_config.get("process_length", -1)))
@@ -769,7 +801,7 @@ class InpaintingGUI(ThemedTk):
 
             # --- NEW: CHUNKED HI-RES PROCESSING ---
             hires_reader = VideoReader(hires_video_path, ctx=cpu(0))
-            chunk_size = int(self.frames_chunk_var.get())
+            chunk_size = int(frames_chunk)
             
             final_hires_output_chunks = []
             final_hires_left_chunks = []
@@ -1062,7 +1094,11 @@ class InpaintingGUI(ThemedTk):
             
             # Parameter Configurations
             "num_inference_steps": self.num_inference_steps_var.get(),
-            "tile_num": self.tile_num_var.get(),
+            "tile_num": str(self._legacy_tile_num_from_mode(self.tile_mode_var.get())),
+            "enable_dynamic_chunk": self.enable_dynamic_chunk_var.get(),
+            "tile_mode": self.tile_mode_var.get(),
+            "tile1_max_size": self.tile1_max_size_var.get(),
+            "tile2_max_size": self.tile2_max_size_var.get(),
             "process_length": self.process_length_var.get(),
             "frames_chunk": self.frames_chunk_var.get(),
             "frame_overlap": self.overlap_var.get(),
@@ -1711,6 +1747,31 @@ class InpaintingGUI(ThemedTk):
         # check in `_apply_post_inpainting_blend` already handles this.
         # This function primarily affects the GUI state.
         logger.debug(f"Blend parameters state set to: {state}")
+
+    @staticmethod
+    def _legacy_tile_num_from_mode(tile_mode: Optional[str]) -> int:
+        normalized = InpaintingGUI._normalize_tile_mode(tile_mode, tile_num=2)
+        return 1 if normalized == "1" else 2
+
+    def _toggle_dynamic_chunk_controls(self, save: bool = False) -> None:
+        dynamic_enabled = bool(self.enable_dynamic_chunk_var.get())
+        if hasattr(self, "frames_chunk_entry"):
+            self.frames_chunk_entry.configure(
+                state=tk.DISABLED if dynamic_enabled else tk.NORMAL
+            )
+        tile_limit_state = tk.NORMAL if dynamic_enabled else tk.DISABLED
+        if hasattr(self, "tile1_max_size_entry"):
+            self.tile1_max_size_entry.configure(state=tile_limit_state)
+        if hasattr(self, "tile2_max_size_entry"):
+            self.tile2_max_size_entry.configure(state=tile_limit_state)
+        logger.debug(
+            "Dynamic chunk controls updated: dynamic=%s chunk_size=%s tile_limits=%s",
+            dynamic_enabled,
+            "disabled" if dynamic_enabled else "enabled",
+            "enabled" if dynamic_enabled else "disabled",
+        )
+        if save:
+            self.save_config()
     
     def create_widgets(self):
         
@@ -1804,11 +1865,21 @@ class InpaintingGUI(ThemedTk):
         ttk.Entry(param_frame, textvariable=self.original_input_blend_strength_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
-        # Row 1: Tile Number (Left) & Process Length (Right)
-        tile_num_label = ttk.Label(param_frame, text="Tile Number:")
-        tile_num_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(tile_num_label, self.help_data.get("tile_num", ""))
-        ttk.Entry(param_frame, textvariable=self.tile_num_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
+        # Row 1: Tile Mode (Left) & Process Length (Right)
+        tile_mode_label = ttk.Label(param_frame, text="Tile Mode:")
+        tile_mode_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(
+            tile_mode_label,
+            "Tile selection policy. Use '1 and 2' to prefer tile 1 and fall back to tile 2 when needed.",
+        )
+        self.tile_mode_combo = ttk.Combobox(
+            param_frame,
+            textvariable=self.tile_mode_var,
+            values=["1", "2", "1 and 2"],
+            width=10,
+            state="readonly",
+        )
+        self.tile_mode_combo.grid(row=current_row, column=1, sticky="w", padx=5)
         
         frame_overlap_label = ttk.Label(param_frame, text="Frame Overlap:")
         frame_overlap_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
@@ -1819,8 +1890,16 @@ class InpaintingGUI(ThemedTk):
         # Row 2: Frames Chunk (Left) & Tail Pad / Guard (Right)
         frames_chunk_label = ttk.Label(param_frame, text="Frames Chunk:")
         frames_chunk_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(frames_chunk_label, self.help_data.get("frames_chunk", ""))
-        ttk.Entry(param_frame, textvariable=self.frames_chunk_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
+        Tooltip(
+            frames_chunk_label,
+            "Fixed processed chunk size used when Dynamic Chunk is disabled.",
+        )
+        self.frames_chunk_entry = ttk.Entry(
+            param_frame,
+            textvariable=self.frames_chunk_var,
+            width=10,
+        )
+        self.frames_chunk_entry.grid(row=current_row, column=1, sticky="w", padx=5)
 
         tail_pad_label = ttk.Label(param_frame, text="Tail Pad / Guard:")
         tail_pad_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
@@ -1828,7 +1907,55 @@ class InpaintingGUI(ThemedTk):
         ttk.Entry(param_frame, textvariable=self.tail_pad_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
-        # Row 3: Output CRF (Left) & Process Length (Right)
+        # Row 3: Dynamic Chunk (Left) & CPU Offload (Right)
+        dynamic_chunk_check = ttk.Checkbutton(
+            param_frame,
+            text="Enable Dynamic Chunk",
+            variable=self.enable_dynamic_chunk_var,
+            command=lambda: self._toggle_dynamic_chunk_controls(save=True),
+        )
+        dynamic_chunk_check.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        Tooltip(
+            dynamic_chunk_check,
+            "Use the dynamic chunk planner with replace-mask hold analysis and tile size limits.",
+        )
+
+        offload_label = ttk.Label(param_frame, text="CPU Offload:")
+        offload_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(offload_label, self.help_data.get("offload_type", ""))
+        offload_options = ["model", "sequential", "none"]
+        ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=current_row, column=3, sticky="w", padx=5)
+        current_row += 1
+
+        # Row 4: Tile Limits (active only with Dynamic Chunk)
+        tile1_max_label = ttk.Label(param_frame, text="Tile 1 Max Size:")
+        tile1_max_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(
+            tile1_max_label,
+            "Maximum processed chunk size allowed before staying on tile 1.",
+        )
+        self.tile1_max_size_entry = ttk.Entry(
+            param_frame,
+            textvariable=self.tile1_max_size_var,
+            width=10,
+        )
+        self.tile1_max_size_entry.grid(row=current_row, column=1, sticky="w", padx=5)
+
+        tile2_max_label = ttk.Label(param_frame, text="Tile 2 Max Size:")
+        tile2_max_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(
+            tile2_max_label,
+            "Maximum processed chunk size allowed on tile 2 after dynamic fallback.",
+        )
+        self.tile2_max_size_entry = ttk.Entry(
+            param_frame,
+            textvariable=self.tile2_max_size_var,
+            width=10,
+        )
+        self.tile2_max_size_entry.grid(row=current_row, column=3, sticky="w", padx=5)
+        current_row += 1
+
+        # Row 5: Output CRF (Left) & Process Length (Right)
         output_crf_label = ttk.Label(param_frame, text="Output Quality (CRF/QP):")
         output_crf_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(output_crf_label, self.help_data.get("output_crf", ""))
@@ -1840,13 +1967,7 @@ class InpaintingGUI(ThemedTk):
         ttk.Entry(param_frame, textvariable=self.process_length_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
-        # Row 4: CPU Offload (Right)
-        offload_label = ttk.Label(param_frame, text="CPU Offload:")
-        offload_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
-        Tooltip(offload_label, self.help_data.get("offload_type", ""))
-        offload_options = ["model", "sequential", "none"]
-        ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=current_row, column=3, sticky="w", padx=5)
-        # current_row += 1 # No need to increment here, param_frame is done
+        self._toggle_dynamic_chunk_controls(save=False)
 
 
         # --- POST-PROCESSING FRAME ---
@@ -1966,15 +2087,173 @@ class InpaintingGUI(ThemedTk):
         self.video_bias_label = ttk.Label(self.info_frame, textvariable=self.video_bias_var, anchor="w")
         self.video_bias_label.grid(row=current_row, column=1, sticky="ew", padx=(2, 5), pady=1)
 
+    @staticmethod
+    def _visible_chunk_from_steps(num_inference_steps: int) -> int:
+        steps = max(1, int(num_inference_steps))
+        if steps <= 5:
+            return 20
+        if steps == 6:
+            return 16
+        return 12
+
+    @staticmethod
+    def _normalize_tile_mode(tile_mode: Optional[str], tile_num: int = 1) -> str:
+        raw = str(tile_mode or "").strip().lower()
+        if raw in {"1", "tile 1"}:
+            return "1"
+        if raw in {"2", "tile 2"}:
+            return "2"
+        if raw in {"1 and 2", "1&2", "1+2", "auto"}:
+            return "1 and 2"
+        legacy = max(1, int(tile_num))
+        if legacy <= 1:
+            return "1"
+        return "2"
+
+    def _analyze_scene_mask_hold(
+        self,
+        *,
+        input_video_path: str,
+        input_layout: str,
+        replace_mask_path: str,
+        process_length: int,
+    ) -> Dict[str, object]:
+        analysis_defaults = {
+            "file": os.path.abspath(replace_mask_path or input_video_path),
+            "frames": 0,
+            "fps": 0.0,
+            "max_hold_frames": 0,
+            "max_hold_seconds": 0.0,
+            "max_hold_start_frame": 0,
+            "max_hold_end_frame": 0,
+            "max_hold_area_px": 0,
+        }
+        try:
+            if replace_mask_path:
+                return analyze_mask_video(
+                    path=replace_mask_path,
+                    threshold_u8=DEFAULT_THRESHOLD_U8,
+                    min_area_px=DEFAULT_MIN_AREA_PX,
+                    border_tolerance_px=DEFAULT_BORDER_TOLERANCE_PX,
+                    component_merge_y_tol_px=DEFAULT_COMPONENT_MERGE_Y_TOL_PX,
+                    anchor_overlap_min_ratio=DEFAULT_ANCHOR_OVERLAP_MIN_RATIO,
+                )
+            if input_layout in {"dual", "quad"}:
+                return analyze_embedded_mask_video(
+                    path=input_video_path,
+                    input_layout=input_layout,
+                    threshold_u8=DEFAULT_THRESHOLD_U8,
+                    min_area_px=DEFAULT_MIN_AREA_PX,
+                    border_tolerance_px=DEFAULT_BORDER_TOLERANCE_PX,
+                    component_merge_y_tol_px=DEFAULT_COMPONENT_MERGE_Y_TOL_PX,
+                    anchor_overlap_min_ratio=DEFAULT_ANCHOR_OVERLAP_MIN_RATIO,
+                    process_length=process_length,
+                )
+        except Exception as exc:
+            logger.warning(
+                f"Mask-hold analysis failed for {os.path.basename(input_video_path)}: {exc}. "
+                "Falling back to step-only chunk selection."
+            )
+        return analysis_defaults
+
+    def _resolve_scene_chunk_plan(
+        self,
+        *,
+        input_video_path: str,
+        input_layout: str,
+        replace_mask_path: str,
+        process_length: int,
+        num_inference_steps: int,
+        overlap: int,
+        frames_chunk: int,
+        enable_dynamic_chunk: bool,
+        tile_mode: Optional[str],
+        tile_num: int,
+        tile1_max_size: Optional[int],
+        tile2_max_size: Optional[int],
+    ) -> Dict[str, object]:
+        current_overlap = max(0, int(overlap))
+        min_processed_chunk = max(1, 2 * current_overlap + 1)
+        normalized_tile_mode = self._normalize_tile_mode(tile_mode, tile_num=tile_num)
+
+        if tile1_max_size is None:
+            tile1_limit = None
+        else:
+            tile1_limit = max(min_processed_chunk, int(tile1_max_size))
+        if tile2_max_size is None:
+            tile2_limit = None
+        else:
+            tile2_limit = max(min_processed_chunk, int(tile2_max_size))
+
+        max_hold = 0
+        hold_floor_visible = 0
+        visible_chunk_from_steps = self._visible_chunk_from_steps(num_inference_steps)
+        if enable_dynamic_chunk:
+            hold_info = self._analyze_scene_mask_hold(
+                input_video_path=input_video_path,
+                input_layout=input_layout,
+                replace_mask_path=replace_mask_path,
+                process_length=process_length,
+            )
+            max_hold = int(hold_info.get("max_hold_frames") or 0)
+            hold_floor_visible = int(math.ceil(float(max_hold) / 5.0)) if max_hold > 0 else 0
+            visible_chunk_after_hold = max(visible_chunk_from_steps, hold_floor_visible)
+            processed_chunk_target = max(min_processed_chunk, visible_chunk_after_hold + current_overlap)
+        else:
+            visible_chunk_after_hold = max(1, int(frames_chunk) - current_overlap)
+            processed_chunk_target = max(min_processed_chunk, int(frames_chunk))
+
+        clamp_reason = ""
+        if normalized_tile_mode == "1":
+            selected_tile = 1
+            processed_chunk_final = processed_chunk_target if tile1_limit is None else min(processed_chunk_target, tile1_limit)
+            if tile1_limit is not None and processed_chunk_final < processed_chunk_target:
+                clamp_reason = "tile1_max"
+        elif normalized_tile_mode == "2":
+            selected_tile = 2
+            processed_chunk_final = processed_chunk_target if tile2_limit is None else min(processed_chunk_target, tile2_limit)
+            if tile2_limit is not None and processed_chunk_final < processed_chunk_target:
+                clamp_reason = "tile2_max"
+        else:
+            if tile1_limit is None or processed_chunk_target <= tile1_limit:
+                selected_tile = 1
+                processed_chunk_final = processed_chunk_target
+            else:
+                selected_tile = 2
+                processed_chunk_final = processed_chunk_target if tile2_limit is None else min(processed_chunk_target, tile2_limit)
+                if tile2_limit is not None and processed_chunk_final < processed_chunk_target:
+                    clamp_reason = "tile2_max"
+
+        processed_chunk_final = max(min_processed_chunk, int(processed_chunk_final))
+        visible_chunk_final = max(1, processed_chunk_final - current_overlap)
+        return {
+            "steps_resolved": int(num_inference_steps),
+            "visible_chunk_from_steps": int(visible_chunk_from_steps),
+            "max_hold_frames": int(max_hold),
+            "hold_floor_visible": int(hold_floor_visible),
+            "visible_chunk_after_hold": int(visible_chunk_after_hold),
+            "processed_chunk_target": int(processed_chunk_target),
+            "tile_mode": normalized_tile_mode,
+            "selected_tile": int(selected_tile),
+            "processed_chunk_final": int(processed_chunk_final),
+            "visible_chunk_final": int(visible_chunk_final),
+            "clamp_reason": clamp_reason,
+        }
+
     def process_single_video(
         self,
         pipeline: StableVideoDiffusionInpaintingPipeline,
         input_video_path: str,
         save_dir: str,
         frames_chunk: int = 23,
-        overlap: int = 3,
-        tail_pad: int = 3,
+        frames_chunk_end: Optional[int] = None,
+        overlap: int = 2,
+        tail_pad: int = 1,
         tile_num: int = 1,
+        enable_dynamic_chunk: bool = False,
+        tile_mode: Optional[str] = None,
+        tile1_max_size: Optional[int] = None,
+        tile2_max_size: Optional[int] = None,
         vf: Optional[str] = None,
         num_inference_steps: int = 5,
         stop_event: Optional[threading.Event] = None,
@@ -2001,6 +2280,7 @@ class InpaintingGUI(ThemedTk):
         is_dual_input = input_layout == "dual"
         is_quad_input = input_layout == "quad"
         replace_mask_vr = None
+        replace_mask_path = ""
         if input_layout == "single" and not self.use_replace_mask_var.get():
             logger.error(
                 f"{base_video_name} is single-warp (_splatted1): external replace mask is required."
@@ -2035,6 +2315,42 @@ class InpaintingGUI(ThemedTk):
                         f"Failed to open replace mask '{replace_mask_path}' ({e}). "
                         "Falling back to embedded mask from splatted input."
                     )
+                    replace_mask_path = ""
+
+        chunk_plan = self._resolve_scene_chunk_plan(
+            input_video_path=input_video_path,
+            input_layout=input_layout,
+            replace_mask_path=replace_mask_path,
+            process_length=process_length,
+            num_inference_steps=num_inference_steps,
+            overlap=overlap,
+            frames_chunk=frames_chunk,
+            enable_dynamic_chunk=enable_dynamic_chunk,
+            tile_mode=tile_mode,
+            tile_num=tile_num,
+            tile1_max_size=tile1_max_size,
+            tile2_max_size=tile2_max_size,
+        )
+        frames_chunk = int(chunk_plan["processed_chunk_final"])
+        tile_num = int(chunk_plan["selected_tile"])
+        logger.info(
+            "[chunk-plan] "
+            f"steps={chunk_plan['steps_resolved']} "
+            f"visible_from_steps={chunk_plan['visible_chunk_from_steps']} "
+            f"max_hold={chunk_plan['max_hold_frames']} "
+            f"hold_floor={chunk_plan['hold_floor_visible']} "
+            f"visible_after_hold={chunk_plan['visible_chunk_after_hold']} "
+            f"processed_target={chunk_plan['processed_chunk_target']} "
+            f"tile_mode={chunk_plan['tile_mode']} "
+            f"selected_tile={chunk_plan['selected_tile']} "
+            f"processed_final={chunk_plan['processed_chunk_final']} "
+            f"visible_final={chunk_plan['visible_chunk_final']}"
+            + (
+                f" clamp={chunk_plan['clamp_reason']}"
+                if chunk_plan.get("clamp_reason")
+                else ""
+            )
+        )
 
         # 1. SETUP & HI-RES DETECTION
         # output_video_path is str (guaranteed), hires_data is dict (guaranteed)
@@ -2103,10 +2419,17 @@ class InpaintingGUI(ThemedTk):
         
         # 3. INPAINTING CHUNKS (The main loop)
         # This part of the loop remains the same, but the logic inside is simplified
-        total_frames_to_process_actual = num_frames_original        
+        total_frames_to_process_actual = num_frames_original
+        frames_chunk = max(1, int(frames_chunk))
+        current_overlap_base = min(max(0, int(overlap)), max(0, frames_chunk - 1))
+        min_processed_chunk = max(1, 2 * current_overlap_base + 1)
+        if frames_chunk < min_processed_chunk:
+            logger.warning(
+                f"processed_chunk={frames_chunk} is too small for overlap={current_overlap_base}; "
+                f"clamping processed_chunk -> {min_processed_chunk}"
+            )
+            frames_chunk = min_processed_chunk
         tail_pad = max(0, int(tail_pad))
-
-        stride = max(1, frames_chunk - overlap)
 
         # Streaming encode (write MP4 as we generate frames) drastically reduces RAM usage.
         # NOTE: If Hi-Res blending is enabled, we fall back to the original (non-streaming) path.
@@ -2147,10 +2470,17 @@ class InpaintingGUI(ThemedTk):
                 ffmpeg_p = None
                 video_only_path = None
 
-        for i in range(0, total_frames_to_process_actual, stride):
+        i = 0
+        while i < total_frames_to_process_actual:
             if stop_event and stop_event.is_set():
                 logger.info(f"Stopping processing of {input_video_path}")
                 return False, None
+
+            current_processed_chunk = frames_chunk
+            current_overlap = min(max(0, int(overlap)), max(0, current_processed_chunk - 1))
+            current_visible_chunk = max(1, current_processed_chunk - current_overlap)
+            current_core_real_span = current_visible_chunk if i == 0 else current_processed_chunk
+            current_tail_pad = min(tail_pad, max(0, current_core_real_span - 1))
             
             # --- CHUNK SLICING AND PADDING LOGIC ---
             # Guard-frame policy:
@@ -2158,9 +2488,12 @@ class InpaintingGUI(ThemedTk):
             # - Last chunk: append tail_pad DUPLICATED tail frames and discard them from output.
             # A chunk is "last" when its core real span reaches EOF.
             # Using next_chunk_start can misclassify near-tail chunks and drop frames.
-            is_last_chunk = (i + frames_chunk) >= total_frames_to_process_actual
-            guard_extra_real_requested = 0 if is_last_chunk else tail_pad
-            end_idx_for_slicing = min(i + frames_chunk + guard_extra_real_requested, total_frames_to_process_actual)
+            is_last_chunk = (i + current_core_real_span) >= total_frames_to_process_actual
+            guard_extra_real_requested = 0 if is_last_chunk else current_tail_pad
+            end_idx_for_slicing = min(
+                i + current_core_real_span + guard_extra_real_requested,
+                total_frames_to_process_actual,
+            )
             if stream_input_enabled:
                 (original_input_frames_slice, mask_frames_slice,
                  warped_unpadded_slice, mask_unpadded_slice, left_unpadded_slice) = self._read_and_prepare_chunk_from_reader(
@@ -2183,7 +2516,7 @@ class InpaintingGUI(ThemedTk):
             else:
                 # If we are close to EOF, we may have fewer real guard frames than requested.
                 # Drop only the guard frames we actually have.
-                guard_extra_real_actual = max(0, actual_sliced_length - frames_chunk)
+                guard_extra_real_actual = max(0, actual_sliced_length - current_core_real_span)
                 emit_sliced_length = max(0, actual_sliced_length - guard_extra_real_actual)
 
             if emit_sliced_length <= 0:
@@ -2191,26 +2524,26 @@ class InpaintingGUI(ThemedTk):
                 break
 
             # Skip useless tail chunks that would contribute no new frames (only overlap)
-            if i > 0 and overlap > 0 and emit_sliced_length <= overlap:
+            if i > 0 and current_overlap > 0 and emit_sliced_length <= current_overlap:
                 tail_end_idx = end_idx_for_slicing - 1
                 logger.debug(
                     f"Skipping tail chunk real_idx={i}-{tail_end_idx} (len={emit_sliced_length}) "
-                    f"because it contributes no new frames (overlap={overlap})."
+                    f"because it contributes no new frames (overlap={current_overlap})."
                 )
                 break
 
             input_frames_to_pipeline = original_input_frames_slice
             mask_frames_i = mask_frames_slice
 
-            if is_last_chunk and tail_pad > 0:
+            if is_last_chunk and current_tail_pad > 0:
                 logger.debug(
                     f"Applying last-chunk guard duplication at frame {i} "
-                    f"(emit_sliced_length={emit_sliced_length}, guard_dup={tail_pad})."
+                    f"(emit_sliced_length={emit_sliced_length}, guard_dup={current_tail_pad})."
                 )
                 last_original_frame_warpped = input_frames_to_pipeline[-1:].clone()
                 last_original_frame_mask = mask_frames_i[-1:].clone()
-                repeated_warpped = last_original_frame_warpped.repeat(tail_pad, 1, 1, 1)
-                repeated_mask = last_original_frame_mask.repeat(tail_pad, 1, 1, 1)
+                repeated_warpped = last_original_frame_warpped.repeat(current_tail_pad, 1, 1, 1)
+                repeated_mask = last_original_frame_mask.repeat(current_tail_pad, 1, 1, 1)
                 input_frames_to_pipeline = torch.cat([input_frames_to_pipeline, repeated_warpped], dim=0)
                 mask_frames_i = torch.cat([mask_frames_i, repeated_mask], dim=0)
             # No extra temporal tail padding beyond guard frames:
@@ -2219,9 +2552,9 @@ class InpaintingGUI(ThemedTk):
             # --- END CHUNK SLICING AND PADDING LOGIC ---
 
             # --- INPUT-LEVEL BLENDING (Remains from your last correct version) ---
-            if previous_chunk_output_frames is not None and overlap > 0:
+            if previous_chunk_output_frames is not None and current_overlap > 0:
                 # ... (Input-level blending logic) ...
-                overlap_actual = min(overlap, input_frames_to_pipeline.shape[0]) 
+                overlap_actual = min(current_overlap, input_frames_to_pipeline.shape[0])
                 if overlap_actual > 0:
                     prev_gen_overlap_frames = previous_chunk_output_frames[-overlap_actual:]
                     if original_input_blend_strength > 0:
@@ -2239,29 +2572,21 @@ class InpaintingGUI(ThemedTk):
             real_start_idx = i
             real_end_idx = end_idx_for_slicing - 1
             real_len = actual_sliced_length
-            guard_dup = tail_pad if is_last_chunk else 0
+            guard_dup = current_tail_pad if is_last_chunk else 0
             model_len = int(input_frames_to_pipeline.shape[0])
             # "tail_pad" is now strictly the non-last guard frames used for chunk handoff.
             tail_pad_used = guard_extra_real_actual
-            planned_end_emit = emit_sliced_length if is_last_chunk else min(stride, emit_sliced_length)
+            # Keep overlap frames as hidden warmup for the next chunk. In output we keep
+            # showing the previous chunk through the overlap, then switch to the new chunk.
+            planned_end_emit = emit_sliced_length
             if i == 0:
                 will_emit = planned_end_emit
             else:
-                overlap_actual_for_log = 0
-                if overlap > 0 and previous_chunk_output_frames is not None:
-                    overlap_actual_for_log = min(
-                        overlap,
-                        int(previous_chunk_output_frames.shape[0]),
-                        int(planned_end_emit),
-                    )
-                if overlap_actual_for_log > 0:
-                    # Cross-fade keeps overlap in output (blended with previous chunk).
-                    will_emit = planned_end_emit
-                else:
-                    will_emit = max(0, planned_end_emit - min(overlap, planned_end_emit))
+                will_emit = max(0, planned_end_emit - min(current_overlap, planned_end_emit))
             logger.info(
                 f"Starting inference chunk idx={real_start_idx}-{real_end_idx} "
-                f"(len={real_len}, overlap={overlap}, "
+                f"(processed={current_processed_chunk}, visible={current_visible_chunk}, "
+                f"core={current_core_real_span}, len={real_len}, overlap={current_overlap}, "
                 f"guard_dup={guard_dup}, tail_pad={tail_pad_used}, model={model_len}, output={will_emit})..."
             )
             start_time = time.time()
@@ -2290,49 +2615,26 @@ class InpaintingGUI(ThemedTk):
             ]).cpu()
             self._save_debug_image(current_chunk_generated, f"07_inpainted_chunk_{i}", base_video_name, i)
 
-            # Emit frames with temporal cross-fade on overlap boundaries.
+            # Overlap frames are processed as warmup but not emitted. The previous chunk
+            # remains visible through the overlap and the new chunk appears afterward.
             source_start_off = 0
             if i == 0:
                 end_emit = planned_end_emit
                 chunk_new = current_chunk_generated[:end_emit]
                 source_start_off = 0
             else:
-                overlap_actual = 0
-                if overlap > 0 and previous_chunk_output_frames is not None:
-                    overlap_actual = min(
-                        overlap,
-                        int(previous_chunk_output_frames.shape[0]),
-                        int(current_chunk_generated.shape[0]),
-                        int(planned_end_emit),
-                    )
-
                 end_emit = planned_end_emit
-                if overlap_actual > 0:
-                    weights = torch.linspace(
-                        0.0,
-                        1.0,
-                        overlap_actual,
-                        device=current_chunk_generated.device,
-                    ).view(-1, 1, 1, 1)
-                    prev_overlap = previous_chunk_output_frames[-overlap_actual:]
-                    curr_overlap = current_chunk_generated[:overlap_actual]
-                    blended_overlap = (1.0 - weights) * prev_overlap + weights * curr_overlap
-
-                    if end_emit < overlap_actual:
-                        end_emit = overlap_actual
-                    rest = current_chunk_generated[overlap_actual:end_emit]
-                    chunk_new = torch.cat([blended_overlap, rest], dim=0)
-                    source_start_off = 0
-                else:
-                    start_emit = min(overlap, planned_end_emit)
-                    if end_emit < start_emit:
-                        end_emit = start_emit
-                    chunk_new = current_chunk_generated[start_emit:end_emit]
-                    source_start_off = start_emit
+                start_emit = min(current_overlap, end_emit)
+                if end_emit < start_emit:
+                    end_emit = start_emit
+                chunk_new = current_chunk_generated[start_emit:end_emit]
+                source_start_off = start_emit
 
             # Keep only overlap tail (on CPU) for the next chunk to reduce VRAM growth
-            if overlap > 0 and emit_sliced_length >= overlap:
-                previous_chunk_output_frames = current_chunk_generated[emit_sliced_length - overlap:emit_sliced_length].detach().cpu()
+            if current_overlap > 0 and emit_sliced_length >= current_overlap:
+                previous_chunk_output_frames = current_chunk_generated[
+                    emit_sliced_length - current_overlap:emit_sliced_length
+                ].detach().cpu()
             else:
                 previous_chunk_output_frames = None
 
@@ -2433,6 +2735,8 @@ class InpaintingGUI(ThemedTk):
             # Stop after processing the true last chunk.
             if is_last_chunk:
                 break
+            next_stride = max(1, emit_sliced_length - current_overlap)
+            i += next_stride
         # If streaming encoding is enabled, we have already written frames to ffmpeg as they were generated.
         if stream_encode_enabled and ffmpeg_p is not None and video_only_path is not None:
             if update_info_callback:
@@ -2575,10 +2879,13 @@ class InpaintingGUI(ThemedTk):
         self.replace_mask_folder_var.set("")
         self.use_replace_mask_var.set(False)
         self.num_inference_steps_var.set("5")
-        self.tile_num_var.set("2")
+        self.enable_dynamic_chunk_var.set(True)
+        self.tile_mode_var.set("1 and 2")
+        self.tile1_max_size_var.set("22")
+        self.tile2_max_size_var.set("55")
         self.frames_chunk_var.set("23")
-        self.overlap_var.set("3")
-        self.tail_pad_var.set("3")
+        self.overlap_var.set("2")
+        self.tail_pad_var.set("1")
         self.original_input_blend_strength_var.set("0.5")
         self.offload_type_var.set("model")
 
@@ -2591,7 +2898,8 @@ class InpaintingGUI(ThemedTk):
         self.enable_color_transfer.set(True) # Default state is ON
         
         # Crucially, call the function to disable the entry fields if the blend toggle is now False
-        self._toggle_blend_parameters_state() 
+        self._toggle_blend_parameters_state()
+        self._toggle_dynamic_chunk_controls(save=False)
 
         self.save_config() # Save these new default settings
         messagebox.showinfo("Settings Reset", "All settings have been reset to their default values.")
@@ -2651,7 +2959,10 @@ class InpaintingGUI(ThemedTk):
             input_folder,
             output_folder,
             num_inference_steps,
-            tile_num, offload_type,
+            tile_mode, offload_type,
+            enable_dynamic_chunk,
+            tile1_max_size,
+            tile2_max_size,
             frames_chunk, gui_overlap,
             gui_tail_pad,
             gui_original_input_blend_strength,
@@ -2748,6 +3059,7 @@ class InpaintingGUI(ThemedTk):
                 self.after(0, self.update_status_label, f"Processing video {idx + 1} of {self.total_videos.get()}")
 
                 logger.info(f"Starting processing of {video_path}")
+                legacy_tile_num = self._legacy_tile_num_from_mode(tile_mode)
                 completed, hi_res_input_path = self.process_single_video(
                     pipeline=self.pipeline,
                     input_video_path=video_path,
@@ -2755,7 +3067,11 @@ class InpaintingGUI(ThemedTk):
                     frames_chunk=frames_chunk,
                     overlap=current_overlap,
                     tail_pad=current_tail_pad,
-                    tile_num=tile_num,
+                    tile_num=legacy_tile_num,
+                    enable_dynamic_chunk=enable_dynamic_chunk,
+                    tile_mode=tile_mode if enable_dynamic_chunk else None,
+                    tile1_max_size=tile1_max_size if enable_dynamic_chunk else None,
+                    tile2_max_size=tile2_max_size if enable_dynamic_chunk else None,
                     vf=None, 
                     num_inference_steps=num_inference_steps,
                     stop_event=self.stop_event,
@@ -2822,7 +3138,11 @@ class InpaintingGUI(ThemedTk):
         output_folder = self.output_folder_var.get()
         try:
             num_inference_steps = int(self.num_inference_steps_var.get())
-            tile_num = int(self.tile_num_var.get())
+            tile_mode = self._normalize_tile_mode(self.tile_mode_var.get(), tile_num=2)
+            self.tile_mode_var.set(tile_mode)
+            enable_dynamic_chunk = bool(self.enable_dynamic_chunk_var.get())
+            tile1_max_size = int(self.tile1_max_size_var.get())
+            tile2_max_size = int(self.tile2_max_size_var.get())
             frames_chunk = int(self.frames_chunk_var.get())
             gui_overlap = int(self.overlap_var.get())
             gui_tail_pad = int(self.tail_pad_var.get())
@@ -2833,13 +3153,13 @@ class InpaintingGUI(ThemedTk):
             if process_length != -1 and process_length <= 0:
                 raise ValueError("Process Length must be -1 or a positive integer.")
             
-            if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1 or gui_overlap  < 0 or \
+            if num_inference_steps < 1 or frames_chunk < 1 or tile1_max_size < 1 or tile2_max_size < 1 or gui_overlap  < 0 or \
                gui_tail_pad < 0 or \
                not (0.0 <= gui_original_input_blend_strength  <= 1.0) or gui_output_crf < 0: # NEW VALIDATION for CRF
                 raise ValueError("Invalid parameter values")
         except ValueError:
             # UPDATED ERROR MESSAGE
-            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Tile Number >=1, Frames Chunk >=1, Frame Overlap >=0, Tail Pad >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0.")
+            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Frames Chunk >=1, Tile 1/2 Max Size >=1, Frame Overlap >=0, Tail Pad >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0.")
             return
         offload_type = self.offload_type_var.get()
 
@@ -2856,7 +3176,7 @@ class InpaintingGUI(ThemedTk):
         self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
 
         threading.Thread(target=self.run_batch_process,
-                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_tail_pad, gui_original_input_blend_strength, gui_output_crf, process_length),
+                         args=(input_folder, output_folder, num_inference_steps, tile_mode, offload_type, enable_dynamic_chunk, tile1_max_size, tile2_max_size, frames_chunk, gui_overlap, gui_tail_pad, gui_original_input_blend_strength, gui_output_crf, process_length),
                          daemon=True).start()
 
     def stop_processing(self):
@@ -2945,9 +3265,25 @@ class InpaintingGUI(ThemedTk):
                 else:
                     logger.debug(f"Skipping config key {key}: No matching tk.Variable or direct attribute found.")
 
+            if "tile_mode" not in loaded_config and "tile_num" in loaded_config:
+                try:
+                    legacy_tile_num = max(1, int(loaded_config.get("tile_num", 2)))
+                except Exception:
+                    legacy_tile_num = 2
+                self.tile_mode_var.set("1" if legacy_tile_num <= 1 else "2")
+
+            self.tile_mode_var.set(
+                self._normalize_tile_mode(self.tile_mode_var.get(), tile_num=2)
+            )
+            if not self.tile1_max_size_var.get().strip():
+                self.tile1_max_size_var.set("22")
+            if not self.tile2_max_size_var.get().strip():
+                self.tile2_max_size_var.set("55")
+
             self._apply_theme() # Re-apply theme in case dark mode setting was loaded
             # --- FIX: Correct function name for updating blend fields state ---
             self._toggle_blend_parameters_state() # Update state of dependent fields
+            self._toggle_dynamic_chunk_controls(save=False)
             # --- END FIX ---
             
             messagebox.showinfo("Settings Loaded", f"Successfully loaded settings from:\n{os.path.basename(filename)}")

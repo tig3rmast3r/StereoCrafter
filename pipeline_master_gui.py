@@ -128,7 +128,7 @@ class PipelineMasterGUI:
             "expandable_segments": True,
             "max_split_size_mb": "off",
             "cpu_offload_inherited": True,
-            "cpu_offload_mode": "none",
+            "cpu_offload_mode": "model",
         },
         "retry1": {
             "garbage_collection_threshold": True,
@@ -712,28 +712,43 @@ class PipelineMasterGUI:
         )
         self.inpaint_info_text_var = tk.StringVar(value=self.INPAINT_AUTO_INFO)
         self.inpaint_frames_chunk_var = tk.StringVar(
-            value=str(self._config.get("inpaint_frames_chunk", "55"))
+            value=str(self._config.get("inpaint_frames_chunk", "22"))
+        )
+        self._inpaint_chunk_manual_cache = self.inpaint_frames_chunk_var.get().strip() or "22"
+        self.inpaint_dynamic_chunk_var = tk.BooleanVar(
+            value=bool(self._config.get("inpaint_dynamic_chunk", True))
         )
         self.inpaint_cpu_offload_var = tk.StringVar(
-            value=self._config.get("inpaint_cpu_offload", "none")
+            value=self._config.get("inpaint_cpu_offload", "model")
         )
-        self.inpaint_tile_num_var = tk.StringVar(
-            value=str(self._config.get("inpaint_tile_num", "2"))
+        self.inpaint_tile_mode_var = tk.StringVar(
+            value=str(
+                self._config.get(
+                    "inpaint_tile_mode",
+                    str(self._config.get("inpaint_tile_num", "1 and 2")),
+                )
+            )
+        )
+        self.inpaint_tile1_max_size_var = tk.StringVar(
+            value=str(self._config.get("inpaint_tile1_max_size", "22"))
+        )
+        self.inpaint_tile2_max_size_var = tk.StringVar(
+            value=str(self._config.get("inpaint_tile2_max_size", "55"))
         )
         self.inpaint_input_bias_var = tk.StringVar(
             value=str(self._config.get("inpaint_input_bias", "0"))
         )
         self.inpaint_overlap_var = tk.StringVar(
-            value=str(self._config.get("inpaint_overlap", "3"))
+            value=str(self._config.get("inpaint_overlap", "2"))
         )
         self.inpaint_tail_pad_var = tk.StringVar(
-            value=str(self._config.get("inpaint_tail_pad", "2"))
+            value=str(self._config.get("inpaint_tail_pad", "1"))
         )
         self.inpaint_use_sharpness_csv_var = tk.BooleanVar(
             value=bool(self._config.get("inpaint_use_sharpness_csv", True))
         )
         self.inpaint_use_sharpen_var = tk.BooleanVar(
-            value=bool(self._config.get("inpaint_use_sharpen", True))
+            value=bool(self._config.get("inpaint_use_sharpen", False))
         )
         default_sharp_workers = "19"
         self.inpaint_sharpness_workers_var = tk.StringVar(
@@ -999,11 +1014,22 @@ class PipelineMasterGUI:
         if self.inpaint_mode_var.get().strip() not in {"Auto (recommended)", "Manual"}:
             self.inpaint_mode_var.set("Auto (recommended)")
         if self.inpaint_mode_var.get().strip() == "Auto (recommended)":
-            self.inpaint_use_sharpen_var.set(True)
+            self.inpaint_use_sharpen_var.set(False)
         if self.inpaint_frames_chunk_var.get().strip() == "":
-            self.inpaint_frames_chunk_var.set("55")
+            self.inpaint_frames_chunk_var.set("22")
+        self._inpaint_chunk_manual_cache = self.inpaint_frames_chunk_var.get().strip() or "22"
         if self.inpaint_cpu_offload_var.get().strip() == "":
-            self.inpaint_cpu_offload_var.set("none")
+            self.inpaint_cpu_offload_var.set("model")
+        if self.inpaint_overlap_var.get().strip() == "":
+            self.inpaint_overlap_var.set("2")
+        if self.inpaint_tail_pad_var.get().strip() == "":
+            self.inpaint_tail_pad_var.set("1")
+        if self.inpaint_tile_mode_var.get().strip() not in {"1", "2", "1 and 2"}:
+            self.inpaint_tile_mode_var.set("1 and 2")
+        if self.inpaint_tile1_max_size_var.get().strip() == "":
+            self.inpaint_tile1_max_size_var.set("22")
+        if self.inpaint_tile2_max_size_var.get().strip() == "":
+            self.inpaint_tile2_max_size_var.set("55")
         if self.inpaint_inference_steps_var.get().strip() == "":
             self.inpaint_inference_steps_var.set("8")
         try:
@@ -2055,13 +2081,21 @@ class PipelineMasterGUI:
             params_frame.grid_columnconfigure(col, weight=0)
         params_frame.grid_columnconfigure(9, weight=1)
 
-        ttk.Label(params_frame, text="Frames Chunk:").grid(row=0, column=0, sticky="w")
+        ttk.Label(params_frame, text="Chunk Size:").grid(row=0, column=0, sticky="w")
         self.inpaint_frames_chunk_entry = ttk.Entry(
             params_frame, textvariable=self.inpaint_frames_chunk_var, width=8
         )
         self.inpaint_frames_chunk_entry.grid(row=0, column=1, sticky="w", padx=(6, 12))
 
-        ttk.Label(params_frame, text="CPU offload:").grid(row=0, column=2, sticky="w")
+        self.inpaint_dynamic_chunk_check = ttk.Checkbutton(
+            params_frame,
+            text="Enable Dynamic Chunk",
+            variable=self.inpaint_dynamic_chunk_var,
+            command=self._on_inpaint_dynamic_chunk_toggle,
+        )
+        self.inpaint_dynamic_chunk_check.grid(row=0, column=2, columnspan=2, sticky="w")
+
+        ttk.Label(params_frame, text="CPU offload:").grid(row=0, column=4, sticky="w")
         self.inpaint_cpu_offload_combo = ttk.Combobox(
             params_frame,
             textvariable=self.inpaint_cpu_offload_var,
@@ -2069,31 +2103,47 @@ class PipelineMasterGUI:
             width=12,
             state="readonly",
         )
-        self.inpaint_cpu_offload_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
+        self.inpaint_cpu_offload_combo.grid(row=0, column=5, sticky="w", padx=(6, 12))
 
-        ttk.Label(params_frame, text="Tile Number:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.inpaint_tile_num_entry = ttk.Entry(
-            params_frame, textvariable=self.inpaint_tile_num_var, width=8
+        ttk.Label(params_frame, text="Tile:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.inpaint_tile_mode_combo = ttk.Combobox(
+            params_frame,
+            textvariable=self.inpaint_tile_mode_var,
+            values=["1", "2", "1 and 2"],
+            width=10,
+            state="readonly",
         )
-        self.inpaint_tile_num_entry.grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+        self.inpaint_tile_mode_combo.grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
 
-        ttk.Label(params_frame, text="Input Bias:").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Label(params_frame, text="Tile 1 Max Size:").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        self.inpaint_tile1_max_size_entry = ttk.Entry(
+            params_frame, textvariable=self.inpaint_tile1_max_size_var, width=8
+        )
+        self.inpaint_tile1_max_size_entry.grid(row=1, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(params_frame, text="Tile 2 Max Size:").grid(row=1, column=4, sticky="w", pady=(8, 0))
+        self.inpaint_tile2_max_size_entry = ttk.Entry(
+            params_frame, textvariable=self.inpaint_tile2_max_size_var, width=8
+        )
+        self.inpaint_tile2_max_size_entry.grid(row=1, column=5, sticky="w", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(params_frame, text="Input Bias:").grid(row=1, column=6, sticky="w", pady=(8, 0))
         self.inpaint_input_bias_entry = ttk.Entry(
             params_frame, textvariable=self.inpaint_input_bias_var, width=8
         )
-        self.inpaint_input_bias_entry.grid(row=1, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
+        self.inpaint_input_bias_entry.grid(row=1, column=7, sticky="w", padx=(6, 12), pady=(8, 0))
 
-        ttk.Label(params_frame, text="Overlap:").grid(row=1, column=4, sticky="w", pady=(8, 0))
+        ttk.Label(params_frame, text="Overlap:").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.inpaint_overlap_entry = ttk.Entry(
             params_frame, textvariable=self.inpaint_overlap_var, width=8
         )
-        self.inpaint_overlap_entry.grid(row=1, column=5, sticky="w", padx=(6, 12), pady=(8, 0))
+        self.inpaint_overlap_entry.grid(row=2, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
 
-        ttk.Label(params_frame, text="TailPad:").grid(row=1, column=6, sticky="w", pady=(8, 0))
+        ttk.Label(params_frame, text="TailPad:").grid(row=2, column=2, sticky="w", pady=(8, 0))
         self.inpaint_tail_pad_entry = ttk.Entry(
             params_frame, textvariable=self.inpaint_tail_pad_var, width=8
         )
-        self.inpaint_tail_pad_entry.grid(row=1, column=7, sticky="w", padx=(6, 12), pady=(8, 0))
+        self.inpaint_tail_pad_entry.grid(row=2, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
 
         self.inpaint_use_sharpness_check = ttk.Checkbutton(
             params_frame,
@@ -2101,22 +2151,22 @@ class PipelineMasterGUI:
             variable=self.inpaint_use_sharpness_csv_var,
             command=self._on_inpaint_auto_steps_toggle,
         )
-        self.inpaint_use_sharpness_check.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.inpaint_use_sharpness_check.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
-        ttk.Label(params_frame, text="Inference steps:").grid(row=2, column=4, sticky="w", pady=(8, 0))
+        ttk.Label(params_frame, text="Inference steps:").grid(row=3, column=4, sticky="w", pady=(8, 0))
         self.inpaint_inference_steps_entry = ttk.Entry(
             params_frame, textvariable=self.inpaint_inference_steps_var, width=8
         )
-        self.inpaint_inference_steps_entry.grid(row=2, column=5, sticky="w", padx=(6, 12), pady=(8, 0))
+        self.inpaint_inference_steps_entry.grid(row=3, column=5, sticky="w", padx=(6, 12), pady=(8, 0))
 
         ttk.Label(params_frame, text="Sharpness CSV workers:").grid(
-            row=2, column=6, sticky="w", pady=(8, 0)
+            row=3, column=6, sticky="w", pady=(8, 0)
         )
         self.inpaint_sharpness_workers_entry = ttk.Entry(
             params_frame, textvariable=self.inpaint_sharpness_workers_var, width=8
         )
         self.inpaint_sharpness_workers_entry.grid(
-            row=2, column=7, sticky="w", padx=(6, 12), pady=(8, 0)
+            row=3, column=7, sticky="w", padx=(6, 12), pady=(8, 0)
         )
 
         self.inpaint_sharpen_check = ttk.Checkbutton(
@@ -2125,16 +2175,16 @@ class PipelineMasterGUI:
             variable=self.inpaint_use_sharpen_var,
             command=self._on_inpaint_sharpen_toggle,
         )
-        self.inpaint_sharpen_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.inpaint_sharpen_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         ttk.Label(params_frame, text="Sharpen workers:").grid(
-            row=3, column=2, sticky="w", pady=(8, 0)
+            row=4, column=2, sticky="w", pady=(8, 0)
         )
         self.inpaint_sharpen_workers_entry = ttk.Entry(
             params_frame, textvariable=self.inpaint_sharpen_workers_var, width=8
         )
         self.inpaint_sharpen_workers_entry.grid(
-            row=3, column=3, sticky="w", padx=(6, 12), pady=(8, 0)
+            row=4, column=3, sticky="w", padx=(6, 12), pady=(8, 0)
         )
 
         encode_frame = ttk.LabelFrame(parent, text="Encoding", padding=8)
@@ -2225,7 +2275,6 @@ class PipelineMasterGUI:
         self.inpaint_log_text.configure(yscrollcommand=iscroll.set)
 
         self._inpaint_manual_widgets = [
-            self.inpaint_tile_num_entry,
             self.inpaint_input_bias_entry,
             self.inpaint_overlap_entry,
             self.inpaint_tail_pad_entry,
@@ -2264,6 +2313,23 @@ class PipelineMasterGUI:
         os.makedirs(folder, exist_ok=True)
         self._append_inpaint_log(f"Sharpen output folder ready: {folder}")
 
+    def _get_inpaint_chunk_manual_value(self) -> str:
+        raw = self.inpaint_frames_chunk_var.get().strip()
+        if raw and raw.upper() != "N/A":
+            self._inpaint_chunk_manual_cache = raw
+            return raw
+        return str(self._inpaint_chunk_manual_cache or "22")
+
+    def _set_inpaint_chunk_entry_na(self) -> None:
+        raw = self.inpaint_frames_chunk_var.get().strip()
+        if raw and raw.upper() != "N/A":
+            self._inpaint_chunk_manual_cache = raw
+        self.inpaint_frames_chunk_var.set("N/A")
+
+    def _restore_inpaint_chunk_entry_value(self) -> None:
+        if self.inpaint_frames_chunk_var.get().strip().upper() == "N/A":
+            self.inpaint_frames_chunk_var.set(self._get_inpaint_chunk_manual_value())
+
     def _on_inpaint_mode_changed(self, _event=None) -> None:
         mode = self.inpaint_mode_var.get().strip()
         if mode == "Manual":
@@ -2276,34 +2342,52 @@ class PipelineMasterGUI:
 
     def _reset_inpaint_auto_locked_defaults(self) -> None:
         # Fields disabled in Auto mode.
-        self.inpaint_tile_num_var.set("2")
+        self.inpaint_dynamic_chunk_var.set(True)
+        self.inpaint_tile_mode_var.set("1 and 2")
         self.inpaint_input_bias_var.set("0")
-        self.inpaint_overlap_var.set("3")
-        self.inpaint_tail_pad_var.set("2")
+        self.inpaint_overlap_var.set("2")
+        self.inpaint_tail_pad_var.set("1")
         self.inpaint_use_sharpness_csv_var.set(True)
-        self.inpaint_use_sharpen_var.set(True)
+        self.inpaint_use_sharpen_var.set(False)
         self.inpaint_inference_steps_var.set("8")
 
     def _on_inpaint_auto_steps_toggle(self) -> None:
+        self._apply_inpaint_control_states()
+
+    def _on_inpaint_dynamic_chunk_toggle(self) -> None:
         self._apply_inpaint_control_states()
 
     def _on_inpaint_sharpen_toggle(self) -> None:
         self._apply_inpaint_control_states()
 
     def _sharpen_step_enabled_in_current_mode(self) -> bool:
-        if self.inpaint_mode_var.get().strip() == "Auto (recommended)":
-            return True
         return bool(self.inpaint_use_sharpen_var.get())
 
     def _apply_inpaint_control_states(self) -> None:
         mode_manual = self.inpaint_mode_var.get().strip() == "Manual"
+        dynamic_chunk = bool(self.inpaint_dynamic_chunk_var.get())
 
-        self.inpaint_frames_chunk_entry.configure(state=tk.NORMAL)
         self.inpaint_cpu_offload_combo.configure(state="readonly")
 
         manual_state = tk.NORMAL if mode_manual else tk.DISABLED
         for widget in getattr(self, "_inpaint_manual_widgets", []):
             widget.configure(state=manual_state)
+
+        if not mode_manual:
+            self.inpaint_dynamic_chunk_var.set(True)
+            dynamic_chunk = True
+
+        if dynamic_chunk:
+            self._set_inpaint_chunk_entry_na()
+            self.inpaint_frames_chunk_entry.configure(state=tk.DISABLED)
+        else:
+            self._restore_inpaint_chunk_entry_value()
+            self.inpaint_frames_chunk_entry.configure(state=tk.NORMAL if mode_manual else tk.DISABLED)
+
+        self.inpaint_dynamic_chunk_check.configure(state=tk.DISABLED if not mode_manual else tk.NORMAL)
+        self.inpaint_tile_mode_combo.configure(state=tk.DISABLED if not mode_manual else "readonly")
+        self.inpaint_tile1_max_size_entry.configure(state=tk.NORMAL)
+        self.inpaint_tile2_max_size_entry.configure(state=tk.NORMAL)
 
         use_auto_steps = bool(self.inpaint_use_sharpness_csv_var.get())
         if mode_manual and not use_auto_steps:
@@ -2313,10 +2397,7 @@ class PipelineMasterGUI:
 
         sharpen_manual_state = tk.NORMAL if mode_manual else tk.DISABLED
         self.inpaint_sharpen_check.configure(state=sharpen_manual_state)
-        sharpen_workers_state = tk.NORMAL if (
-            self.inpaint_mode_var.get().strip() == "Auto (recommended)"
-            or bool(self.inpaint_use_sharpen_var.get())
-        ) else tk.DISABLED
+        sharpen_workers_state = tk.NORMAL if self._sharpen_step_enabled_in_current_mode() else tk.DISABLED
         self.inpaint_sharpen_workers_entry.configure(state=sharpen_workers_state)
         sharpen_buttons_state = tk.NORMAL if self._sharpen_step_enabled_in_current_mode() else tk.DISABLED
         self.inpaint_sharpen_run_btn.configure(state=sharpen_buttons_state)
@@ -2350,10 +2431,13 @@ class PipelineMasterGUI:
             "REPLACE_MASK_FOLDER": mask_dir,
             "USE_REPLACE_MASK": "1",
             "OFFLOAD_TYPE": self.inpaint_cpu_offload_var.get().strip() or "model",
-            "FRAMES_CHUNK": self.inpaint_frames_chunk_var.get().strip() or "50",
-            "TILE_NUM": self.inpaint_tile_num_var.get().strip() or "2",
-            "OVERLAP": self.inpaint_overlap_var.get().strip() or "3",
-            "TAIL_PAD": self.inpaint_tail_pad_var.get().strip() or "2",
+            "CHUNK_SIZE": self._get_inpaint_chunk_manual_value(),
+            "ENABLE_DYNAMIC_CHUNK": "1" if bool(self.inpaint_dynamic_chunk_var.get()) else "0",
+            "TILE_MODE": self.inpaint_tile_mode_var.get().strip() or "1 and 2",
+            "TILE1_MAX_SIZE": self.inpaint_tile1_max_size_var.get().strip() or "22",
+            "TILE2_MAX_SIZE": self.inpaint_tile2_max_size_var.get().strip() or "55",
+            "OVERLAP": self.inpaint_overlap_var.get().strip() or "2",
+            "TAIL_PAD": self.inpaint_tail_pad_var.get().strip() or "1",
             "ORIGINAL_INPUT_BLEND_STRENGTH": self.inpaint_input_bias_var.get().strip() or "0",
             "OUTPUT_CODEC": codec_value,
             "OUTPUT_ENCODING_MODE": self._current_global_encoder_mode(),
@@ -2365,7 +2449,6 @@ class PipelineMasterGUI:
             # Hardcoded unsupported features in this tab.
             "ENABLE_POST_INPAINTING_BLEND": "0",
             "DISABLE_COLOR_TRANSFER": "1",
-            "DISABLE_DYNAMIC_CHUNK": "1",
             "STOP_MARKER": os.path.join(
                 output_dir or os.path.join(work_dir, self.STANDARD_SUBDIRS["inpaint"]),
                 ".stop_after_current",
@@ -2744,7 +2827,7 @@ class PipelineMasterGUI:
             messagebox.showinfo("Sharpen", "Stop verification before running Sharpen.")
             return
         if not self._sharpen_step_enabled_in_current_mode():
-            messagebox.showinfo("Sharpen", "Sharpen is disabled in Manual mode.")
+            messagebox.showinfo("Sharpen", "Sharpen is disabled for the current Inpainting settings.")
             return
         try:
             cmd, env_updates, _preview = self._build_inpaint_sharpen_runner_payload()
@@ -8459,10 +8542,15 @@ class PipelineMasterGUI:
 
         # Inpaint defaults.
         self.inpaint_mode_var.set("Auto (recommended)")
-        self.inpaint_frames_chunk_var.set("55")
-        self.inpaint_cpu_offload_var.set("none")
+        self.inpaint_frames_chunk_var.set("22")
+        self._inpaint_chunk_manual_cache = "22"
+        self.inpaint_dynamic_chunk_var.set(True)
+        self.inpaint_cpu_offload_var.set("model")
+        self.inpaint_tile_mode_var.set("1 and 2")
+        self.inpaint_tile1_max_size_var.set("22")
+        self.inpaint_tile2_max_size_var.set("55")
         self.inpaint_sharpness_workers_var.set("19")
-        self.inpaint_use_sharpen_var.set(True)
+        self.inpaint_use_sharpen_var.set(False)
         self.inpaint_sharpen_workers_var.set("19")
         self.inpaint_codec_var.set(self.DEFAULT_SCENE_CODEC)
         self._on_inpaint_mode_changed()
@@ -16532,9 +16620,12 @@ class PipelineMasterGUI:
             "splat_replace_mask_edge": bool(self.splat_replace_mask_edge_var.get()),
             "splat_codec": self.splat_codec_var.get().strip(),
             "inpaint_mode": self.inpaint_mode_var.get().strip(),
-            "inpaint_frames_chunk": self.inpaint_frames_chunk_var.get().strip(),
+            "inpaint_frames_chunk": self._get_inpaint_chunk_manual_value(),
+            "inpaint_dynamic_chunk": bool(self.inpaint_dynamic_chunk_var.get()),
             "inpaint_cpu_offload": self.inpaint_cpu_offload_var.get().strip(),
-            "inpaint_tile_num": self.inpaint_tile_num_var.get().strip(),
+            "inpaint_tile_mode": self.inpaint_tile_mode_var.get().strip(),
+            "inpaint_tile1_max_size": self.inpaint_tile1_max_size_var.get().strip(),
+            "inpaint_tile2_max_size": self.inpaint_tile2_max_size_var.get().strip(),
             "inpaint_input_bias": self.inpaint_input_bias_var.get().strip(),
             "inpaint_overlap": self.inpaint_overlap_var.get().strip(),
             "inpaint_tail_pad": self.inpaint_tail_pad_var.get().strip(),

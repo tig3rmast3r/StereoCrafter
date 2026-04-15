@@ -25,7 +25,7 @@ garbage_collection_threshold:0.8 and expandable_segments:True are very light so 
 
 ## Usage (manual with or without GUI)
 
-All the scripts can be launched as stand-alone, or you can run the gui versions like the originating fork where i've started, only a warning with merging_gui, it leads to crashes very often so use at your own risk. Use preprocessed motion/shadowed mask to reduce crashes (mask_for_merge script)<br>
+All the scripts can be launched as stand-alone, or you can run the gui versions like the originating fork where i've started<br>
 Below the full manual pipeline (using all features)<br>
 
 As a general rule:<br>
@@ -43,7 +43,7 @@ python Utilities/split_scenes_from_csv.py
 ./runners/run_splatting_runner_parallel.sh
 python Utilities/analyze_inpaint_sharpness.py
 ./runners/run_inpainting_runner.sh
-./runners/run_inpaint_sharpen_runner.sh
+#./runners/run_inpaint_sharpen_runner.sh #currently disabled on the new auto preset
 ./runners/run_mask_formerge_nogui.sh
 python Utilities/analyze_auto_ct_csv.py
 ./runners/run_merging_nogui_batch_parallel.sh #or runners/run_merging_nogui_batch.sh for single thread

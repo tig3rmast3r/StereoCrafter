@@ -17,12 +17,15 @@ GLOB="${GLOB:-*.mp4}"
 HIRES_BLEND_FOLDER="${HIRES_BLEND_FOLDER:-}"                # optional
 REPLACE_MASK_FOLDER="${REPLACE_MASK_FOLDER:-./work/mask/}"              # optional; folder with <splatted_stem>_replace_mask.*
 USE_REPLACE_MASK="${USE_REPLACE_MASK:-1}"                   # 1 => use external replace mask (fast-fail if missing/mismatch)
-OFFLOAD_TYPE="${OFFLOAD_TYPE:-none}"                       # none | model | sequential
+OFFLOAD_TYPE="${OFFLOAD_TYPE:-model}"                      # none | model | sequential
 
-TILE_NUM="${TILE_NUM:-2}"
-FRAMES_CHUNK="${FRAMES_CHUNK:-55}"
-OVERLAP="${OVERLAP:-3}"
-TAIL_PAD="${TAIL_PAD:-2}"
+CHUNK_SIZE="${CHUNK_SIZE:-22}"
+ENABLE_DYNAMIC_CHUNK="${ENABLE_DYNAMIC_CHUNK:-1}"
+TILE_MODE="${TILE_MODE:-1 and 2}"
+TILE1_MAX_SIZE="${TILE1_MAX_SIZE:-22}"
+TILE2_MAX_SIZE="${TILE2_MAX_SIZE:-55}"
+OVERLAP="${OVERLAP:-2}"
+TAIL_PAD="${TAIL_PAD:-1}"
 ORIGINAL_INPUT_BLEND_STRENGTH="${ORIGINAL_INPUT_BLEND_STRENGTH:-0}"
 OUTPUT_CODEC="${OUTPUT_CODEC:-libx264}"                # optional override (e.g. libx264, h264_nvenc, hevc_nvenc)
 OUTPUT_ENCODING_MODE="${OUTPUT_ENCODING_MODE:-lossless}"       # shared encoder mode for color outputs
@@ -50,7 +53,6 @@ SKIP_EXISTING="${SKIP_EXISTING:-1}"
 MOVE_FINISHED="${MOVE_FINISHED:-0}"
 FINISHED_SUBDIR="${FINISHED_SUBDIR:-finished}"
 
-DISABLE_DYNAMIC_CHUNK="${DISABLE_DYNAMIC_CHUNK:-1}"
 RETRY_POLICY_JSON="${RETRY_POLICY_JSON:-}"
 
 DEBUG="${DEBUG:-0}"
@@ -67,8 +69,10 @@ fi
 
 CMD+=(--output_dir "$OUTPUT_DIR"
      --stop_marker "$STOP_MARKER"
-     --tile_num "$TILE_NUM"
-     --frames_chunk "$FRAMES_CHUNK"
+     --chunk_size "$CHUNK_SIZE"
+     --tile_mode "$TILE_MODE"
+     --tile1_max_size "$TILE1_MAX_SIZE"
+     --tile2_max_size "$TILE2_MAX_SIZE"
      --overlap "$OVERLAP"
      --tail_pad "$TAIL_PAD"
      --original_input_blend_strength "$ORIGINAL_INPUT_BLEND_STRENGTH"
@@ -103,7 +107,11 @@ if [[ -n "$OUTPUT_EXTRA_ARGS" ]]; then CMD+=(--output_extra_args "$OUTPUT_EXTRA_
 if [[ "$SKIP_EXISTING" == "1" ]]; then CMD+=(--skip_existing); fi
 if [[ "$MOVE_FINISHED" == "1" ]]; then CMD+=(--move_finished); fi
 if [[ "$DEBUG" == "1" ]]; then CMD+=(--debug); fi
-if [[ "$DISABLE_DYNAMIC_CHUNK" == "1" ]]; then CMD+=(--no_dynamic_chunk); fi
+if [[ "$ENABLE_DYNAMIC_CHUNK" == "1" ]]; then
+  CMD+=(--enable_dynamic_chunk)
+else
+  CMD+=(--disable_dynamic_chunk)
+fi
 if [[ -n "$RETRY_POLICY_JSON" ]]; then CMD+=(--retry_policy_json "$RETRY_POLICY_JSON"); fi
 
 echo "[CMD] ${CMD[*]}"

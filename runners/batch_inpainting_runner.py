@@ -27,11 +27,6 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch
 
-try:
-    import cv2  # type: ignore
-except Exception:
-    cv2 = None
-
 # The GUI module contains the full inpainting implementation we want to reuse.
 # Importing it is fine headless; we just must not create a real Tk window.
 
@@ -424,66 +419,6 @@ def _load_sharpness_csv(csv_path: str):
     except Exception:
         return {}
 
-def _load_chunk_csv(csv_path: str):
-    """Return mapping {basename -> frames_chunk}. If csv missing or column missing, returns empty dict.
-
-    Looks for any of these columns (first found wins per row):
-      - frames_chunk
-      - frame_chunk
-      - chunk
-      - chunk_size
-    """
-    if not csv_path:
-        return {}
-    try:
-        if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
-            return {}
-        out = {}
-        with open(csv_path, "r", newline="") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                name = (row.get("file") or "").strip()
-                if not name:
-                    continue
-                # try multiple possible column names
-                val = None
-                for key in ("frames_chunk", "frame_chunk", "chunk", "chunk_size"):
-                    s = (row.get(key) or "").strip()
-                    if s != "":
-                        val = s
-                        break
-                if val is None:
-                    continue
-                try:
-                    c = int(float(val))
-                except Exception:
-                    continue
-                if c > 0:
-                    out[name] = c
-        return out
-    except Exception:
-        return {}
-
-
-def _get_video_wh(path: str):
-    """Fast width/height probe using OpenCV. Returns (w,h) or (None,None)."""
-    try:
-        if cv2 is None:
-            return (None, None)
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            return (None, None)
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        cap.release()
-        if w > 0 and h > 0:
-            return (w, h)
-        return (None, None)
-    except Exception:
-        return (None, None)
-
-DEFAULT_CHUNK_K = 3840 * 832 * 16  # reference: 1920x832 -> 16 frames_chunk
-
 RETRY_PROFILE_ORDER = ("run", "retry1", "retry2", "retry3")
 RETRY_OFFLOAD_CHOICES = {"none", "model", "sequential"}
 RETRY_MAX_SPLIT_CHOICES = {64, 128, 256, 512}
@@ -794,14 +729,8 @@ def run_batch(args):
             sharp_csv = os.path.join(os.path.abspath(sharp_base), "sharpness.csv")
         sharpness_map = _load_sharpness_csv(sharp_csv)
         print(f"[INFO] sharpness_csv: {sharp_csv} (rows={len(sharpness_map)})")
-        chunk_map = _load_chunk_csv(sharp_csv)
-        if chunk_map:
-            print(f"[INFO] per-file frames_chunk overrides: {len(chunk_map)}")
-        else:
-            print("[INFO] no per-file frames_chunk overrides found in sharpness CSV")
     else:
         print(f"[INFO] sharpness CSV disabled; using fixed steps={args.fixed_steps}")
-        chunk_map = {}
 
     for idx, video_path in enumerate(videos, 1):
         if _stop_marker_exists(stop_marker_path):
@@ -876,37 +805,18 @@ def run_batch(args):
                 num_steps = _steps_from_sharpness(sharp_val)
                 print(f"[INFO] steps={num_steps} (sharp_raw={sharp_val:.2f})")
 
-            # frames_chunk selection:
-            # - If --no_dynamic_chunk is NOT set, compute frames_chunk from frame area using chunk_k:
-            #     frames_chunk ~= chunk_k / (W*H)
-            #   Reference default: 1920x832 -> 24 frames_chunk  (chunk_k = 1920*832*24)
-            # - If sharpness.csv provides a per-file override column, it wins.
-            frames_chunk = int(args.frames_chunk)
-
-            if not args.no_dynamic_chunk:
-                vw, vh = _get_video_wh(video_path)
-                if vw and vh:
-                    dyn = int(round(float(args.chunk_k) / float(vw * vh)))
-                    if dyn < 1:
-                        dyn = 1
-                    # clamp
-                    dyn = max(int(args.chunk_min), min(int(args.chunk_max), dyn))
-                    frames_chunk = dyn
-                    print(f"[INFO] frames_chunk={frames_chunk} (dynamic from {vw}x{vh}, chunk_k={int(args.chunk_k)})")
-                else:
-                    print("[WARN] dynamic frames_chunk enabled but failed to probe video size; using fixed frames_chunk")
-
-            # Per-file override (from sharpness.csv columns, if present).
-            if chunk_map and base in chunk_map:
-                frames_chunk = int(chunk_map[base])
-                # clamp even on override
-                frames_chunk = max(int(args.chunk_min), min(int(args.chunk_max), frames_chunk))
-                print(f"[INFO] frames_chunk={frames_chunk} (per-file override)")
+            frames_chunk = max(1, int(args.chunk_size))
+            print(
+                f"[INFO] chunk_setup dynamic={bool(args.enable_dynamic_chunk)} "
+                f"chunk_size={frames_chunk} tile_mode={args.tile_mode} "
+                f"tile1_max={int(args.tile1_max_size)} tile2_max={int(args.tile2_max_size)} "
+                f"overlap={int(args.overlap)} tail_pad={int(args.tail_pad)}"
+            )
 
             # Keep overlap valid: must be < frames_chunk (otherwise chunking can't progress).
             overlap = int(args.overlap)
             if frames_chunk <= 0:
-                frames_chunk = int(args.frames_chunk)
+                frames_chunk = max(1, int(args.chunk_size))
             if overlap < 0:
                 overlap = 0
             if overlap >= frames_chunk:
@@ -928,6 +838,11 @@ def run_batch(args):
                 "total": len(videos),
                 "input_path": video_path,
                 "output_path": out_path,
+                "chunk_size": frames_chunk,
+                "dynamic_chunk": bool(args.enable_dynamic_chunk),
+                "tile_mode": args.tile_mode,
+                "overlap": overlap,
+                "tail_pad": tail_pad,
                 "process_length": int(args.process_length),
             })
             current_job_marked = True
@@ -972,7 +887,10 @@ def run_batch(args):
                         frames_chunk=frames_chunk,
                         overlap=overlap,
                         tail_pad=tail_pad,
-                        tile_num=args.tile_num,
+                        enable_dynamic_chunk=bool(args.enable_dynamic_chunk),
+                        tile_mode=args.tile_mode,
+                        tile1_max_size=args.tile1_max_size,
+                        tile2_max_size=args.tile2_max_size,
                         vf=None,
                         num_inference_steps=num_steps,
                         stop_event=stop_event,
@@ -1103,16 +1021,18 @@ def main():
                    help="Ignore sharpness.csv and use --fixed_steps for all files")
     p.add_argument("--fixed_steps", type=int, default=8,
                    help="Fallback steps when sharpness.csv is missing or ignored")
-    p.add_argument("--tile_num", type=int, default=2)
-    p.add_argument("--frames_chunk", type=int, default=50)
-    p.add_argument("--no_dynamic_chunk", action="store_true",
-                   help="Disable dynamic frames_chunk computation; always use --frames_chunk (unless CSV override exists)")
-    p.add_argument("--chunk_k", type=float, default=float(DEFAULT_CHUNK_K),
-                   help="Constant for dynamic frames_chunk: frames_chunk ~= chunk_k/(W*H). Default based on 1920x832->24.")
-    p.add_argument("--chunk_min", type=int, default=20, help="Minimum frames_chunk when dynamic/override is used")
-    p.add_argument("--chunk_max", type=int, default=500, help="Maximum frames_chunk when dynamic/override is used")
-    p.add_argument("--overlap", type=int, default=3)
-    p.add_argument("--tail_pad", type=int, default=3,
+    p.add_argument("--chunk_size", type=int, default=22,
+                   help="Processed chunk size (visible + overlap, no tail) used when dynamic chunk is disabled.")
+    p.add_argument("--enable_dynamic_chunk", dest="enable_dynamic_chunk", action="store_true",
+                   help="Resolve chunk size per scene from steps + mask hold.")
+    p.add_argument("--disable_dynamic_chunk", dest="enable_dynamic_chunk", action="store_false",
+                   help="Use fixed --chunk_size instead of dynamic chunk selection.")
+    p.set_defaults(enable_dynamic_chunk=True)
+    p.add_argument("--tile_mode", type=str, default="1 and 2", choices=["1", "2", "1 and 2"])
+    p.add_argument("--tile1_max_size", type=int, default=22)
+    p.add_argument("--tile2_max_size", type=int, default=55)
+    p.add_argument("--overlap", type=int, default=2)
+    p.add_argument("--tail_pad", type=int, default=1,
                    help="Guard frames used for both non-last chunk handoff and last-chunk duplication.")
     p.add_argument("--original_input_blend_strength", type=float, default=0.0)
     p.add_argument("--process_length", type=int, default=-1)

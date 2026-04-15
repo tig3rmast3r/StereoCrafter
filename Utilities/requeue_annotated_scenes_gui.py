@@ -75,13 +75,16 @@ DIR_LABELS = {
     "mask_for_merge": "mask_for_merge",
     "sbs": "sbs",
 }
+# copy_prev must include the full cumulative pipeline history up to the
+# previous step, not just the folders strictly required to execute the next
+# runner. Pipeline Master reuses earlier stage folders for coverage/validation.
 STEP_TO_SUBSET_PREV_DIRS = {
     "depthcrafter": ["seg"],
     "splatting": ["seg", "depthmap"],
-    "inpainting": ["seg", "splat/hires", "mask"],
-    "sharpen": ["seg", "splat/hires", "mask", "output"],
-    "mask_for_merge": ["seg", "splat/hires", "mask", "output", "output-sharpen"],
-    "merging": ["seg", "splat/hires", "mask", "output", "output-sharpen", "mask_for_merge"],
+    "inpainting": ["seg", "depthmap", "splat/hires", "mask"],
+    "sharpen": ["seg", "depthmap", "splat/hires", "mask", "output"],
+    "mask_for_merge": ["seg", "depthmap", "splat/hires", "mask", "output", "output-sharpen"],
+    "merging": ["seg", "depthmap", "splat/hires", "mask", "output", "output-sharpen", "mask_for_merge"],
 }
 
 CSV_BASENAME_FIELDS = ("file_name", "filename", "file", "video", "file_path", "path")
