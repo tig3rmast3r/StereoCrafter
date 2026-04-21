@@ -46,7 +46,7 @@ try:
 except Exception:
     ThemedTk = None
 
-GUI_VERSION = "2026-04-06"
+GUI_VERSION = "2026-04-21"
 REPO_ROOT = repo_root()
 DEFAULT_PIPELINE_MASTER_CONFIG_PATH = config_path("config_pipeline_master_gui.json")
 
@@ -798,7 +798,7 @@ class PipelineMasterGUI:
             value=bool(self._config.get("inpaint_use_sharpness_csv", True))
         )
         self.inpaint_use_sharpen_var = tk.BooleanVar(
-            value=bool(self._config.get("inpaint_use_sharpen", False))
+            value=bool(self._config.get("inpaint_use_sharpen", True))
         )
         default_sharp_workers = "19"
         self.inpaint_sharpness_workers_var = tk.StringVar(
@@ -1064,7 +1064,7 @@ class PipelineMasterGUI:
         if self.inpaint_mode_var.get().strip() not in {"Auto (recommended)", "Manual"}:
             self.inpaint_mode_var.set("Auto (recommended)")
         if self.inpaint_mode_var.get().strip() == "Auto (recommended)":
-            self.inpaint_use_sharpen_var.set(False)
+            self.inpaint_use_sharpen_var.set(True)
         if self.inpaint_frames_chunk_var.get().strip() == "":
             self.inpaint_frames_chunk_var.set("22")
         self._inpaint_chunk_manual_cache = self.inpaint_frames_chunk_var.get().strip() or "22"
@@ -2511,7 +2511,7 @@ class PipelineMasterGUI:
         self.inpaint_overlap_var.set("2")
         self.inpaint_tail_pad_var.set("1")
         self.inpaint_use_sharpness_csv_var.set(True)
-        self.inpaint_use_sharpen_var.set(False)
+        self.inpaint_use_sharpen_var.set(True)
         self.inpaint_inference_steps_var.set("8")
         self.inpaint_dynamic_visible_chunk_steps5_var.set(
             self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS5_DEFAULT
@@ -8835,7 +8835,7 @@ class PipelineMasterGUI:
             self.INPAINT_DYNAMIC_STATIC_MASK_DIVISOR_DEFAULT
         )
         self.inpaint_sharpness_workers_var.set("19")
-        self.inpaint_use_sharpen_var.set(False)
+        self.inpaint_use_sharpen_var.set(True)
         self.inpaint_sharpen_workers_var.set("19")
         self.inpaint_codec_var.set(self.DEFAULT_SCENE_CODEC)
         self._on_inpaint_mode_changed()
