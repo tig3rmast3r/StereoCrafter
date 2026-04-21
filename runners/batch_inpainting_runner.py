@@ -573,25 +573,27 @@ def _apply_allocator_conf(conf: str) -> None:
         print(f"[WARN] failed to apply allocator settings '{conf_s or 'default'}': {e}")
 
 
-def _steps_from_sharpness(val: float) -> int:
+def _round_half_up(value: float) -> int:
+    return int(math.floor(float(value) + 0.5))
+
+
+def _steps_from_sharpness(val: float) -> float:
     """
-    Rule:
-    raw <= 1100 -> 5
-    +1 step every additional 1100
-    max 12
+    Continuous rule:
+    raw <= 1100 -> 5.0
+    every additional 1100 sharpness points adds +1.0 step
+    clamp to 8.0
     """
     try:
         v = float(val)
     except Exception:
-        return 5
+        return 5.0
 
-    if v <= 1100:
-        return 5
+    if v <= 1100.0:
+        return 5.0
 
-    steps = 5 + int(v // 1100)
-    if steps > 8:
-        steps = 8
-    return steps
+    steps = 5.0 + ((v - 1100.0) / 1100.0)
+    return max(5.0, min(8.0, steps))
 
 
 
@@ -799,18 +801,31 @@ def run_batch(args):
             # - Otherwise, use --fixed_steps.
             sharp_val = sharpness_map.get(base) if sharpness_map else None
             if sharp_val is None:
-                num_steps = int(args.fixed_steps)
-                print(f"[INFO] steps={num_steps} (fixed)")
+                effective_steps = max(1.0, float(args.fixed_steps))
+                model_steps = _round_half_up(effective_steps)
+                print(
+                    f"[INFO] effective_steps={effective_steps:.2f} "
+                    f"model_steps={model_steps} (fixed)"
+                )
             else:
-                num_steps = _steps_from_sharpness(sharp_val)
-                print(f"[INFO] steps={num_steps} (sharp_raw={sharp_val:.2f})")
+                effective_steps = _steps_from_sharpness(sharp_val)
+                model_steps = _round_half_up(effective_steps)
+                print(
+                    f"[INFO] effective_steps={effective_steps:.2f} "
+                    f"model_steps={model_steps} (sharp_raw={sharp_val:.2f})"
+                )
 
             frames_chunk = max(1, int(args.chunk_size))
             print(
                 f"[INFO] chunk_setup dynamic={bool(args.enable_dynamic_chunk)} "
                 f"chunk_size={frames_chunk} tile_mode={args.tile_mode} "
                 f"tile1_max={int(args.tile1_max_size)} tile2_max={int(args.tile2_max_size)} "
-                f"overlap={int(args.overlap)} tail_pad={int(args.tail_pad)}"
+                f"overlap={int(args.overlap)} tail_pad={int(args.tail_pad)} "
+                f"steps5={int(args.dynamic_visible_chunk_steps5)} "
+                f"steps6={int(args.dynamic_visible_chunk_steps6)} "
+                f"steps7={int(args.dynamic_visible_chunk_steps7)} "
+                f"steps8plus={int(args.dynamic_visible_chunk_steps8_plus)} "
+                f"hold_divisor={float(args.dynamic_hold_divisor):.2f}"
             )
 
             # Keep overlap valid: must be < frames_chunk (otherwise chunking can't progress).
@@ -892,7 +907,7 @@ def run_batch(args):
                         tile1_max_size=args.tile1_max_size,
                         tile2_max_size=args.tile2_max_size,
                         vf=None,
-                        num_inference_steps=num_steps,
+                        effective_inference_steps=effective_steps,
                         stop_event=stop_event,
                         update_info_callback=None,
                         original_input_blend_strength=args.original_input_blend_strength,
@@ -900,6 +915,11 @@ def run_batch(args):
                         output_encoding_mode=args.output_encoding_mode,
                         output_extra_args=args.output_extra_args,
                         process_length=args.process_length,
+                        dynamic_visible_chunk_steps5=args.dynamic_visible_chunk_steps5,
+                        dynamic_visible_chunk_steps6=args.dynamic_visible_chunk_steps6,
+                        dynamic_visible_chunk_steps7=args.dynamic_visible_chunk_steps7,
+                        dynamic_visible_chunk_steps8_plus=args.dynamic_visible_chunk_steps8_plus,
+                        static_mask_divisor=args.dynamic_hold_divisor,
                     )
                 except Exception as e:
                     completed = False
@@ -1019,8 +1039,8 @@ def main():
                    help="Explicit sharpness CSV path (overrides --sharpness_base).")
     p.add_argument("--no_sharpness_csv", action="store_true",
                    help="Ignore sharpness.csv and use --fixed_steps for all files")
-    p.add_argument("--fixed_steps", type=int, default=8,
-                   help="Fallback steps when sharpness.csv is missing or ignored")
+    p.add_argument("--fixed_steps", type=float, default=8.0,
+                   help="Fallback effective steps when sharpness.csv is missing or ignored")
     p.add_argument("--chunk_size", type=int, default=22,
                    help="Processed chunk size (visible + overlap, no tail) used when dynamic chunk is disabled.")
     p.add_argument("--enable_dynamic_chunk", dest="enable_dynamic_chunk", action="store_true",
@@ -1031,6 +1051,11 @@ def main():
     p.add_argument("--tile_mode", type=str, default="1 and 2", choices=["1", "2", "1 and 2"])
     p.add_argument("--tile1_max_size", type=int, default=22)
     p.add_argument("--tile2_max_size", type=int, default=55)
+    p.add_argument("--dynamic_visible_chunk_steps5", type=int, default=igs.DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS5)
+    p.add_argument("--dynamic_visible_chunk_steps6", type=int, default=igs.DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS6)
+    p.add_argument("--dynamic_visible_chunk_steps7", type=int, default=igs.DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS7)
+    p.add_argument("--dynamic_visible_chunk_steps8_plus", type=int, default=igs.DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS)
+    p.add_argument("--dynamic_hold_divisor", type=float, default=igs.DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR)
     p.add_argument("--overlap", type=int, default=2)
     p.add_argument("--tail_pad", type=int, default=1,
                    help="Guard frames used for both non-last chunk handoff and last-chunk duplication.")

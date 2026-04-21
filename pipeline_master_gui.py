@@ -72,6 +72,11 @@ class PipelineMasterGUI:
     MAX_DEPTH_SCALE_FACTOR = 1.0
     DEFAULT_SPLIT_SCENES_WORKERS = 8
     DEFAULT_PIPELINE_TEST_RUN_FILES = 5
+    INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS5_DEFAULT = "38"
+    INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS6_DEFAULT = "26"
+    INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS7_DEFAULT = "18"
+    INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS_DEFAULT = "14"
+    INPAINT_DYNAMIC_STATIC_MASK_DIVISOR_DEFAULT = "3.0"
     DEPTH_RUNTIME_MODE_CHOICES = ("original", "stream")
     DEPTH_RUNTIME_MODE_TO_SCRIPT = {
         "original": "./runners/depthcrafter_nogui_batch.py",
@@ -359,7 +364,9 @@ class PipelineMasterGUI:
 
         self._scene_thread: threading.Thread | None = None
         self._scene_process: subprocess.Popen | None = None
+        self._scene_stop_marker_path: str = ""
         self._scene_stop_requested = False
+        self._scene_stop_clicks = 0
         self._scene_active_step = "scenedetect"
 
         self._verify_thread: threading.Thread | None = None
@@ -380,14 +387,17 @@ class PipelineMasterGUI:
 
         self._depth_thread: threading.Thread | None = None
         self._depth_process: subprocess.Popen | None = None
+        self._depth_stop_marker_path: str = ""
         self._depth_stop_requested = False
         self._depth_stop_clicks = 0
         self._splat_thread: threading.Thread | None = None
         self._splat_process: subprocess.Popen | None = None
+        self._splat_stop_marker_path: str = ""
         self._splat_stop_requested = False
         self._splat_stop_clicks = 0
         self._inpaint_thread: threading.Thread | None = None
         self._inpaint_process: subprocess.Popen | None = None
+        self._inpaint_stop_marker_path: str = ""
         self._inpaint_stop_requested = False
         self._inpaint_stop_clicks = 0
         self._inpaint_resume_after_sharpness = False
@@ -735,6 +745,46 @@ class PipelineMasterGUI:
         self.inpaint_tile2_max_size_var = tk.StringVar(
             value=str(self._config.get("inpaint_tile2_max_size", "55"))
         )
+        self.inpaint_dynamic_visible_chunk_steps5_var = tk.StringVar(
+            value=str(
+                self._config.get(
+                    "inpaint_dynamic_visible_chunk_steps5",
+                    self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS5_DEFAULT,
+                )
+            )
+        )
+        self.inpaint_dynamic_visible_chunk_steps6_var = tk.StringVar(
+            value=str(
+                self._config.get(
+                    "inpaint_dynamic_visible_chunk_steps6",
+                    self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS6_DEFAULT,
+                )
+            )
+        )
+        self.inpaint_dynamic_visible_chunk_steps7_var = tk.StringVar(
+            value=str(
+                self._config.get(
+                    "inpaint_dynamic_visible_chunk_steps7",
+                    self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS7_DEFAULT,
+                )
+            )
+        )
+        self.inpaint_dynamic_visible_chunk_steps8_plus_var = tk.StringVar(
+            value=str(
+                self._config.get(
+                    "inpaint_dynamic_visible_chunk_steps8_plus",
+                    self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS_DEFAULT,
+                )
+            )
+        )
+        self.inpaint_dynamic_hold_divisor_var = tk.StringVar(
+            value=str(
+                self._config.get(
+                    "inpaint_dynamic_hold_divisor",
+                    self.INPAINT_DYNAMIC_STATIC_MASK_DIVISOR_DEFAULT,
+                )
+            )
+        )
         self.inpaint_input_bias_var = tk.StringVar(
             value=str(self._config.get("inpaint_input_bias", "0"))
         )
@@ -1030,6 +1080,26 @@ class PipelineMasterGUI:
             self.inpaint_tile1_max_size_var.set("22")
         if self.inpaint_tile2_max_size_var.get().strip() == "":
             self.inpaint_tile2_max_size_var.set("55")
+        if self.inpaint_dynamic_visible_chunk_steps5_var.get().strip() == "":
+            self.inpaint_dynamic_visible_chunk_steps5_var.set(
+                self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS5_DEFAULT
+            )
+        if self.inpaint_dynamic_visible_chunk_steps6_var.get().strip() == "":
+            self.inpaint_dynamic_visible_chunk_steps6_var.set(
+                self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS6_DEFAULT
+            )
+        if self.inpaint_dynamic_visible_chunk_steps7_var.get().strip() == "":
+            self.inpaint_dynamic_visible_chunk_steps7_var.set(
+                self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS7_DEFAULT
+            )
+        if self.inpaint_dynamic_visible_chunk_steps8_plus_var.get().strip() == "":
+            self.inpaint_dynamic_visible_chunk_steps8_plus_var.set(
+                self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS_DEFAULT
+            )
+        if self.inpaint_dynamic_hold_divisor_var.get().strip() == "":
+            self.inpaint_dynamic_hold_divisor_var.set(
+                self.INPAINT_DYNAMIC_STATIC_MASK_DIVISOR_DEFAULT
+            )
         if self.inpaint_inference_steps_var.get().strip() == "":
             self.inpaint_inference_steps_var.set("8")
         try:
@@ -2075,8 +2145,13 @@ class PipelineMasterGUI:
             wraplength=1000,
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
-        params_frame = ttk.LabelFrame(parent, text="Inpainting Parameters", padding=8)
-        params_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
+        params_container = ttk.Frame(parent)
+        params_container.grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
+        params_container.grid_columnconfigure(0, weight=3)
+        params_container.grid_columnconfigure(1, weight=2)
+
+        params_frame = ttk.LabelFrame(params_container, text="Inpainting Parameters", padding=8)
+        params_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         for col in range(10):
             params_frame.grid_columnconfigure(col, weight=0)
         params_frame.grid_columnconfigure(9, weight=1)
@@ -2185,6 +2260,60 @@ class PipelineMasterGUI:
         )
         self.inpaint_sharpen_workers_entry.grid(
             row=4, column=3, sticky="w", padx=(6, 12), pady=(8, 0)
+        )
+
+        dynamic_frame = ttk.LabelFrame(params_container, text="Dynamic Chunk Settings", padding=8)
+        dynamic_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        dynamic_frame.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(dynamic_frame, text="Chunk @ 5.0 steps:").grid(row=0, column=0, sticky="w")
+        self.inpaint_dynamic_visible_chunk_steps5_entry = ttk.Entry(
+            dynamic_frame,
+            textvariable=self.inpaint_dynamic_visible_chunk_steps5_var,
+            width=8,
+        )
+        self.inpaint_dynamic_visible_chunk_steps5_entry.grid(
+            row=0, column=1, sticky="w", padx=(6, 0)
+        )
+
+        ttk.Label(dynamic_frame, text="Chunk @ 6.0 steps:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.inpaint_dynamic_visible_chunk_steps6_entry = ttk.Entry(
+            dynamic_frame,
+            textvariable=self.inpaint_dynamic_visible_chunk_steps6_var,
+            width=8,
+        )
+        self.inpaint_dynamic_visible_chunk_steps6_entry.grid(
+            row=1, column=1, sticky="w", padx=(6, 0), pady=(8, 0)
+        )
+
+        ttk.Label(dynamic_frame, text="Chunk @ 7.0 steps:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.inpaint_dynamic_visible_chunk_steps7_entry = ttk.Entry(
+            dynamic_frame,
+            textvariable=self.inpaint_dynamic_visible_chunk_steps7_var,
+            width=8,
+        )
+        self.inpaint_dynamic_visible_chunk_steps7_entry.grid(
+            row=2, column=1, sticky="w", padx=(6, 0), pady=(8, 0)
+        )
+
+        ttk.Label(dynamic_frame, text="Chunk @ 8.0+ steps:").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.inpaint_dynamic_visible_chunk_steps8_plus_entry = ttk.Entry(
+            dynamic_frame,
+            textvariable=self.inpaint_dynamic_visible_chunk_steps8_plus_var,
+            width=8,
+        )
+        self.inpaint_dynamic_visible_chunk_steps8_plus_entry.grid(
+            row=3, column=1, sticky="w", padx=(6, 0), pady=(8, 0)
+        )
+
+        ttk.Label(dynamic_frame, text="Static Mask Divisor:").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.inpaint_dynamic_hold_divisor_entry = ttk.Entry(
+            dynamic_frame,
+            textvariable=self.inpaint_dynamic_hold_divisor_var,
+            width=8,
+        )
+        self.inpaint_dynamic_hold_divisor_entry.grid(
+            row=4, column=1, sticky="w", padx=(6, 0), pady=(8, 0)
         )
 
         encode_frame = ttk.LabelFrame(parent, text="Encoding", padding=8)
@@ -2330,6 +2459,40 @@ class PipelineMasterGUI:
         if self.inpaint_frames_chunk_var.get().strip().upper() == "N/A":
             self.inpaint_frames_chunk_var.set(self._get_inpaint_chunk_manual_value())
 
+    @staticmethod
+    def _parse_inpaint_positive_int(raw: str, label: str) -> int:
+        value = int(str(raw).strip())
+        if value < 1:
+            raise ValueError(f"{label} must be >= 1.")
+        return value
+
+    @staticmethod
+    def _parse_inpaint_nonnegative_int(raw: str, label: str) -> int:
+        value = int(str(raw).strip())
+        if value < 0:
+            raise ValueError(f"{label} must be >= 0.")
+        return value
+
+    @staticmethod
+    def _parse_inpaint_positive_float(raw: str, label: str) -> float:
+        value = float(str(raw).strip())
+        if value <= 0.0:
+            raise ValueError(f"{label} must be > 0.")
+        return value
+
+    @staticmethod
+    def _parse_inpaint_bounded_float(
+        raw: str,
+        label: str,
+        *,
+        min_value: float,
+        max_value: float,
+    ) -> float:
+        value = float(str(raw).strip())
+        if value < min_value or value > max_value:
+            raise ValueError(f"{label} must be between {min_value} and {max_value}.")
+        return value
+
     def _on_inpaint_mode_changed(self, _event=None) -> None:
         mode = self.inpaint_mode_var.get().strip()
         if mode == "Manual":
@@ -2350,6 +2513,21 @@ class PipelineMasterGUI:
         self.inpaint_use_sharpness_csv_var.set(True)
         self.inpaint_use_sharpen_var.set(False)
         self.inpaint_inference_steps_var.set("8")
+        self.inpaint_dynamic_visible_chunk_steps5_var.set(
+            self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS5_DEFAULT
+        )
+        self.inpaint_dynamic_visible_chunk_steps6_var.set(
+            self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS6_DEFAULT
+        )
+        self.inpaint_dynamic_visible_chunk_steps7_var.set(
+            self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS7_DEFAULT
+        )
+        self.inpaint_dynamic_visible_chunk_steps8_plus_var.set(
+            self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS_DEFAULT
+        )
+        self.inpaint_dynamic_hold_divisor_var.set(
+            self.INPAINT_DYNAMIC_STATIC_MASK_DIVISOR_DEFAULT
+        )
 
     def _on_inpaint_auto_steps_toggle(self) -> None:
         self._apply_inpaint_control_states()
@@ -2388,6 +2566,16 @@ class PipelineMasterGUI:
         self.inpaint_tile_mode_combo.configure(state=tk.DISABLED if not mode_manual else "readonly")
         self.inpaint_tile1_max_size_entry.configure(state=tk.NORMAL)
         self.inpaint_tile2_max_size_entry.configure(state=tk.NORMAL)
+        dynamic_settings_state = tk.NORMAL if (mode_manual and dynamic_chunk) else tk.DISABLED
+        for widget in (
+            getattr(self, "inpaint_dynamic_visible_chunk_steps5_entry", None),
+            getattr(self, "inpaint_dynamic_visible_chunk_steps6_entry", None),
+            getattr(self, "inpaint_dynamic_visible_chunk_steps7_entry", None),
+            getattr(self, "inpaint_dynamic_visible_chunk_steps8_plus_entry", None),
+            getattr(self, "inpaint_dynamic_hold_divisor_entry", None),
+        ):
+            if widget is not None:
+                widget.configure(state=dynamic_settings_state)
 
         use_auto_steps = bool(self.inpaint_use_sharpness_csv_var.get())
         if mode_manual and not use_auto_steps:
@@ -2421,6 +2609,59 @@ class PipelineMasterGUI:
             self.DEFAULT_SCENE_CODEC,
         )
         self.inpaint_codec_var.set(codec_value)
+        chunk_size = self._parse_inpaint_positive_int(
+            self._get_inpaint_chunk_manual_value(),
+            "Chunk Size",
+        )
+        tile1_max_size = self._parse_inpaint_positive_int(
+            self.inpaint_tile1_max_size_var.get(),
+            "Tile 1 Max Size",
+        )
+        tile2_max_size = self._parse_inpaint_positive_int(
+            self.inpaint_tile2_max_size_var.get(),
+            "Tile 2 Max Size",
+        )
+        overlap = self._parse_inpaint_nonnegative_int(
+            self.inpaint_overlap_var.get(),
+            "Overlap",
+        )
+        tail_pad = self._parse_inpaint_nonnegative_int(
+            self.inpaint_tail_pad_var.get(),
+            "TailPad",
+        )
+        input_bias = self._parse_inpaint_bounded_float(
+            self.inpaint_input_bias_var.get(),
+            "Input Bias",
+            min_value=0.0,
+            max_value=1.0,
+        )
+        fixed_steps = self._parse_inpaint_positive_float(
+            self.inpaint_inference_steps_var.get(),
+            "Inference steps",
+        )
+        dynamic_steps5 = self._parse_inpaint_positive_int(
+            self.inpaint_dynamic_visible_chunk_steps5_var.get(),
+            "Chunk @ 5.0 steps",
+        )
+        dynamic_steps6 = self._parse_inpaint_positive_int(
+            self.inpaint_dynamic_visible_chunk_steps6_var.get(),
+            "Chunk @ 6.0 steps",
+        )
+        dynamic_steps7 = self._parse_inpaint_positive_int(
+            self.inpaint_dynamic_visible_chunk_steps7_var.get(),
+            "Chunk @ 7.0 steps",
+        )
+        dynamic_steps8_plus = self._parse_inpaint_positive_int(
+            self.inpaint_dynamic_visible_chunk_steps8_plus_var.get(),
+            "Chunk @ 8.0+ steps",
+        )
+        dynamic_hold_divisor = self._parse_inpaint_positive_float(
+            self.inpaint_dynamic_hold_divisor_var.get(),
+            "Static Mask Divisor",
+        )
+        tile_mode = self.inpaint_tile_mode_var.get().strip() or "1 and 2"
+        if tile_mode not in {"1", "2", "1 and 2"}:
+            raise ValueError("Tile must be one of: 1, 2, 1 and 2.")
 
         env_updates: dict[str, str] = {
             "PYTHON": sys.executable,
@@ -2431,21 +2672,26 @@ class PipelineMasterGUI:
             "REPLACE_MASK_FOLDER": mask_dir,
             "USE_REPLACE_MASK": "1",
             "OFFLOAD_TYPE": self.inpaint_cpu_offload_var.get().strip() or "model",
-            "CHUNK_SIZE": self._get_inpaint_chunk_manual_value(),
+            "CHUNK_SIZE": str(chunk_size),
             "ENABLE_DYNAMIC_CHUNK": "1" if bool(self.inpaint_dynamic_chunk_var.get()) else "0",
-            "TILE_MODE": self.inpaint_tile_mode_var.get().strip() or "1 and 2",
-            "TILE1_MAX_SIZE": self.inpaint_tile1_max_size_var.get().strip() or "22",
-            "TILE2_MAX_SIZE": self.inpaint_tile2_max_size_var.get().strip() or "55",
-            "OVERLAP": self.inpaint_overlap_var.get().strip() or "2",
-            "TAIL_PAD": self.inpaint_tail_pad_var.get().strip() or "1",
-            "ORIGINAL_INPUT_BLEND_STRENGTH": self.inpaint_input_bias_var.get().strip() or "0",
+            "TILE_MODE": tile_mode,
+            "TILE1_MAX_SIZE": str(tile1_max_size),
+            "TILE2_MAX_SIZE": str(tile2_max_size),
+            "DYNAMIC_VISIBLE_CHUNK_STEPS5": str(dynamic_steps5),
+            "DYNAMIC_VISIBLE_CHUNK_STEPS6": str(dynamic_steps6),
+            "DYNAMIC_VISIBLE_CHUNK_STEPS7": str(dynamic_steps7),
+            "DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS": str(dynamic_steps8_plus),
+            "DYNAMIC_HOLD_DIVISOR": str(dynamic_hold_divisor),
+            "OVERLAP": str(overlap),
+            "TAIL_PAD": str(tail_pad),
+            "ORIGINAL_INPUT_BLEND_STRENGTH": str(input_bias),
             "OUTPUT_CODEC": codec_value,
             "OUTPUT_ENCODING_MODE": self._current_global_encoder_mode(),
             "OUTPUT_EXTRA_ARGS": self._current_global_ffmpeg_extra_args(),
             "NO_SHARPNESS_CSV": "0" if use_sharpness_csv else "1",
             "SHARPNESS_BASE": sharp_base,
             "SHARPNESS_CSV_PATH": sharp_csv_path,
-            "FIXED_STEPS": self.inpaint_inference_steps_var.get().strip() or "8",
+            "FIXED_STEPS": str(fixed_steps),
             # Hardcoded unsupported features in this tab.
             "ENABLE_POST_INPAINTING_BLEND": "0",
             "DISABLE_COLOR_TRANSFER": "1",
@@ -2596,6 +2842,7 @@ class PipelineMasterGUI:
         self._append_inpaint_log(
             "ENV: " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
         )
+        self._inpaint_stop_marker_path = env_updates.get("STOP_MARKER", "").strip()
         self._inpaint_thread = threading.Thread(
             target=self._run_inpaint_worker,
             args=(cmd, env_updates),
@@ -2627,8 +2874,6 @@ class PipelineMasterGUI:
                 if line:
                     self._log_queue.put(("inpaint_line", line))
                     self._try_parse_inpaint_progress(line)
-                if self._inpaint_stop_requested:
-                    break
             rc = proc.wait()
             if self._inpaint_stop_requested:
                 self._log_queue.put(("inpaint_status", "Stopped by user"))
@@ -2726,6 +2971,8 @@ class PipelineMasterGUI:
             "--workers",
             str(workers),
         ]
+        stop_marker = str(out_csv.parent / ".stop_after_current")
+        cmd.extend(["--stop-marker", stop_marker])
 
         self._inpaint_stop_requested = False
         self._inpaint_stop_clicks = 0
@@ -2736,6 +2983,7 @@ class PipelineMasterGUI:
             self._pipeline_invalidate_from("sharpness_csv")
         self._append_inpaint_log("=== Sharpness CSV creation started ===")
         self._append_inpaint_log("CMD: " + " ".join(shlex.quote(x) for x in cmd))
+        self._inpaint_stop_marker_path = stop_marker
         self._inpaint_resume_after_sharpness = bool(resume_inpaint_after)
         self._inpaint_thread = threading.Thread(
             target=self._run_inpaint_sharpness_worker,
@@ -2933,6 +3181,7 @@ class PipelineMasterGUI:
         self._append_inpaint_log(
             "ENV: " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
         )
+        self._inpaint_stop_marker_path = env_updates.get("STOP_MARKER", "").strip()
         self._inpaint_thread = threading.Thread(
             target=self._run_inpaint_sharpen_worker,
             args=(cmd, env_updates),
@@ -3369,6 +3618,23 @@ class PipelineMasterGUI:
             )
             self._log_queue.put(("verify_done", "sharpen_deep"))
 
+    def _touch_stop_marker_file(
+        self,
+        marker_path: str,
+        logger: object | None = None,
+    ) -> str:
+        marker = str(marker_path or "").strip()
+        if not marker:
+            return ""
+        try:
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+            Path(marker).touch()
+        except Exception as exc:
+            if callable(logger):
+                logger(f"[STOP] failed to create stop marker {marker}: {exc}")
+            return ""
+        return marker
+
     def _stop_inpaint_placeholder(self, prompt_user: bool = True) -> None:
         running = bool(self._inpaint_thread and self._inpaint_thread.is_alive())
         if not running:
@@ -3389,12 +3655,20 @@ class PipelineMasterGUI:
                 "[STOP] graceful stop requested (click Stop again for immediate force stop)."
             )
             self.inpaint_stop_btn.configure(text="Force Stop")
+            marker_path = self._touch_stop_marker_file(
+                str(self._inpaint_stop_marker_path or "").strip()
+                or os.path.join(
+                    self.inpaint_output_var.get().strip() or "./work/output",
+                    ".stop_after_current",
+                ),
+                self._append_inpaint_log,
+            )
+            if marker_path:
+                self._inpaint_stop_marker_path = marker_path
         else:
             self.inpaint_status_var.set("Force stop requested...")
             self._append_inpaint_log("[STOP] force stop requested.")
-
-        self._send_inpaint_signal(signal.SIGINT)
-        if self._inpaint_stop_clicks >= 2:
+            self._send_inpaint_signal(signal.SIGINT)
             self.root.after(1000, self._force_kill_inpaint)
         self._refresh_pipeline_run_button()
 
@@ -3447,6 +3721,7 @@ class PipelineMasterGUI:
             self.inpaint_stop_btn.configure(text="Stop")
             self._inpaint_stop_clicks = 0
             self._inpaint_stop_requested = False
+            self._inpaint_stop_marker_path = ""
         self._update_replace_mask_dependent_controls()
         self._refresh_pipeline_run_button()
 
@@ -4322,6 +4597,10 @@ class PipelineMasterGUI:
             "SHADOW_CURVE": self.merge_shadow_curve_var.get().strip() or "0",
             "SHADOW_WIDTH_ADAPTIVE": "1" if bool(self.merge_dynamic_shadow_width_var.get()) else "0",
             "SKIP_EXISTING": "1",
+            "STOP_MARKER": os.path.join(
+                self.merge_mask_formerge_var.get().strip() or "./work/mask_for_merge",
+                ".stop_after_current",
+            ),
         }
         cmd = ["/usr/bin/env", "bash", str(runner_path("run_mask_formerge_nogui.sh"))]
         preview = (
@@ -4376,7 +4655,7 @@ class PipelineMasterGUI:
             "ENV: " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
         )
         self._merge_process_group_id = None
-        self._merge_stop_marker_path = ""
+        self._merge_stop_marker_path = env_updates.get("STOP_MARKER", "").strip()
         self._merge_thread = threading.Thread(
             target=self._run_merge_mask_worker,
             args=(cmd, env_updates),
@@ -4409,8 +4688,6 @@ class PipelineMasterGUI:
                 if line:
                     self._log_queue.put(("merge_line", f"[MASK] {line}"))
                     self._try_parse_merge_progress(line)
-                if self._merge_stop_requested:
-                    break
             rc = proc.wait()
             if self._merge_stop_requested:
                 self._log_queue.put(("merge_status", "Mask-for-merge stopped by user"))
@@ -4629,8 +4906,6 @@ class PipelineMasterGUI:
                 if line:
                     self._log_queue.put(("merge_line", line))
                     self._try_parse_merge_progress(line)
-                if self._merge_stop_requested:
-                    break
             rc = proc.wait()
             if self._merge_stop_requested:
                 self._log_queue.put(("merge_status", "Stopped by user"))
@@ -4750,6 +5025,8 @@ class PipelineMasterGUI:
                     str(Path(preferred_inpainted).resolve()),
                 ]
             )
+        stop_marker = str(out_csv_path.parent / ".stop_after_current")
+        cmd.extend(["--stop-marker", stop_marker])
 
         self._merge_stop_requested = False
         self._merge_stop_clicks = 0
@@ -4761,7 +5038,7 @@ class PipelineMasterGUI:
         self._append_merge_log("=== AutoCT CSV creation started ===")
         self._append_merge_log("CMD: " + " ".join(shlex.quote(x) for x in cmd))
         self._merge_process_group_id = None
-        self._merge_stop_marker_path = ""
+        self._merge_stop_marker_path = stop_marker
         self._merge_resume_after_autoct = bool(resume_merge_after)
         self._merge_thread = threading.Thread(
             target=self._run_merge_autoct_worker,
@@ -4843,9 +5120,7 @@ class PipelineMasterGUI:
         else:
             self.merge_status_var.set("Force stop requested...")
             self._append_merge_log("[STOP] force stop requested.")
-
-        self._send_merge_signal(signal.SIGINT)
-        if self._merge_stop_clicks >= 2:
+            self._send_merge_signal(signal.SIGINT)
             self.root.after(1000, self._force_kill_merge)
         self._refresh_pipeline_run_button()
 
@@ -4869,13 +5144,7 @@ class PipelineMasterGUI:
             output_dir = self.merge_output_var.get().strip() or "./work/sbs"
             marker_path = os.path.join(output_dir, ".stop_after_current")
             self._merge_stop_marker_path = marker_path
-        try:
-            os.makedirs(os.path.dirname(marker_path), exist_ok=True)
-            Path(marker_path).touch()
-        except Exception as exc:
-            self._append_merge_log(f"[STOP] failed to create stop marker {marker_path}: {exc}")
-            return ""
-        return marker_path
+        return self._touch_stop_marker_file(marker_path, self._append_merge_log)
 
     def _send_merge_signal(self, sig: int) -> None:
         proc = self._merge_process
@@ -4929,6 +5198,7 @@ class PipelineMasterGUI:
             self.merge_stop_btn.configure(text="Stop")
             self._merge_stop_clicks = 0
             self._merge_stop_requested = False
+            self._merge_stop_marker_path = ""
         self._update_replace_mask_dependent_controls()
         self._refresh_pipeline_run_button()
 
@@ -8549,6 +8819,21 @@ class PipelineMasterGUI:
         self.inpaint_tile_mode_var.set("1 and 2")
         self.inpaint_tile1_max_size_var.set("22")
         self.inpaint_tile2_max_size_var.set("55")
+        self.inpaint_dynamic_visible_chunk_steps5_var.set(
+            self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS5_DEFAULT
+        )
+        self.inpaint_dynamic_visible_chunk_steps6_var.set(
+            self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS6_DEFAULT
+        )
+        self.inpaint_dynamic_visible_chunk_steps7_var.set(
+            self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS7_DEFAULT
+        )
+        self.inpaint_dynamic_visible_chunk_steps8_plus_var.set(
+            self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS_DEFAULT
+        )
+        self.inpaint_dynamic_hold_divisor_var.set(
+            self.INPAINT_DYNAMIC_STATIC_MASK_DIVISOR_DEFAULT
+        )
         self.inpaint_sharpness_workers_var.set("19")
         self.inpaint_use_sharpen_var.set(False)
         self.inpaint_sharpen_workers_var.set("19")
@@ -10480,6 +10765,10 @@ class PipelineMasterGUI:
             "SCENE_STRIP_PAD_TOP": str(scene_strip_pad_top),
             "SCENE_STRIP_PAD_BOTTOM": str(scene_strip_pad_bottom),
             "FFMPEG_CODEC": depth_codec,
+            "STOP_MARKER": os.path.join(
+                self.depth_output_var.get().strip() or "./work/depthmap",
+                ".stop_after_current",
+            ),
             "RETRY_POLICY_JSON": self._build_retry_policy_json(
                 self.depth_retry_policy_vars,
                 self.depth_cpu_offload_var.get().strip() or "model",
@@ -10561,6 +10850,7 @@ class PipelineMasterGUI:
         self._append_depth_log(
             "ENV: " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
         )
+        self._depth_stop_marker_path = env_updates.get("STOP_MARKER", "").strip()
         self._depth_thread = threading.Thread(
             target=self._run_depth_worker,
             args=(cmd, env_updates),
@@ -10592,8 +10882,6 @@ class PipelineMasterGUI:
                 if line:
                     self._log_queue.put(("depth_line", line))
                     self._try_parse_depth_progress(line)
-                if self._depth_stop_requested:
-                    break
             rc = proc.wait()
             if self._depth_stop_requested:
                 self._log_queue.put(("depth_status", "Stopped by user"))
@@ -10730,12 +11018,20 @@ class PipelineMasterGUI:
                 "[STOP] graceful stop requested (click Stop again for immediate force stop)."
             )
             self.depth_stop_btn.configure(text="Force Stop")
+            marker_path = self._touch_stop_marker_file(
+                str(self._depth_stop_marker_path or "").strip()
+                or os.path.join(
+                    self.depth_output_var.get().strip() or "./work/depthmap",
+                    ".stop_after_current",
+                ),
+                self._append_depth_log,
+            )
+            if marker_path:
+                self._depth_stop_marker_path = marker_path
         else:
             self.depth_status_var.set("Force stop requested...")
             self._append_depth_log("[STOP] force stop requested.")
-
-        self._send_depth_signal(signal.SIGINT)
-        if self._depth_stop_clicks >= 2:
+            self._send_depth_signal(signal.SIGINT)
             self.root.after(1000, self._force_kill_depth)
         self._refresh_pipeline_run_button()
 
@@ -10832,6 +11128,7 @@ class PipelineMasterGUI:
             self.depth_stop_btn.configure(text="Stop")
             self._depth_stop_clicks = 0
             self._depth_stop_requested = False
+            self._depth_stop_marker_path = ""
         self._refresh_pipeline_run_button()
 
     def _open_splat_input_clips_folder(self) -> None:
@@ -11091,6 +11388,7 @@ class PipelineMasterGUI:
         self._append_splat_log(
             "ENV: " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
         )
+        self._splat_stop_marker_path = env_updates.get("STOP_MARKER", "").strip()
         self._splat_thread = threading.Thread(
             target=self._run_splat_worker,
             args=(cmd, env_updates),
@@ -11121,8 +11419,6 @@ class PipelineMasterGUI:
                 if line:
                     self._log_queue.put(("splat_line", line))
                     self._try_parse_splat_progress(line)
-                if self._splat_stop_requested:
-                    break
             rc = proc.wait()
             if self._splat_stop_requested:
                 self._log_queue.put(("splat_status", "Stopped by user"))
@@ -12472,12 +12768,20 @@ class PipelineMasterGUI:
                 "[STOP] graceful stop requested (click Stop again for immediate force stop)."
             )
             self.splat_stop_btn.configure(text="Force Stop")
+            marker_path = self._touch_stop_marker_file(
+                str(self._splat_stop_marker_path or "").strip()
+                or os.path.join(
+                    self.splat_output_var.get().strip() or "./work/splat",
+                    ".stop_after_current",
+                ),
+                self._append_splat_log,
+            )
+            if marker_path:
+                self._splat_stop_marker_path = marker_path
         else:
             self.splat_status_var.set("Force stop requested...")
             self._append_splat_log("[STOP] force stop requested.")
-
-        self._send_splat_signal(signal.SIGINT)
-        if self._splat_stop_clicks >= 2:
+            self._send_splat_signal(signal.SIGINT)
             self.root.after(1000, self._force_kill_splat)
         self._refresh_pipeline_run_button()
 
@@ -12521,6 +12825,7 @@ class PipelineMasterGUI:
             self.splat_stop_btn.configure(text="Stop")
             self._splat_stop_clicks = 0
             self._splat_stop_requested = False
+            self._splat_stop_marker_path = ""
         self._update_replace_mask_dependent_controls()
         self._refresh_pipeline_run_button()
 
@@ -13524,6 +13829,7 @@ class PipelineMasterGUI:
         workers = self._get_scene_split_workers()
         ffmpeg_tokens = self._build_scene_split_ffmpeg_tokens()
         script_path = utilities_path("split_scenes_from_csv.py")
+        stop_marker = os.path.join(output_path or "./work/seg", ".stop_after_current")
         return [
             sys.executable,
             str(script_path),
@@ -13541,6 +13847,8 @@ class PipelineMasterGUI:
             "yes",
             "--delete-failed",
             "yes",
+            "--stop-marker",
+            stop_marker,
         ]
 
     def _preview_scene_command(self) -> None:
@@ -13579,6 +13887,10 @@ class PipelineMasterGUI:
         self.scene_split_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
         stop_enabled = bool(is_running or self._analysis_running)
         self.scene_stop_btn.configure(state=tk.NORMAL if stop_enabled else tk.DISABLED)
+        if not is_running and not self._analysis_running:
+            self.scene_stop_btn.configure(text="Stop")
+            self._scene_stop_clicks = 0
+            self._scene_stop_marker_path = ""
         if is_running:
             self.scene_verify_quick_btn.configure(state=tk.DISABLED)
         elif not self._verify_running and not self._analysis_running:
@@ -15463,7 +15775,12 @@ class PipelineMasterGUI:
         self.scene_status_var.set("Starting...")
         self._set_scene_running(True)
         self._scene_stop_requested = False
+        self._scene_stop_clicks = 0
         self._scene_active_step = "split_scenes"
+        self._scene_stop_marker_path = os.path.join(
+            self.scene_output_var.get().strip() or "./work/seg",
+            ".stop_after_current",
+        )
         if not self._pipeline_test_active:
             self._pipeline_invalidate_from("split_scenes")
 
@@ -15506,8 +15823,6 @@ class PipelineMasterGUI:
                 line = raw_line.rstrip("\n")
                 self._log_queue.put(("line", line))
                 self._try_parse_progress(line)
-                if self._scene_stop_requested:
-                    break
 
             rc = proc.wait()
             if self._scene_stop_requested:
@@ -15557,10 +15872,34 @@ class PipelineMasterGUI:
 
         if scene_running:
             self._scene_stop_requested = True
-            self.scene_status_var.set("Stopping...")
-            self._append_scene_log(f"Stopping {active_label}...")
             proc_s = self._scene_process
-            if proc_s is not None and proc_s.poll() is None:
+            if self._scene_active_step == "split_scenes":
+                self._scene_stop_clicks += 1
+                if self._scene_stop_clicks == 1:
+                    self.scene_status_var.set("Stop requested...")
+                    self._append_scene_log(
+                        "[STOP] graceful stop requested (click Stop again for immediate force stop)."
+                    )
+                    self.scene_stop_btn.configure(text="Force Stop")
+                    marker_path = self._touch_stop_marker_file(
+                        str(self._scene_stop_marker_path or "").strip()
+                        or os.path.join(
+                            self.scene_output_var.get().strip() or "./work/seg",
+                            ".stop_after_current",
+                        ),
+                        self._append_scene_log,
+                    )
+                    if marker_path:
+                        self._scene_stop_marker_path = marker_path
+                else:
+                    self.scene_status_var.set("Force stop requested...")
+                    self._append_scene_log("[STOP] force stop requested.")
+            else:
+                self.scene_status_var.set("Stopping...")
+                self._append_scene_log(f"Stopping {active_label}...")
+            if proc_s is not None and proc_s.poll() is None and (
+                self._scene_active_step != "split_scenes" or self._scene_stop_clicks >= 2
+            ):
                 stop_sig = signal.SIGINT if self._scene_active_step == "split_scenes" else signal.SIGTERM
                 sent = False
                 if hasattr(os, "killpg") and hasattr(os, "getpgid"):
@@ -15586,8 +15925,12 @@ class PipelineMasterGUI:
                             self._append_scene_log(
                                 f"Terminate failed after send_signal error ({send_exc}): {term_exc}"
                             )
-            # Give ffmpeg/python splitter time to flush and close current output.
-            self.root.after(6000, self._force_kill_scene_detect)
+            if self._scene_active_step == "split_scenes":
+                if self._scene_stop_clicks >= 2:
+                    self.root.after(1000, self._force_kill_scene_detect)
+            else:
+                # Give ffmpeg/python splitter time to flush and close current output.
+                self.root.after(6000, self._force_kill_scene_detect)
         self._refresh_pipeline_run_button()
 
     def _force_kill_scene_detect(self) -> None:
@@ -16626,6 +16969,11 @@ class PipelineMasterGUI:
             "inpaint_tile_mode": self.inpaint_tile_mode_var.get().strip(),
             "inpaint_tile1_max_size": self.inpaint_tile1_max_size_var.get().strip(),
             "inpaint_tile2_max_size": self.inpaint_tile2_max_size_var.get().strip(),
+            "inpaint_dynamic_visible_chunk_steps5": self.inpaint_dynamic_visible_chunk_steps5_var.get().strip(),
+            "inpaint_dynamic_visible_chunk_steps6": self.inpaint_dynamic_visible_chunk_steps6_var.get().strip(),
+            "inpaint_dynamic_visible_chunk_steps7": self.inpaint_dynamic_visible_chunk_steps7_var.get().strip(),
+            "inpaint_dynamic_visible_chunk_steps8_plus": self.inpaint_dynamic_visible_chunk_steps8_plus_var.get().strip(),
+            "inpaint_dynamic_hold_divisor": self.inpaint_dynamic_hold_divisor_var.get().strip(),
             "inpaint_input_bias": self.inpaint_input_bias_var.get().strip(),
             "inpaint_overlap": self.inpaint_overlap_var.get().strip(),
             "inpaint_tail_pad": self.inpaint_tail_pad_var.get().strip(),

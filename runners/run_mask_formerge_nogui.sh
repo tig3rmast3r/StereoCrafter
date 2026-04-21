@@ -410,6 +410,9 @@ run_single_file_with_retries() {
   local attempt=1
 
   while true; do
+    if [ "$STOP_REQUESTED" -eq 0 ] && [ -f "$STOP_MARKER" ]; then
+      request_graceful_stop
+    fi
     if [ -f "$STOP_REQUEST_FILE" ]; then
       echo "[STOP w$wid] stop marker detected before $base"
       return 0
@@ -449,6 +452,9 @@ run_single_file_with_retries() {
 
     echo "[RETRY w$wid] $base exit_code=$code -> retrying in ${RETRY_SLEEP_SEC}s"
     for ((s=0; s<RETRY_SLEEP_SEC; s++)); do
+      if [ "$STOP_REQUESTED" -eq 0 ] && [ -f "$STOP_MARKER" ]; then
+        request_graceful_stop
+      fi
       if [ -f "$STOP_REQUEST_FILE" ]; then
         echo "[STOP w$wid] graceful stop completed"
         return 0
@@ -518,6 +524,9 @@ done
 
 remaining="${#pids[@]}"
 while [ "$remaining" -gt 0 ]; do
+  if [ "$STOP_REQUESTED" -eq 0 ] && [ -f "$STOP_MARKER" ]; then
+    request_graceful_stop
+  fi
   poll_all_worker_logs
   emit_progress_snapshot
 

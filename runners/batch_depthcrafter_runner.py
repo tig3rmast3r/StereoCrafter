@@ -170,6 +170,25 @@ def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
+def _default_stop_marker_path(output_dir: str) -> str:
+    return os.path.join(os.path.abspath(output_dir), ".stop_after_current")
+
+
+def _stop_marker_exists(path: str) -> bool:
+    try:
+        return bool(path) and os.path.isfile(path)
+    except Exception:
+        return False
+
+
+def _clear_stop_marker(path: str) -> None:
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
 def _default_out_name(in_file: Path, out_ext: str = ".mp4", suffix: str = "_depth") -> str:
     return f"{in_file.stem}{suffix}{out_ext}"
 
@@ -299,6 +318,7 @@ def run(
     worker_script: str = "./runners/depthcrafter_nogui_batch.py",
     input_dir: str = ".",
     output_dir: str = "./out",
+    stop_marker: str = "",
     glob: str = "*.mp4",
     out_ext: str = ".mp4",
     suffix: str = "_depth",
@@ -343,6 +363,11 @@ def run(
     input_dir_p = Path(input_dir).resolve()
     output_dir_p = Path(output_dir).resolve()
     _ensure_dir(output_dir_p)
+    stop_marker_path = (
+        os.path.abspath(str(stop_marker).strip())
+        if str(stop_marker).strip()
+        else _default_stop_marker_path(str(output_dir_p))
+    )
 
     temp_dir = output_dir_p / ".tmp_depthcrafter"
     _ensure_dir(temp_dir)
@@ -445,6 +470,10 @@ def run(
     retry_skipped: list[str] = []
 
     for i, in_path in enumerate(files, 1):
+        if _stop_marker_exists(stop_marker_path):
+            print(f"[STOP] marker detected, stopping before next file: {stop_marker_path}")
+            _clear_stop_marker(stop_marker_path)
+            break
         out_name = _default_out_name(in_path, out_ext=out_ext, suffix=suffix)
         out_final = output_dir_p / out_name
 
@@ -745,6 +774,10 @@ def run(
             finally:
                 _cleanup_local_temps()
                 _cuda_cleanup()
+            if _stop_marker_exists(stop_marker_path):
+                print(f"[STOP] marker detected after current file: {stop_marker_path}")
+                _clear_stop_marker(stop_marker_path)
+                break
             continue
 
         try:
@@ -813,6 +846,11 @@ def run(
         finally:
             _cleanup_local_temps()
             _cuda_cleanup()
+
+        if _stop_marker_exists(stop_marker_path):
+            print(f"[STOP] marker detected after current file: {stop_marker_path}")
+            _clear_stop_marker(stop_marker_path)
+            break
 
     print("-----")
     print(f"[DONE] ok={ok} skipped={skipped} failed={failed} total={total}")
@@ -1068,6 +1106,7 @@ def main():
     ap.add_argument("--worker_script", default="./runners/depthcrafter_nogui_batch.py")
     ap.add_argument("--input_dir", default=".")
     ap.add_argument("--output_dir", default="./out")
+    ap.add_argument("--stop_marker", default="")
     ap.add_argument("--glob", default="*.mp4")
     ap.add_argument("--out_ext", default=".mp4")
     ap.add_argument("--suffix", default="_depth")

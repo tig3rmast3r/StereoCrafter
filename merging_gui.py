@@ -863,7 +863,10 @@ def apply_color_transfer_safe(
 
         n_valid = int(src_valid.sum())
         min_valid_eff = max(int(min_valid), int(min_valid_ratio * Hs * Ws))
-        if n_valid < min_valid_eff:
+        # The directional/ring ROI can occasionally collapse to zero valid source
+        # pixels on long or edge-hugging masks. In that case, skip CT for the frame
+        # instead of letting NumPy compute means/stddev on an empty slice.
+        if n_valid <= 0 or n_valid < min_valid_eff:
             return target_frame
 
         src_lab = cv2.cvtColor(src_np, cv2.COLOR_RGB2LAB).astype(np.float32)

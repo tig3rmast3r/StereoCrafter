@@ -114,6 +114,23 @@ _is_true() {
   esac
 }
 
+wait_for_pid() {
+  local pid="$1"
+  local code=0
+  while true; do
+    if wait "$pid"; then
+      code=0
+    else
+      code=$?
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  return "$code"
+}
+
 _latest_mp4_in_output() {
   find "$OUTPUT_DIR" -type f -name "*.mp4" -printf '%T@|%p\n' 2>/dev/null \
     | awk -F'|' '
@@ -203,7 +220,7 @@ _run_once_with_watchdog() {
 
   if ! _is_true "$WATCHDOG_ENABLED"; then
     local rc=0
-    if wait "$child_pid"; then
+    if wait_for_pid "$child_pid"; then
       rc=0
     else
       rc=$?

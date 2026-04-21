@@ -24,7 +24,6 @@ All the extra scripts are made multithreading/parallel when possible, helping re
 - no_gui headless version with same functionalities from the gui version, segmenting is not supported at this time
 - runners for no_gui version, will autostart/retry from errors, skip if done already and supports ctrl-c graceful stop
 - small changes to depthcrafter script to reduce Vram spikes during load
-- auto routine for depthcrafter running at lower resolution and then upscaled with REALesrgan (build included in this project)
 - alternate script (stream based) will allow depthcrafting from any length source with some compromises
 
 ### Splatting
@@ -126,7 +125,6 @@ Long live to 3D!!
 2026-03-16 (New Scenes requeue utility, better "Stop" and fixes)
 - [new] New Utility that will automatically move/delete selected scenes from the project in order to re-process them again. It accepts annotations csv from Utilities/run_sbs_left_click_logger_player.sh or manual names on the specified TextBox (file name in this case will automatically set the step)
 - [new] Start/resume will now become "Stop" when running, in order to stop the run even during verifyscenes
-- [new] Verifyscenes buttons will become "Stop" when is running, allowing to stop it
 - [fix] VerifyScenes clips deletion was not working during Test Runs
 - [fix] Unstable Mask_for_merge workers near run end
 - [fix] run suddenly stops after AutoCT step in some cases
@@ -150,7 +148,7 @@ Long live to 3D!!
 - [fix] Run stops when shapen step throws an error
 
 2026-03-22 (More Fixes)
-- [change] merging step will auto restart workers after each file to prevent RAM buildup
+- [changed] merging step will auto restart workers after each file to prevent RAM buildup
 - [fix] Sharpen clips had incorrect fps causing join step to fail
 - [fix] seg-mono to flat sbs clips was not identical to merged clips
 
@@ -161,15 +159,15 @@ Long live to 3D!!
 - [new] requeue_annotates_scenes_gui improvements: optional delete and optional create subset with selected clips + final replace into main work folder
 - [new] new options for requeue annotaed scenes gui: rejoin in-place, will make the join step preferring the sbs outputs in the subset. Compare join will make a joined sbs with old-new-old-new pattern for a quick compare
 - [new] Alternate script (stream based) for Depthcrafter, it will work with files from any size but results will be a bit different, so avoid it until is strictly necessary (it will basically miss the latents_all calculation on the entire clip, results can be more unstable chunk by chunk and have a narrower contrast range), i have included it as last retry (4th attempt).
-- [change] auto preset according to new changes, depthcrafter step will take longer but is crucial to get good results on all the following ones.
-- [change] removed pix_fmt option everywhere (except last join step), it will always use yuv444p to maintain better colors transitions during the steps.
-- [change] Included window,overlap and script selection under the depthcrafter retry policy
-- [change] Removed "inherited" flag for cpu offload on inpaint menus retry and modified it on depthcrafter menu to include all parameters and not just cpu offload
-- [change] vast_stage2 script will now download only required model instead of the full repo, with option for specific steps (inpaint,depthcrafter,all)
-- [change] depthcrafter max resolution slider increased to 1x
-- [change] "join scenes" step will now join an incomplete set with pop-up warning
-- [change] removed VerifyScenes (deep) buttons, the current quick verify is enough, there is still verifyscenes.py script to launch manually.
-- [change] requeue script now support both clicks on the final merged file and clicks on the sbs folder
+- [changed] auto preset according to new changes, depthcrafter step will take longer but is crucial to get good results on all the following ones.
+- [changed] removed pix_fmt option everywhere (except last join step), it will always use yuv444p to maintain better colors transitions during the steps.
+- [changed] Included window,overlap and script selection under the depthcrafter retry policy
+- [changed] Removed "inherited" flag for cpu offload on inpaint menus retry and modified it on depthcrafter menu to include all parameters and not just cpu offload
+- [changed] vast_stage2 script will now download only required model instead of the full repo, with option for specific steps (inpaint,depthcrafter,all)
+- [changed] depthcrafter max resolution slider increased to 1x
+- [changed] "join scenes" step will now join an incomplete set with pop-up warning
+- [changed] removed VerifyScenes (deep) buttons, the current quick verify is enough, there is still verifyscenes.py script to launch manually.
+- [changed] requeue script now support both clicks on the final merged file and clicks on the sbs folder
 - [fix] Requeue will delete/move according to the selected step non from the one after it
 - [fix] sharpen step was missing in requeue scenes script
 - [fix] Scene names are back with 4 digits to avoid incorrect clip sequence during steps
@@ -177,18 +175,18 @@ Long live to 3D!!
 - [fix] Several other minor fixes
 
 2026-04-06 (WSL ready)
-- [change] removed display dependency from splatting step
-- [change] Forward Warp build now optional (default: off)
-- [change] improved install script + WSL friendly + ffmpeg checks
-- [change] removed RealESRGAN step completely
-- [change] repo mini refactor, log files into /logs, configs into /configs, sh scripts and batch runners into /runners
-- [change] pipeline_master_gui now supports multiple configurations, in order to work with more projects simultaneously, to enable custom config (json will be saved and honored into the work folder) launch with arg --work_dir "work path"
+- [changed] removed display dependency from splatting step
+- [changed] Forward Warp build now optional (default: off)
+- [changed] improved install script + WSL friendly + ffmpeg checks
+- [changed] removed RealESRGAN step completely
+- [changed] repo mini refactor, log files into /logs, configs into /configs, sh scripts and batch runners into /runners
+- [changed] pipeline_master_gui now supports multiple configurations, in order to work with more projects simultaneously, to enable custom config (json will be saved and honored into the work folder) launch with arg --work_dir "work path"
 - [fix] test run suddenly stops on merge step in some cases
 
 2026-04-16 (Inpainting Changes)
-- [new/change/fix] i want to talk about inpaint and its flaws, there are mainly 2 problems with inpaint atm:
+- [new/changed/fix] i want to talk about inpaint and its flaws, there are mainly 2 problems with inpaint atm:<br>
 1 - color flashes: at first i tought that color flashes was only on the last frame of each chunk and i fixed it by adding tail_pad so the last frame for every chunk and at the end of each clip is calculated but not sent into the stream. I've discovered later that the same identical color flash is present also on the last overlap frame of the following chunks, so when i've cherry picked the crossfade commit the problem has arised again. for this reason i've removed crossfade when is overlapping and the new chunk starts to be seen after the overlap has done. There are still some traces on the following frames but at least the huge flash is now gone again.<br>
-2 - blurry inpaint: when the warped zone is detailed there is a very visible difference between the inpainted zone and the surroudings, the inpainted zone is really blurry compared to the rest, with the older auto setting this issue was more prominent, as the blurry ratio is directly proportioal to the chunk size, switching back to tile 1 and shorter chunks helped a lot but there's a downside to this, it may happen that for static and long scenes the inpainted zone tends to become worse overtime, for this other reason some scenes are better using longer chunks, so in order to let everything going "automatically", the script has to decide if it's better to use shorter or longer chunks depending on 2 factors:<br>
+2 - blurry inpaint: when the warped zone is detailed there is a very visible difference between the inpainted zone and the surroudings, the inpainted zone is really blurry compared to the rest, with the older auto setting this issue was more prominent, as the blurry ratio is directly proportional to the chunk size, switching back to tile 1 and shorter chunks helped a lot but there's a downside to this, it may happen that for static and long scenes the inpainted zone tends to become worse overtime, for this other reason some scenes are better using longer chunks, so in order to let everything going "automatically", the script has to decide if it's better to use shorter or longer chunks depending on 2 factors:<br>
 -length of static mask areas<br>
 -expected amount of sharpness for the warp areas<br>
 when a main mask area is static the max chunk size will be adjusted to avoid the degratation for that area, if the chunk can be used with tile 1 it will be used, (it's faster with tile 1), but if the chunk will require more frames it will fallback to tile 2, you can set the maximum possible frames for your current Vram pool with tile 1 and 2, in my case with 4090 in Linux is 22 and 55 (+1 tail_pad) so this is the default value in pipeline_master_gui<br>
@@ -196,3 +194,9 @@ If no static Masks are detected (or are short), chunk size will be inversely pro
 Still testing, may need some fine tuning<br>
 - [fix] Requeue annotated scenes now copy all files from the previous steps and not just the ones required by the selected step
 - [fix] stand-alone script settings are now aligned with pipeline_master_gui
+
+2026-04-20 (inpainting improvements part 2 + graceful stop fix)
+- [new] improved static mask detection, now it takes into account the ROI next to the mask to evaluate if is going to degrade overtime with small chunks
+- [new] dynamic chunk settings and static mask divisor are now available as CLI vars and in pipeline_master_gui
+- [changed] dynamic chunk preset values
+- [fix] Stop/Graceful Stop should work correctly now on all steps from both scripts and pipeline master gui

@@ -5,6 +5,7 @@ import csv
 import glob
 import multiprocessing as mp
 import os
+import signal
 from typing import Dict, List, Optional, Tuple
 
 import av
@@ -35,6 +36,39 @@ DEFAULT_MASK_DILATE_ITER = 0
 DEFAULT_RIGHT_BORDER_TOL_PX = 2
 DEFAULT_MIN_ROI_PIXELS = 250
 DEFAULT_WORKERS = min(8, max(1, os.cpu_count() or 1))
+_STOP_REQUESTED = False
+
+
+def _set_stop_requested() -> None:
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = True
+
+
+def _stop_requested(stop_marker: str) -> bool:
+    if _STOP_REQUESTED:
+        return True
+    marker = str(stop_marker or "").strip()
+    return bool(marker) and os.path.isfile(marker)
+
+
+def _handle_signal(_signum, _frame) -> None:
+    _set_stop_requested()
+
+
+def _init_worker_ignore_signals() -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
+def _clear_stop_marker(stop_marker: str) -> None:
+    marker = str(stop_marker or "").strip()
+    if not marker:
+        return
+    try:
+        if os.path.isfile(marker):
+            os.remove(marker)
+    except Exception:
+        pass
 
 
 def find_mask_for_video(mask_dir: str, video_basename: str) -> Optional[str]:
@@ -436,7 +470,14 @@ def main():
         default=DEFAULT_WORKERS,
         help="Parallel workers (processes). 1 = sequential",
     )
+    ap.add_argument(
+        "--stop-marker",
+        default="",
+        help="Optional graceful-stop marker file. Default: alongside out_csv.",
+    )
     args = ap.parse_args()
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
 
     in_dir = os.path.abspath(args.in_dir)
     paths = sorted(glob.glob(os.path.join(in_dir, args.glob)))
@@ -444,11 +485,29 @@ def main():
         raise SystemExit(f"No files found: {in_dir}/{args.glob}")
 
     out_csv = os.path.abspath(args.out_csv)
+    stop_marker = (
+        os.path.abspath(str(args.stop_marker).strip())
+        if str(args.stop_marker).strip()
+        else os.path.join(os.path.dirname(out_csv) or os.getcwd(), ".stop_after_current")
+    )
+    if os.path.isfile(stop_marker):
+        print(f"[INFO] removing stale stop marker: {stop_marker}")
+        _clear_stop_marker(stop_marker)
     existing = load_existing_csv(out_csv)
 
     reused = 0
     computed = 0
     results: Dict[str, Tuple[float, int, float]] = {}
+    stop_logged = False
+
+    def _note_stop_requested() -> bool:
+        nonlocal stop_logged
+        if not _stop_requested(stop_marker):
+            return False
+        if not stop_logged:
+            print("[STOP] graceful stop requested. Waiting current file(s) to finish.")
+            stop_logged = True
+        return True
 
     # Reuse from existing CSV
     for p in paths:
@@ -485,6 +544,8 @@ def main():
     # Compute (sequential or parallel)
     if args.workers <= 1 or len(jobs) <= 1:
         for job in jobs:
+            if _note_stop_requested():
+                break
             bn, raw, n, cov, status = _worker_compute(job)
             _print_status(bn, raw, n, cov, status, mask_dir)
             results[bn] = (raw, n, cov)
@@ -495,24 +556,47 @@ def main():
             with concurrent.futures.ProcessPoolExecutor(
                 max_workers=args.workers,
                 mp_context=mp.get_context("spawn"),
+                initializer=_init_worker_ignore_signals,
             ) as ex:
-                fut_to_job = {ex.submit(_worker_compute, job): job for job in jobs}
-                for fut in concurrent.futures.as_completed(fut_to_job):
-                    try:
-                        bn, raw, n, cov, status = fut.result()
-                    except Exception as e:
-                        # If the pool dies abruptly, recover in sequential mode below.
-                        if isinstance(e, BrokenProcessPool):
-                            pool_broken = True
-                            print(f"[WARN] process pool broken, fallback to sequential: {e}")
-                            ex.shutdown(wait=False, cancel_futures=True)
-                            break
-                        job = fut_to_job[fut]
-                        bn = os.path.basename(job[0])
-                        raw, n, cov, status = 0.0, 0, 0.0, f"ERR:{type(e).__name__}"
-                    _print_status(bn, raw, n, cov, status, mask_dir)
-                    results[bn] = (raw, n, cov)
-                    computed += 1
+                pending_jobs = list(jobs)
+                fut_to_job: Dict[concurrent.futures.Future, tuple] = {}
+                while pending_jobs or fut_to_job:
+                    while (
+                        pending_jobs
+                        and len(fut_to_job) < max(1, int(args.workers))
+                        and not _stop_requested(stop_marker)
+                    ):
+                        job = pending_jobs.pop(0)
+                        fut_to_job[ex.submit(_worker_compute, job)] = job
+                    _note_stop_requested()
+                    if not fut_to_job:
+                        break
+                    done, _pending = concurrent.futures.wait(
+                        tuple(fut_to_job.keys()),
+                        timeout=0.2,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        continue
+                    for fut in done:
+                        job = fut_to_job.pop(fut)
+                        try:
+                            bn, raw, n, cov, status = fut.result()
+                        except Exception as e:
+                            # If the pool dies abruptly, recover in sequential mode below.
+                            if isinstance(e, BrokenProcessPool):
+                                pool_broken = True
+                                print(f"[WARN] process pool broken, fallback to sequential: {e}")
+                                ex.shutdown(wait=False, cancel_futures=True)
+                                fut_to_job.clear()
+                                break
+                            bn = os.path.basename(job[0])
+                            raw, n, cov, status = 0.0, 0, 0.0, f"ERR:{type(e).__name__}"
+                        _print_status(bn, raw, n, cov, status, mask_dir)
+                        results[bn] = (raw, n, cov)
+                        computed += 1
+                    if pool_broken:
+                        break
         except Exception as e:
             if isinstance(e, BrokenProcessPool):
                 pool_broken = True
@@ -520,10 +604,12 @@ def main():
             else:
                 raise
 
-        if pool_broken:
+        if pool_broken and not _stop_requested(stop_marker):
             remaining_jobs = [job for job in jobs if os.path.basename(job[0]) not in results]
             print(f"[INFO] recovering remaining jobs sequentially: {len(remaining_jobs)}")
             for job in remaining_jobs:
+                if _note_stop_requested():
+                    break
                 bn, raw, n, cov, status = _worker_compute(job)
                 _print_status(bn, raw, n, cov, status, mask_dir)
                 results[bn] = (raw, n, cov)
@@ -533,7 +619,9 @@ def main():
     tmp: List[Tuple[str, float, int, float]] = []
     for p in paths:
         bn = os.path.basename(p)
-        raw, n, cov = results.get(bn, (0.0, 0, 0.0))
+        if bn not in results:
+            continue
+        raw, n, cov = results[bn]
         tmp.append((bn, raw, n, cov))
 
     raws = [x[1] for x in tmp]
@@ -545,6 +633,9 @@ def main():
         for (bn, raw, n, cov), pct in zip(tmp, pcts):
             w.writerow([bn, f"{raw:.6f}", f"{pct:.2f}", n, f"{cov:.3f}"])
 
+    if _stop_requested(stop_marker):
+        _clear_stop_marker(stop_marker)
+
     print(
         f"\nDone: {out_csv}  "
         f"(reused={reused}, computed={computed}, total={len(tmp)})  "
@@ -552,6 +643,12 @@ def main():
         f"agg={args.agg_mode} "
         "roi_mode=ring_shift_source"
     )
+    if _stop_requested(stop_marker):
+        remaining = max(0, len(paths) - len(tmp))
+        print(
+            f"[STOP] graceful stop completed: remaining_files={remaining} "
+            f"marker={stop_marker}"
+        )
 
 
 if __name__ == "__main__":

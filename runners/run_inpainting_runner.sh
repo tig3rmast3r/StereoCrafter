@@ -24,6 +24,11 @@ ENABLE_DYNAMIC_CHUNK="${ENABLE_DYNAMIC_CHUNK:-1}"
 TILE_MODE="${TILE_MODE:-1 and 2}"
 TILE1_MAX_SIZE="${TILE1_MAX_SIZE:-22}"
 TILE2_MAX_SIZE="${TILE2_MAX_SIZE:-55}"
+DYNAMIC_VISIBLE_CHUNK_STEPS5="${DYNAMIC_VISIBLE_CHUNK_STEPS5:-36}"
+DYNAMIC_VISIBLE_CHUNK_STEPS6="${DYNAMIC_VISIBLE_CHUNK_STEPS6:-24}"
+DYNAMIC_VISIBLE_CHUNK_STEPS7="${DYNAMIC_VISIBLE_CHUNK_STEPS7:-16}"
+DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS="${DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS:-12}"
+DYNAMIC_HOLD_DIVISOR="${DYNAMIC_HOLD_DIVISOR:-5.0}"
 OVERLAP="${OVERLAP:-2}"
 TAIL_PAD="${TAIL_PAD:-1}"
 ORIGINAL_INPUT_BLEND_STRENGTH="${ORIGINAL_INPUT_BLEND_STRENGTH:-0}"
@@ -73,6 +78,11 @@ CMD+=(--output_dir "$OUTPUT_DIR"
      --tile_mode "$TILE_MODE"
      --tile1_max_size "$TILE1_MAX_SIZE"
      --tile2_max_size "$TILE2_MAX_SIZE"
+     --dynamic_visible_chunk_steps5 "$DYNAMIC_VISIBLE_CHUNK_STEPS5"
+     --dynamic_visible_chunk_steps6 "$DYNAMIC_VISIBLE_CHUNK_STEPS6"
+     --dynamic_visible_chunk_steps7 "$DYNAMIC_VISIBLE_CHUNK_STEPS7"
+     --dynamic_visible_chunk_steps8_plus "$DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS"
+     --dynamic_hold_divisor "$DYNAMIC_HOLD_DIVISOR"
      --overlap "$OVERLAP"
      --tail_pad "$TAIL_PAD"
      --original_input_blend_strength "$ORIGINAL_INPUT_BLEND_STRENGTH"
@@ -251,6 +261,23 @@ _is_true() {
   esac
 }
 
+wait_for_pid() {
+  local pid="$1"
+  local code=0
+  while true; do
+    if wait "$pid"; then
+      code=0
+    else
+      code=$?
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  return "$code"
+}
+
 _run_once_with_watchdog() {
   local child_pid child_pgid self_pgid
   local last_token current_token
@@ -273,7 +300,7 @@ _run_once_with_watchdog() {
 
   if ! _is_true "$WATCHDOG_ENABLED"; then
     local rc=0
-    if wait "$child_pid"; then
+    if wait_for_pid "$child_pid"; then
       rc=0
     else
       rc=$?

@@ -96,3 +96,6 @@ sudo apt install x11-apps -y
 sudo apt install gedit -y
 wsl --shutdown
 ```
+### Extra Note about WSL
+
+PYTORCH_ALLOC_CONF expandable_segments:True doesn't work in WSL, at least on my pytorch/cuda combo, if your inpaint/depthcrafting job doesn't start try disabling it in pipeline_master_gui under "Options and RUN" Depthcrafter and Inpainting Retry Policy

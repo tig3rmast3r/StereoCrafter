@@ -7,13 +7,16 @@ import argparse
 import csv
 import json
 import shlex
+import signal
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+
+_STOP_REQUESTED = False
 
 
 @dataclass(frozen=True)
@@ -90,7 +93,40 @@ def parse_args() -> argparse.Namespace:
         default="yes",
         help="Delete output file if ffmpeg fails.",
     )
+    p.add_argument(
+        "--stop-marker",
+        default="",
+        help="Optional graceful-stop marker file. Default: output-dir/.stop_after_current.",
+    )
     return p.parse_args()
+
+
+def _set_stop_requested() -> None:
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = True
+
+
+def _handle_signal(_signum, _frame) -> None:
+    _set_stop_requested()
+
+
+def _stop_requested(stop_marker: str) -> bool:
+    if _STOP_REQUESTED:
+        return True
+    marker = str(stop_marker or "").strip()
+    return bool(marker) and Path(marker).is_file()
+
+
+def _clear_stop_marker(stop_marker: str) -> None:
+    marker = str(stop_marker or "").strip()
+    if not marker:
+        return
+    try:
+        p = Path(marker)
+        if p.is_file():
+            p.unlink()
+    except Exception:
+        pass
 
 
 def parse_seconds_or_timecode(value: str) -> float | None:
@@ -356,6 +392,8 @@ def run_one_job(
 
 def main() -> int:
     args = parse_args()
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
     source_path = str(Path(args.input_video).expanduser().resolve())
     scene_csv = Path(args.scene_csv).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -368,6 +406,14 @@ def main() -> int:
         return 2
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    stop_marker = (
+        str(Path(args.stop_marker).expanduser().resolve())
+        if str(args.stop_marker).strip()
+        else str((output_dir / ".stop_after_current").resolve())
+    )
+    if Path(stop_marker).is_file():
+        print(f"[INFO] removing stale stop marker: {stop_marker}", flush=True)
+        _clear_stop_marker(stop_marker)
     ffmpeg_tokens = shlex.split(args.ffmpeg_args)
     if not ffmpeg_tokens:
         print("[ERROR] empty ffmpeg args.", flush=True)
@@ -413,11 +459,23 @@ def main() -> int:
     failed = 0
     total = len(jobs)
     failures: list[str] = []
+    stop_logged = False
+
+    def _note_stop_requested() -> bool:
+        nonlocal stop_logged
+        if not _stop_requested(stop_marker):
+            return False
+        if not stop_logged:
+            print("[STOP] graceful stop requested. Waiting current split job(s) to finish.", flush=True)
+            stop_logged = True
+        return True
 
     pending_jobs = list(jobs)
     round_idx = 0
     resolved = 0
     while pending_jobs:
+        if _note_stop_requested():
+            break
         round_idx += 1
         round_workers = retry_workers_for_round(workers, round_idx, nvenc_active)
         round_total = len(pending_jobs)
@@ -430,50 +488,69 @@ def main() -> int:
             flush=True,
         )
         with ThreadPoolExecutor(max_workers=round_workers) as ex:
-            future_to_job = {
-                ex.submit(
-                    run_one_job,
-                    source_path,
-                    out_path,
-                    scene_row,
-                    ffmpeg_tokens,
-                    source_fps,
-                    args.skip_existing == "yes",
-                    args.delete_failed == "yes",
-                ): (out_path, scene_row)
-                for out_path, scene_row in pending_jobs
-            }
+            round_pending = list(pending_jobs)
+            future_to_job = {}
             completed_in_round = 0
             retry_waiting = 0
-            for fut in as_completed(future_to_job):
-                out_path, scene_row = future_to_job[fut]
-                status, payload = fut.result()
-                completed_in_round += 1
-                if status == "done":
-                    done += 1
-                    round_done += 1
-                    resolved += 1
-                elif status == "skipped":
-                    skipped += 1
-                    round_skipped += 1
-                    resolved += 1
-                else:
-                    if (
-                        round_idx < MAX_RETRY_ROUNDS
-                        and is_retryable_encoder_failure(payload)
-                    ):
-                        round_failed_retryable.append((out_path, scene_row, payload))
-                        retry_waiting += 1
-                    else:
-                        failed += 1
-                        round_failed_hard.append(payload)
-                        failures.append(payload)
+            while round_pending or future_to_job:
+                while (
+                    round_pending
+                    and len(future_to_job) < round_workers
+                    and not _stop_requested(stop_marker)
+                ):
+                    out_path, scene_row = round_pending.pop(0)
+                    future_to_job[
+                        ex.submit(
+                            run_one_job,
+                            source_path,
+                            out_path,
+                            scene_row,
+                            ffmpeg_tokens,
+                            source_fps,
+                            args.skip_existing == "yes",
+                            args.delete_failed == "yes",
+                        )
+                    ] = (out_path, scene_row)
+                _note_stop_requested()
+                if not future_to_job:
+                    break
+                done_set, _pending = wait(
+                    tuple(future_to_job.keys()),
+                    timeout=0.2,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done_set:
+                    continue
+                for fut in done_set:
+                    out_path, scene_row = future_to_job.pop(fut)
+                    status, payload = fut.result()
+                    completed_in_round += 1
+                    if status == "done":
+                        done += 1
+                        round_done += 1
                         resolved += 1
-                remaining_current = round_total - completed_in_round
-                pending_total = remaining_current + retry_waiting
-                progress_done = total - pending_total
-                pct = (float(progress_done) / float(total)) * 100.0 if total > 0 else 100.0
-                print(f"[SPLIT] progress {progress_done}/{total} ({pct:.1f}%)", flush=True)
+                    elif status == "skipped":
+                        skipped += 1
+                        round_skipped += 1
+                        resolved += 1
+                    else:
+                        if (
+                            round_idx < MAX_RETRY_ROUNDS
+                            and is_retryable_encoder_failure(payload)
+                            and not _stop_requested(stop_marker)
+                        ):
+                            round_failed_retryable.append((out_path, scene_row, payload))
+                            retry_waiting += 1
+                        else:
+                            failed += 1
+                            round_failed_hard.append(payload)
+                            failures.append(payload)
+                            resolved += 1
+                    remaining_current = len(round_pending) + len(future_to_job)
+                    pending_total = remaining_current + retry_waiting
+                    progress_done = total - pending_total
+                    pct = (float(progress_done) / float(total)) * 100.0 if total > 0 else 100.0
+                    print(f"[SPLIT] progress {progress_done}/{total} ({pct:.1f}%)", flush=True)
 
         print(
             (
@@ -483,7 +560,7 @@ def main() -> int:
             ),
             flush=True,
         )
-        if round_failed_retryable:
+        if round_failed_retryable and not _stop_requested(stop_marker):
             pending_jobs = [(out_path, scene_row) for out_path, scene_row, _err in round_failed_retryable]
             sleep_sec = min(6, 2 * round_idx)
             print(
@@ -503,6 +580,13 @@ def main() -> int:
         f"[SPLIT] summary: done={done} skipped={skipped} failed={failed} total={total}",
         flush=True,
     )
+    if _stop_requested(stop_marker):
+        _clear_stop_marker(stop_marker)
+        remaining = max(0, total - (done + skipped + failed))
+        print(
+            f"[STOP] graceful stop completed: remaining_jobs={remaining} marker={stop_marker}",
+            flush=True,
+        )
     if failures:
         for item in failures[:50]:
             print(f"[SPLIT][FAILED] {item}", flush=True)

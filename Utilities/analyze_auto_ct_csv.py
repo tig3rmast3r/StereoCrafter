@@ -18,6 +18,7 @@ import csv
 import gc
 import multiprocessing as mp
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -58,6 +59,39 @@ DEFAULT_CT_SETTINGS: Dict[str, object] = {
     "ct_ring_width": 20,
 }
 CT_MIN_MASK_PIXELS = 64
+_STOP_REQUESTED = False
+
+
+def _set_stop_requested() -> None:
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = True
+
+
+def _stop_requested(stop_marker: str) -> bool:
+    if _STOP_REQUESTED:
+        return True
+    marker = str(stop_marker or "").strip()
+    return bool(marker) and os.path.isfile(marker)
+
+
+def _handle_signal(_signum, _frame) -> None:
+    _set_stop_requested()
+
+
+def _init_worker_ignore_signals() -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
+def _clear_stop_marker(stop_marker: str) -> None:
+    marker = str(stop_marker or "").strip()
+    if not marker:
+        return
+    try:
+        if os.path.isfile(marker):
+            os.remove(marker)
+    except Exception:
+        pass
 
 def _safe_uint(v: int) -> int:
     try:
@@ -630,7 +664,14 @@ def main() -> int:
         default="",
         help="Optional log file for faulthandler traceback output.",
     )
+    ap.add_argument(
+        "--stop-marker",
+        default="",
+        help="Optional graceful-stop marker file. Default: alongside output CSV.",
+    )
     args = ap.parse_args()
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
     progress = ProgressTracker(args.progress_every_sec, args.progress_every_frames)
 
     debug_log_handle = None
@@ -665,8 +706,28 @@ def main() -> int:
 
     out_csv = os.path.abspath(args.output_csv)
     out_dir = os.path.dirname(out_csv)
+    stop_marker = (
+        os.path.abspath(str(args.stop_marker).strip())
+        if str(args.stop_marker).strip()
+        else os.path.join(out_dir or os.getcwd(), ".stop_after_current")
+    )
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+    if os.path.isfile(stop_marker):
+        print(f"[INFO] removing stale stop marker: {stop_marker}")
+        _clear_stop_marker(stop_marker)
+
+    stop_logged = False
+    completed_jobs = 0
+
+    def _note_stop_requested() -> bool:
+        nonlocal stop_logged
+        if not _stop_requested(stop_marker):
+            return False
+        if not stop_logged:
+            print("[STOP] graceful stop requested. Waiting current video(s) to finish.")
+            stop_logged = True
+        return True
 
     jobs = collect_jobs(
         inpainted_folder=args.inpainted_folder,
@@ -784,6 +845,8 @@ def main() -> int:
     try:
         if workers == 1:
             for idx, (inpainted_path, splatted_path) in enumerate(jobs, 1):
+                if _note_stop_requested():
+                    break
                 name = os.path.basename(inpainted_path)
                 print(f"[{idx}/{len(jobs)}] {name}")
                 done_frames = existing_frames_by_video.get(name, set())
@@ -797,6 +860,7 @@ def main() -> int:
                 )
                 if rows is not None:
                     _append_rows(rows)
+                completed_jobs += 1
         elif args.process_per_file:
             assert process_ctx is not None
             progress_manager = mp.Manager()
@@ -841,15 +905,43 @@ def main() -> int:
                 with process_ctx.Pool(
                     processes=workers,
                     maxtasksperchild=1,
+                    initializer=_init_worker_ignore_signals,
                 ) as pool:
-                    done_count = 0
-                    for name, rows, err in pool.imap_unordered(_process_video_job_mp, payloads):
-                        done_count += 1
-                        if err:
-                            print(f"[WARN] worker failed for {name}: {err}")
-                        if rows is not None:
-                            _append_rows(rows)
-                        print(f"[DONE] {done_count}/{len(jobs)} {name}")
+                    active: List[Tuple[Any, str]] = []
+                    while payloads or active:
+                        while (
+                            payloads
+                            and len(active) < workers
+                            and not _stop_requested(stop_marker)
+                        ):
+                            payload = payloads.pop(0)
+                            name = os.path.basename(payload[0])
+                            active.append(
+                                (pool.apply_async(_process_video_job_mp, (payload,)), name)
+                            )
+                        _note_stop_requested()
+                        if not active:
+                            break
+                        any_ready = False
+                        next_active: List[Tuple[Any, str]] = []
+                        for async_result, fallback_name in active:
+                            if not async_result.ready():
+                                next_active.append((async_result, fallback_name))
+                                continue
+                            any_ready = True
+                            try:
+                                name, rows, err = async_result.get()
+                            except Exception as e:
+                                name, rows, err = fallback_name, None, str(e)
+                            completed_jobs += 1
+                            if err:
+                                print(f"[WARN] worker failed for {name}: {err}")
+                            if rows is not None:
+                                _append_rows(rows)
+                            print(f"[DONE] {completed_jobs}/{len(jobs)} {name}")
+                        active = next_active
+                        if not any_ready:
+                            time.sleep(0.2)
             finally:
                 try:
                     progress_queue.put_nowait(None)
@@ -869,37 +961,55 @@ def main() -> int:
                     pass
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                pending_jobs = list(jobs)
                 fut_to_name: Dict[concurrent.futures.Future, str] = {}
-                for inpainted_path, splatted_path in jobs:
-                    name = os.path.basename(inpainted_path)
-                    done_frames = existing_frames_by_video.get(name, set())
-                    fut = ex.submit(
-                        _process_video_job,
-                        inpainted_path,
-                        splatted_path,
-                        done_frames,
-                        progress,
-                        None,
-                        args,
+                while pending_jobs or fut_to_name:
+                    while (
+                        pending_jobs
+                        and len(fut_to_name) < workers
+                        and not _stop_requested(stop_marker)
+                    ):
+                        inpainted_path, splatted_path = pending_jobs.pop(0)
+                        name = os.path.basename(inpainted_path)
+                        done_frames = existing_frames_by_video.get(name, set())
+                        fut = ex.submit(
+                            _process_video_job,
+                            inpainted_path,
+                            splatted_path,
+                            done_frames,
+                            progress,
+                            None,
+                            args,
+                        )
+                        fut_to_name[fut] = name
+                    _note_stop_requested()
+                    if not fut_to_name:
+                        break
+                    done, _pending = concurrent.futures.wait(
+                        tuple(fut_to_name.keys()),
+                        timeout=0.2,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
                     )
-                    fut_to_name[fut] = name
-                done_count = 0
-                for fut in concurrent.futures.as_completed(fut_to_name):
-                    done_count += 1
-                    name = fut_to_name[fut]
-                    try:
-                        rows = fut.result()
-                    except Exception as e:
-                        print(f"[WARN] worker failed for {name}: {e}")
-                        rows = None
-                    if rows is not None:
-                        _append_rows(rows)
-                    print(f"[DONE] {done_count}/{len(jobs)} {name}")
+                    if not done:
+                        continue
+                    for fut in done:
+                        name = fut_to_name.pop(fut)
+                        completed_jobs += 1
+                        try:
+                            rows = fut.result()
+                        except Exception as e:
+                            print(f"[WARN] worker failed for {name}: {e}")
+                            rows = None
+                        if rows is not None:
+                            _append_rows(rows)
+                        print(f"[DONE] {completed_jobs}/{len(jobs)} {name}")
     finally:
         out_handle.close()
         if debug_log_handle is not None:
             debug_log_handle.flush()
             debug_log_handle.close()
+    if _stop_requested(stop_marker):
+        _clear_stop_marker(stop_marker)
     progress.final_report()
 
     print(f"[OK] updated CSV: {out_csv}")
@@ -907,6 +1017,12 @@ def main() -> int:
     print(f"[OK] newly written frame rows this run: {written_new}")
     print(f"[OK] duplicate frame rows skipped this run: {skipped_dup}")
     print(f"[OK] total unique frame rows in CSV: {len(written_rows)}")
+    if _stop_requested(stop_marker):
+        remaining_jobs = max(0, len(jobs) - completed_jobs)
+        print(
+            f"[STOP] graceful stop completed: remaining_videos={remaining_jobs} "
+            f"marker={stop_marker}"
+        )
     return 0
 
 

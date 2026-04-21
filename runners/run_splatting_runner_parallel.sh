@@ -19,6 +19,7 @@ WORKERS="${WORKERS:-8}"
 INPUT_SOURCE_CLIPS="${INPUT_SOURCE_CLIPS:-./work/seg/}"
 INPUT_DEPTH_MAPS="${INPUT_DEPTH_MAPS:-./work/depthmap/}"
 OUTPUT_SPLATTED="${OUTPUT_SPLATTED:-./work/splat/}"
+STOP_MARKER="${STOP_MARKER:-$OUTPUT_SPLATTED/.stop_after_current}"
 
 SHARD_ROOT="${SHARD_ROOT:-${TMPDIR:-/tmp}/splat_parallel_${USER:-user}_$$}"
 KEEP_SHARDS="${KEEP_SHARDS:-0}"   # 1 keeps shard folders for debugging
@@ -283,6 +284,8 @@ request_graceful_stop() {
     return
   fi
   STOP_REQUESTED=1
+  mkdir -p "$(dirname "$STOP_MARKER")" 2>/dev/null || true
+  : > "$STOP_MARKER"
   : > "$STOP_REQUEST_FILE"
   echo "[STOP] graceful stop requested. Waiting current clips..."
   local m
@@ -311,6 +314,7 @@ on_interrupt() {
 }
 
 cleanup_runtime() {
+  rm -f -- "$STOP_MARKER" 2>/dev/null || true
   rm -f -- "$STOP_REQUEST_FILE" 2>/dev/null || true
   local m
   for m in "${worker_markers[@]:-}"; do
@@ -323,6 +327,11 @@ cleanup_runtime() {
 
 trap on_interrupt INT TERM
 trap cleanup_runtime EXIT
+
+if [[ -f "$STOP_MARKER" ]]; then
+  echo "[INFO] removing stale stop marker: $STOP_MARKER"
+  rm -f -- "$STOP_MARKER" || true
+fi
 
 mapfile -t source_files < <(
   find "$INPUT_SOURCE_CLIPS" -maxdepth 1 \( -type f -o -type l \) \
@@ -413,6 +422,9 @@ done
 remaining="${#pids[@]}"
 emit_progress_snapshot
 while (( remaining > 0 )); do
+  if [[ "$STOP_REQUESTED" -eq 0 ]] && [[ -f "$STOP_MARKER" ]]; then
+    request_graceful_stop
+  fi
   poll_all_worker_logs
   emit_progress_snapshot
 

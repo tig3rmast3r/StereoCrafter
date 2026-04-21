@@ -44,12 +44,18 @@ from dependency.mask_static_hold import (
     DEFAULT_THRESHOLD_U8,
     analyze_embedded_mask_video,
     analyze_mask_video,
+    analyze_mask_video_with_warped_content,
 )
 from dependency.repo_paths import config_path, repo_path
 
 GUI_VERSION = "26-01-13.0"
 CONFIG_FILENAME = str(config_path("config_inpaint.json"))
 INPAINT_HELP_PATH = str(repo_path("dependency", "inpaint_help.json"))
+DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS5 = 38
+DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS6 = 26
+DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS7 = 18
+DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS = 14
+DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR = 3.0
 
 _ACTIVE_FFMPEG_WRITERS: set[subprocess.Popen] = set()
 _ACTIVE_FFMPEG_LOCK = threading.Lock()
@@ -2088,13 +2094,32 @@ class InpaintingGUI(ThemedTk):
         self.video_bias_label.grid(row=current_row, column=1, sticky="ew", padx=(2, 5), pady=1)
 
     @staticmethod
-    def _visible_chunk_from_steps(num_inference_steps: int) -> int:
-        steps = max(1, int(num_inference_steps))
-        if steps <= 5:
-            return 20
-        if steps == 6:
-            return 16
-        return 12
+    def _round_half_up(value: float) -> int:
+        return int(math.floor(float(value) + 0.5))
+
+    @staticmethod
+    def _visible_chunk_from_steps(
+        effective_inference_steps: float,
+        *,
+        visible_chunk_steps5: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS5,
+        visible_chunk_steps6: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS6,
+        visible_chunk_steps7: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS7,
+        visible_chunk_steps8_plus: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS,
+    ) -> float:
+        steps = max(1.0, float(effective_inference_steps))
+        chunk_5 = float(max(1, int(visible_chunk_steps5)))
+        chunk_6 = float(max(1, int(visible_chunk_steps6)))
+        chunk_7 = float(max(1, int(visible_chunk_steps7)))
+        chunk_8 = float(max(1, int(visible_chunk_steps8_plus)))
+        if steps <= 5.0:
+            return chunk_5
+        if steps < 6.0:
+            return chunk_5 + (steps - 5.0) * (chunk_6 - chunk_5)
+        if steps < 7.0:
+            return chunk_6 + (steps - 6.0) * (chunk_7 - chunk_6)
+        if steps < 8.0:
+            return chunk_7 + (steps - 7.0) * (chunk_8 - chunk_7)
+        return chunk_8
 
     @staticmethod
     def _normalize_tile_mode(tile_mode: Optional[str], tile_num: int = 1) -> str:
@@ -2130,8 +2155,9 @@ class InpaintingGUI(ThemedTk):
         }
         try:
             if replace_mask_path:
-                return analyze_mask_video(
-                    path=replace_mask_path,
+                return analyze_mask_video_with_warped_content(
+                    mask_path=replace_mask_path,
+                    warped_path=input_video_path,
                     threshold_u8=DEFAULT_THRESHOLD_U8,
                     min_area_px=DEFAULT_MIN_AREA_PX,
                     border_tolerance_px=DEFAULT_BORDER_TOLERANCE_PX,
@@ -2163,7 +2189,7 @@ class InpaintingGUI(ThemedTk):
         input_layout: str,
         replace_mask_path: str,
         process_length: int,
-        num_inference_steps: int,
+        effective_inference_steps: float,
         overlap: int,
         frames_chunk: int,
         enable_dynamic_chunk: bool,
@@ -2171,10 +2197,17 @@ class InpaintingGUI(ThemedTk):
         tile_num: int,
         tile1_max_size: Optional[int],
         tile2_max_size: Optional[int],
+        dynamic_visible_chunk_steps5: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS5,
+        dynamic_visible_chunk_steps6: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS6,
+        dynamic_visible_chunk_steps7: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS7,
+        dynamic_visible_chunk_steps8_plus: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS,
+        static_mask_divisor: float = DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR,
     ) -> Dict[str, object]:
         current_overlap = max(0, int(overlap))
         min_processed_chunk = max(1, 2 * current_overlap + 1)
         normalized_tile_mode = self._normalize_tile_mode(tile_mode, tile_num=tile_num)
+        effective_steps = max(1.0, float(effective_inference_steps))
+        model_steps = max(1, self._round_half_up(effective_steps))
 
         if tile1_max_size is None:
             tile1_limit = None
@@ -2187,7 +2220,16 @@ class InpaintingGUI(ThemedTk):
 
         max_hold = 0
         hold_floor_visible = 0
-        visible_chunk_from_steps = self._visible_chunk_from_steps(num_inference_steps)
+        hold_divisor = float(static_mask_divisor)
+        if not math.isfinite(hold_divisor) or hold_divisor <= 0.0:
+            hold_divisor = DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR
+        visible_chunk_from_steps = self._visible_chunk_from_steps(
+            effective_steps,
+            visible_chunk_steps5=dynamic_visible_chunk_steps5,
+            visible_chunk_steps6=dynamic_visible_chunk_steps6,
+            visible_chunk_steps7=dynamic_visible_chunk_steps7,
+            visible_chunk_steps8_plus=dynamic_visible_chunk_steps8_plus,
+        )
         if enable_dynamic_chunk:
             hold_info = self._analyze_scene_mask_hold(
                 input_video_path=input_video_path,
@@ -2196,43 +2238,63 @@ class InpaintingGUI(ThemedTk):
                 process_length=process_length,
             )
             max_hold = int(hold_info.get("max_hold_frames") or 0)
-            hold_floor_visible = int(math.ceil(float(max_hold) / 5.0)) if max_hold > 0 else 0
-            visible_chunk_after_hold = max(visible_chunk_from_steps, hold_floor_visible)
-            processed_chunk_target = max(min_processed_chunk, visible_chunk_after_hold + current_overlap)
+            hold_floor_visible = int(math.ceil(float(max_hold) / hold_divisor)) if max_hold > 0 else 0
+            visible_chunk_after_hold = max(visible_chunk_from_steps, float(hold_floor_visible))
+            processed_chunk_target = max(
+                float(min_processed_chunk),
+                visible_chunk_after_hold + float(current_overlap),
+            )
         else:
-            visible_chunk_after_hold = max(1, int(frames_chunk) - current_overlap)
-            processed_chunk_target = max(min_processed_chunk, int(frames_chunk))
+            visible_chunk_after_hold = max(1.0, float(frames_chunk) - float(current_overlap))
+            processed_chunk_target = max(float(min_processed_chunk), float(frames_chunk))
 
         clamp_reason = ""
-        if normalized_tile_mode == "1":
+        if not enable_dynamic_chunk and normalized_tile_mode == "1 and 2":
+            selected_tile = 2
+            processed_chunk_selected = processed_chunk_target
+        elif normalized_tile_mode == "1":
             selected_tile = 1
-            processed_chunk_final = processed_chunk_target if tile1_limit is None else min(processed_chunk_target, tile1_limit)
-            if tile1_limit is not None and processed_chunk_final < processed_chunk_target:
+            processed_chunk_selected = (
+                processed_chunk_target
+                if tile1_limit is None
+                else min(processed_chunk_target, float(tile1_limit))
+            )
+            if tile1_limit is not None and processed_chunk_selected < processed_chunk_target:
                 clamp_reason = "tile1_max"
         elif normalized_tile_mode == "2":
             selected_tile = 2
-            processed_chunk_final = processed_chunk_target if tile2_limit is None else min(processed_chunk_target, tile2_limit)
-            if tile2_limit is not None and processed_chunk_final < processed_chunk_target:
+            processed_chunk_selected = (
+                processed_chunk_target
+                if tile2_limit is None
+                else min(processed_chunk_target, float(tile2_limit))
+            )
+            if tile2_limit is not None and processed_chunk_selected < processed_chunk_target:
                 clamp_reason = "tile2_max"
         else:
-            if tile1_limit is None or processed_chunk_target <= tile1_limit:
+            if tile1_limit is None or processed_chunk_target <= float(tile1_limit):
                 selected_tile = 1
-                processed_chunk_final = processed_chunk_target
+                processed_chunk_selected = processed_chunk_target
             else:
                 selected_tile = 2
-                processed_chunk_final = processed_chunk_target if tile2_limit is None else min(processed_chunk_target, tile2_limit)
-                if tile2_limit is not None and processed_chunk_final < processed_chunk_target:
+                processed_chunk_selected = (
+                    processed_chunk_target
+                    if tile2_limit is None
+                    else min(processed_chunk_target, float(tile2_limit))
+                )
+                if tile2_limit is not None and processed_chunk_selected < processed_chunk_target:
                     clamp_reason = "tile2_max"
 
-        processed_chunk_final = max(min_processed_chunk, int(processed_chunk_final))
+        processed_chunk_final = max(min_processed_chunk, self._round_half_up(processed_chunk_selected))
         visible_chunk_final = max(1, processed_chunk_final - current_overlap)
         return {
-            "steps_resolved": int(num_inference_steps),
-            "visible_chunk_from_steps": int(visible_chunk_from_steps),
+            "effective_steps": float(effective_steps),
+            "model_steps": int(model_steps),
+            "visible_chunk_from_steps": float(visible_chunk_from_steps),
             "max_hold_frames": int(max_hold),
             "hold_floor_visible": int(hold_floor_visible),
-            "visible_chunk_after_hold": int(visible_chunk_after_hold),
-            "processed_chunk_target": int(processed_chunk_target),
+            "static_mask_divisor": float(hold_divisor),
+            "visible_chunk_after_hold": float(visible_chunk_after_hold),
+            "processed_chunk_target": float(processed_chunk_target),
             "tile_mode": normalized_tile_mode,
             "selected_tile": int(selected_tile),
             "processed_chunk_final": int(processed_chunk_final),
@@ -2255,7 +2317,7 @@ class InpaintingGUI(ThemedTk):
         tile1_max_size: Optional[int] = None,
         tile2_max_size: Optional[int] = None,
         vf: Optional[str] = None,
-        num_inference_steps: int = 5,
+        effective_inference_steps: float = 5.0,
         stop_event: Optional[threading.Event] = None,
         update_info_callback=None,
         original_input_blend_strength: float = 0.8,
@@ -2266,6 +2328,11 @@ class InpaintingGUI(ThemedTk):
         output_pix_fmt: str = "",
         output_extra_args: str = "",
         process_length: int = -1,
+        dynamic_visible_chunk_steps5: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS5,
+        dynamic_visible_chunk_steps6: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS6,
+        dynamic_visible_chunk_steps7: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS7,
+        dynamic_visible_chunk_steps8_plus: int = DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS,
+        static_mask_divisor: float = DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR,
     ) -> Tuple[bool, Optional[str]]:
         """
         Orchestrates the processing of a single video: Setup, Inpainting, Finalization, Encoding.
@@ -2322,7 +2389,7 @@ class InpaintingGUI(ThemedTk):
             input_layout=input_layout,
             replace_mask_path=replace_mask_path,
             process_length=process_length,
-            num_inference_steps=num_inference_steps,
+            effective_inference_steps=effective_inference_steps,
             overlap=overlap,
             frames_chunk=frames_chunk,
             enable_dynamic_chunk=enable_dynamic_chunk,
@@ -2330,17 +2397,25 @@ class InpaintingGUI(ThemedTk):
             tile_num=tile_num,
             tile1_max_size=tile1_max_size,
             tile2_max_size=tile2_max_size,
+            dynamic_visible_chunk_steps5=dynamic_visible_chunk_steps5,
+            dynamic_visible_chunk_steps6=dynamic_visible_chunk_steps6,
+            dynamic_visible_chunk_steps7=dynamic_visible_chunk_steps7,
+            dynamic_visible_chunk_steps8_plus=dynamic_visible_chunk_steps8_plus,
+            static_mask_divisor=static_mask_divisor,
         )
         frames_chunk = int(chunk_plan["processed_chunk_final"])
         tile_num = int(chunk_plan["selected_tile"])
+        model_inference_steps = int(chunk_plan["model_steps"])
         logger.info(
             "[chunk-plan] "
-            f"steps={chunk_plan['steps_resolved']} "
-            f"visible_from_steps={chunk_plan['visible_chunk_from_steps']} "
+            f"effective_steps={chunk_plan['effective_steps']:.2f} "
+            f"model_steps={chunk_plan['model_steps']} "
+            f"visible_from_steps={chunk_plan['visible_chunk_from_steps']:.2f} "
             f"max_hold={chunk_plan['max_hold_frames']} "
+            f"hold_divisor={chunk_plan['static_mask_divisor']:.2f} "
             f"hold_floor={chunk_plan['hold_floor_visible']} "
-            f"visible_after_hold={chunk_plan['visible_chunk_after_hold']} "
-            f"processed_target={chunk_plan['processed_chunk_target']} "
+            f"visible_after_hold={chunk_plan['visible_chunk_after_hold']:.2f} "
+            f"processed_target={chunk_plan['processed_chunk_target']:.2f} "
             f"tile_mode={chunk_plan['tile_mode']} "
             f"selected_tile={chunk_plan['selected_tile']} "
             f"processed_final={chunk_plan['processed_chunk_final']} "
@@ -2596,7 +2671,7 @@ class InpaintingGUI(ThemedTk):
                     # ... (spatial_tiled_process arguments) ...
                     cond_frames=input_frames_to_pipeline, mask_frames=mask_frames_i, process_func=pipeline, tile_num=tile_num,
                     spatial_n_compress=8, min_guidance_scale=1.01, max_guidance_scale=1.01, decode_chunk_size=2,
-                    fps=7, motion_bucket_id=127, noise_aug_strength=0.0, num_inference_steps=num_inference_steps,
+                    fps=7, motion_bucket_id=127, noise_aug_strength=0.0, num_inference_steps=model_inference_steps,
                 )
                 video_latents = video_latents.unsqueeze(0)
                 pipeline.vae.to(dtype=torch.float16)
@@ -3073,7 +3148,7 @@ class InpaintingGUI(ThemedTk):
                     tile1_max_size=tile1_max_size if enable_dynamic_chunk else None,
                     tile2_max_size=tile2_max_size if enable_dynamic_chunk else None,
                     vf=None, 
-                    num_inference_steps=num_inference_steps,
+                    effective_inference_steps=num_inference_steps,
                     stop_event=self.stop_event,
                     update_info_callback=_threaded_update_info_callback, 
                     original_input_blend_strength=current_original_input_blend_strength,
@@ -3137,7 +3212,7 @@ class InpaintingGUI(ThemedTk):
         input_folder = self.input_folder_var.get()
         output_folder = self.output_folder_var.get()
         try:
-            num_inference_steps = int(self.num_inference_steps_var.get())
+            num_inference_steps = float(self.num_inference_steps_var.get())
             tile_mode = self._normalize_tile_mode(self.tile_mode_var.get(), tile_num=2)
             self.tile_mode_var.set(tile_mode)
             enable_dynamic_chunk = bool(self.enable_dynamic_chunk_var.get())
@@ -3153,13 +3228,13 @@ class InpaintingGUI(ThemedTk):
             if process_length != -1 and process_length <= 0:
                 raise ValueError("Process Length must be -1 or a positive integer.")
             
-            if num_inference_steps < 1 or frames_chunk < 1 or tile1_max_size < 1 or tile2_max_size < 1 or gui_overlap  < 0 or \
+            if num_inference_steps < 1.0 or frames_chunk < 1 or tile1_max_size < 1 or tile2_max_size < 1 or gui_overlap  < 0 or \
                gui_tail_pad < 0 or \
                not (0.0 <= gui_original_input_blend_strength  <= 1.0) or gui_output_crf < 0: # NEW VALIDATION for CRF
                 raise ValueError("Invalid parameter values")
         except ValueError:
             # UPDATED ERROR MESSAGE
-            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Frames Chunk >=1, Tile 1/2 Max Size >=1, Frame Overlap >=0, Tail Pad >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0.")
+            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1.0, Frames Chunk >=1, Tile 1/2 Max Size >=1, Frame Overlap >=0, Tail Pad >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0.")
             return
         offload_type = self.offload_type_var.get()
 

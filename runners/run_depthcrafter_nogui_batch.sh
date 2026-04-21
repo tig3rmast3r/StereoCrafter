@@ -70,6 +70,7 @@ CMD=(
   --worker_script "$WORKER_SCRIPT"
   --input_dir "$INPUT_DIR"
   --output_dir "$OUTPUT_DIR"
+  --stop_marker "$STOP_MARKER"
   --glob "$GLOB"
   --window_size "$WINDOW_SIZE"
   --overlap "$OVERLAP"
@@ -209,6 +210,23 @@ _is_true() {
   esac
 }
 
+wait_for_pid() {
+  local pid="$1"
+  local code=0
+  while true; do
+    if wait "$pid"; then
+      code=0
+    else
+      code=$?
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  return "$code"
+}
+
 _request_stop_signal() {
   if [[ "$STOP_REQUESTED" -eq 0 ]]; then
     STOP_REQUESTED=1
@@ -218,9 +236,6 @@ _request_stop_signal() {
     : > "$STOP_MARKER"
     : > "$STOP_REQUEST_FILE"
     echo "[STOP] graceful stop requested (Ctrl+C style)."
-    if [[ -n "$CURRENT_CHILD_PID" ]] && kill -0 "$CURRENT_CHILD_PID" 2>/dev/null; then
-      _send_child_interrupt "$CURRENT_CHILD_PID" "$CURRENT_CHILD_PGID"
-    fi
     return 0
   fi
 
@@ -256,7 +271,7 @@ _run_once_with_watchdog() {
 
   if ! _is_true "$WATCHDOG_ENABLED"; then
     local rc=0
-    if wait "$child_pid"; then
+    if wait_for_pid "$child_pid"; then
       rc=0
     else
       rc=$?
