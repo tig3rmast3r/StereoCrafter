@@ -186,7 +186,7 @@ Long live to 3D!!
 2026-04-16 (Inpainting Changes)
 - [new/changed/fix] i want to talk about inpaint and its flaws, there are mainly 2 problems with inpaint atm:<br>
 1 - color flashes: at first i tought that color flashes was only on the last frame of each chunk and i fixed it by adding tail_pad so the last frame for every chunk and at the end of each clip is calculated but not sent into the stream. I've discovered later that the same identical color flash is present also on the last overlap frame of the following chunks, so when i've cherry picked the crossfade commit the problem has arised again. for this reason i've removed crossfade when is overlapping and the new chunk starts to be seen after the overlap has done. There are still some traces on the following frames but at least the huge flash is now gone again.<br>
-2 - blurry inpaint: when the warped zone is detailed there is a very visible difference between the inpainted zone and the surroudings, the inpainted zone is really blurry compared to the rest, with the older auto setting this issue was more prominent, as the blurry ratio is directly proportional to the chunk size, switching back to tile 1 and shorter chunks helped a lot but there's a downside to this, it may happen that for static and long scenes the inpainted zone tends to become worse overtime, for this other reason some scenes are better using longer chunks, so in order to let everything going "automatically", the script has to decide if it's better to use shorter or longer chunks depending on 2 factors:<br>
+2 - blurry inpaint: when the masked zone is detailed there is a very visible difference between the inpainted zone and the surroudings, the inpainted zone is really blurry compared to the rest, with the older auto setting this issue was more prominent, as the blurry ratio is directly proportional to the chunk size, switching back to tile 1 and shorter chunks helped a lot but there's a downside, it may happen that for static and long scenes the inpainted zone tends to become worse overtime, for this other reason some scenes are better using longer chunks, so in order to let everything going "automatically", the script has to decide if it's better to use shorter or longer chunks depending on 2 factors:<br>
 -length of static mask areas<br>
 -expected amount of sharpness for the warp areas<br>
 when a main mask area is static the max chunk size will be adjusted to avoid the degratation for that area, if the chunk can be used with tile 1 it will be used, (it's faster with tile 1), but if the chunk will require more frames it will fallback to tile 2, you can set the maximum possible frames for your current Vram pool with tile 1 and 2, in my case with 4090 in Linux is 22 and 55 (+1 tail_pad) so this is the default value in pipeline_master_gui<br>
@@ -195,8 +195,11 @@ Still testing, may need some fine tuning<br>
 - [fix] Requeue annotated scenes now copy all files from the previous steps and not just the ones required by the selected step
 - [fix] stand-alone script settings are now aligned with pipeline_master_gui
 
-2026-04-20 (inpainting improvements part 2 + graceful stop fix)
+2026-04-22 (inpainting changes part 2 + graceful stop fix)
 - [new] improved static mask detection, now it takes into account the ROI next to the mask to evaluate if is going to degrade overtime with small chunks
 - [new] dynamic chunk settings and static mask divisor are now available as CLI vars and in pipeline_master_gui
 - [changed] dynamic chunk preset values
+- [changed] added the other auto-convergences in pipeline_master_gui
 - [fix] Stop/Graceful Stop should work correctly now on all steps from both scripts and pipeline master gui
+- [fix] rare NaN case on AutoCT
+- [fix] MinBorder auto convergence clamps was missing

@@ -332,8 +332,8 @@ class ConvergenceEstimatorWrapper:
         gamma: float = 1.0,
         fallback_value: float = 0.5,
         stop_event: Optional[threading.Event] = None,
-        conv_min: float = 0.0,
-        conv_max: float = 1.0,
+        conv_min: float = 0.2,
+        conv_max: float = 0.8,
         conv_step: float = 0.02,
         tv_comp_mode: str = "auto",
     ) -> float:
@@ -341,6 +341,10 @@ class ConvergenceEstimatorWrapper:
 
         Uses only the depth video and the same disparity mapping used by render:
             disp_px = (depth - conv) * 2 * actual_max_disp_pixels
+
+        The historical MinBorders policy intentionally constrains the search
+        range to 0.2..0.8 so the solver cannot collapse to extreme values like
+        0.0 that produce overly aggressive pop-out on typical content.
         """
         if not depth_path or not os.path.exists(depth_path):
             self.logger.warning("MinBorders: depth path not found, using fallback.")

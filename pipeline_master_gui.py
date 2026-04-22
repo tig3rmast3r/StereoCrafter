@@ -46,7 +46,7 @@ try:
 except Exception:
     ThemedTk = None
 
-GUI_VERSION = "2026-04-21"
+GUI_VERSION = "2026-04-22"
 REPO_ROOT = repo_root()
 DEFAULT_PIPELINE_MASTER_CONFIG_PATH = config_path("config_pipeline_master_gui.json")
 
@@ -644,8 +644,13 @@ class PipelineMasterGUI:
         self.splat_layout_var = tk.StringVar(
             value=self._config.get("splat_layout", "Single Warp")
         )
+        splat_auto_conv_cfg = str(
+            self._config.get("splat_auto_convergence", "Min Borders")
+        ).strip()
+        if splat_auto_conv_cfg == "MinBorders":
+            splat_auto_conv_cfg = "Min Borders"
         self.splat_auto_convergence_var = tk.StringVar(
-            value=self._config.get("splat_auto_convergence", "Min Borders")
+            value=splat_auto_conv_cfg or "Min Borders"
         )
         self.splat_dilate_x_var = tk.StringVar(
             value=str(self._config.get("splat_dilate_x", "3"))
@@ -1059,8 +1064,12 @@ class PipelineMasterGUI:
             self.splat_workers_var.set("8")
         if self.splat_layout_var.get().strip() not in {"Single Warp", "Dual", "Quad"}:
             self.splat_layout_var.set("Single Warp")
-        if self.splat_auto_convergence_var.get().strip() not in {"Min Borders", "Off"}:
-            self.splat_auto_convergence_var.set("Min Borders")
+        auto_conv_ui = self.splat_auto_convergence_var.get().strip()
+        if auto_conv_ui == "MinBorders":
+            auto_conv_ui = "Min Borders"
+        if auto_conv_ui not in {"Min Borders", "Average", "Peak", "Hybrid", "Off"}:
+            auto_conv_ui = "Min Borders"
+        self.splat_auto_convergence_var.set(auto_conv_ui)
         if self.inpaint_mode_var.get().strip() not in {"Auto (recommended)", "Manual"}:
             self.inpaint_mode_var.set("Auto (recommended)")
         if self.inpaint_mode_var.get().strip() == "Auto (recommended)":
@@ -1830,7 +1839,7 @@ class PipelineMasterGUI:
         self.splat_auto_convergence_combo = ttk.Combobox(
             params_frame,
             textvariable=self.splat_auto_convergence_var,
-            values=["Min Borders", "Off"],
+            values=["Min Borders", "Average", "Peak", "Hybrid", "Off"],
             width=14,
             state="readonly",
         )
@@ -11253,7 +11262,13 @@ class PipelineMasterGUI:
             workers = 8
             self.splat_workers_var.set(str(workers))
         auto_conv_ui = self.splat_auto_convergence_var.get().strip()
-        auto_conv_cli = "Off" if auto_conv_ui == "Off" else "MinBorders"
+        auto_conv_cli = {
+            "Off": "Off",
+            "Min Borders": "MinBorders",
+            "Average": "Average",
+            "Peak": "Peak",
+            "Hybrid": "Hybrid",
+        }.get(auto_conv_ui, "MinBorders")
         replace_mask_enabled = True
 
         env_updates: dict[str, str] = {
