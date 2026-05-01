@@ -89,7 +89,7 @@ All the extra scripts are made multithreading/parallel when possible, helping re
 Long live to 3D!!
 
 ### Time to encode
-- in linux with intel 265k 48GB Ram + RTX 4090 total time is 0.0125x, that means 1h->80h required time. 75% of this time is taken by the inpainting step. A full power RTX 5090 (575+ Watts) is around 20% faster
+- in linux with intel 265k 48GB Ram + RTX 4090 total time is 0.016x, that means 1h->60h required time. Half of this time is taken by the inpainting step. A full power RTX 5090 (575+ Watts) with adjusted chunks sizes will gain around 20% on depthmap/inpaint steps
 
 # CHANGE LOG
 
@@ -204,7 +204,7 @@ Still testing, may need some fine tuning<br>
 - [fix] rare NaN case on AutoCT
 - [fix] MinBorder auto convergence clamps was missing
 
-2026-04-24 (headless pipeline + dynamic inpaint resolution + speed optimizations)
+2026-05-01 (headless pipeline + dynamic inpaint resolution + speed optimizations)
 - [new] Headless script for Pipeline Master
 - [new] Dynamic resolution will now adapt resolution from 50% to 100% dynamically, greatly reducing inference time with abysmal differences in most cases
 - [new] resolution drop-down can be used to set the max resolution in dynamic mode and the fixed resolution in static mode
