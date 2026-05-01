@@ -69,7 +69,7 @@ echo "[INFO] Installing system packages..."
 export DEBIAN_FRONTEND=noninteractive
 ${SUDO} apt-get update
 ${SUDO} apt-get install -y software-properties-common
-runtime_packages=(git git-lfs ffmpeg libgl1 libglib2.0-0)
+runtime_packages=(git git-lfs ffmpeg mkvtoolnix python3-tk libgl1 libglib2.0-0)
 build_packages=()
 if [[ "${BUILD_FORWARD_WARP}" == "true" ]]; then
   build_packages=(build-essential cmake ninja-build pkg-config)

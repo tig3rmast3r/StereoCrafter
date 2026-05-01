@@ -23,6 +23,18 @@ just run scenedetect TAB manually and Verify(quick) then try a test run on the l
 NOTE about PYTORCH_ALLOC_CONF max_split_size_mb:xx, while this command can save from VRAM OOM be warned that a low value such as 64 can increase inference times by up to 200%, i have implemented those exports to be enabled only when there are fails. <br>
 garbage_collection_threshold:0.8 and expandable_segments:True are very light so i kept them on as default for depthcrafting and inpainting steps.
 
+## Usage (auto without GUI eg. Docker)
+
+```bash
+python runners/pipeline_master_headless.py --help
+```
+
+The headless runner uses a single `work_dir` as the source of truth.<br>
+If `<work_dir>/config_pipeline_master_gui.json` exists it loads the saved Pipeline Master settings from there automatically.<br>
+If `<work_dir>/pipeline_state.json` exists it also resumes the DONE/VERIFY state from there automatically.<br>
+If the local config json does not exist yet, it starts from the normal Pipeline Master defaults but still keeps paths/state inside that same `work_dir`.<br>
+The supported CLI flags and step-selection options are documented directly by the script help above.<br>
+
 ## Usage (manual with or without GUI)
 
 All the scripts can be launched as stand-alone, or you can run the gui versions like the originating fork where i've started but some features will be missing (sharpness csv, autoct csv, "prepare seg mono to sbs" and sharpen step has no GUI, mask for merge step is embeddded into merging_gui)<br>

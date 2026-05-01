@@ -40,13 +40,17 @@ from dependency.repo_paths import (
     runner_path,
     utilities_path,
 )
+from core.pipeline_master import builders as pm_builders
+from core.pipeline_master import config as pm_config
+from core.pipeline_master import orchestrator as pm_orchestrator
+from core.pipeline_master import state as pm_state
 
 try:
     from ttkthemes import ThemedTk
 except Exception:
     ThemedTk = None
 
-GUI_VERSION = "2026-04-22"
+GUI_VERSION = "2026-05-01"
 REPO_ROOT = repo_root()
 DEFAULT_PIPELINE_MASTER_CONFIG_PATH = config_path("config_pipeline_master_gui.json")
 
@@ -85,6 +89,7 @@ class PipelineMasterGUI:
     RETRY_POLICY_PROFILES = ("run", "retry1", "retry2", "retry3")
     RETRY_POLICY_MAX_SPLIT_CHOICES = ("off", "64", "128", "256", "512")
     RETRY_POLICY_OFFLOAD_CHOICES = ("none", "model", "sequential")
+    DEPTH_RETRY_OFFSET_CHOICES = ("+20", "+15", "+10", "+5", "0", "-5", "-10", "-15", "-20")
     DEPTH_RETRY_POLICY_DEFAULT = {
         "run": {
             "garbage_collection_threshold": True,
@@ -93,38 +98,38 @@ class PipelineMasterGUI:
             "cpu_offload_inherited": True,
             "cpu_offload_mode": "model",
             "worker_mode": "original",
-            "window_size": "65",
-            "overlap": "15",
+            "window_offset": "0",
+            "overlap_offset": "0",
         },
         "retry1": {
             "garbage_collection_threshold": True,
             "expandable_segments": True,
-            "max_split_size_mb": "64",
+            "max_split_size_mb": "off",
             "cpu_offload_inherited": False,
             "cpu_offload_mode": "model",
             "worker_mode": "original",
-            "window_size": "60",
-            "overlap": "15",
+            "window_offset": "-10",
+            "overlap_offset": "0",
         },
         "retry2": {
             "garbage_collection_threshold": True,
             "expandable_segments": True,
-            "max_split_size_mb": "64",
+            "max_split_size_mb": "off",
             "cpu_offload_inherited": False,
             "cpu_offload_mode": "sequential",
             "worker_mode": "original",
-            "window_size": "55",
-            "overlap": "15",
+            "window_offset": "-10",
+            "overlap_offset": "0",
         },
         "retry3": {
             "garbage_collection_threshold": True,
             "expandable_segments": True,
-            "max_split_size_mb": "64",
+            "max_split_size_mb": "off",
             "cpu_offload_inherited": False,
             "cpu_offload_mode": "model",
             "worker_mode": "stream",
-            "window_size": "70",
-            "overlap": "25",
+            "window_offset": "+10",
+            "overlap_offset": "+10",
         },
     }
     INPAINT_RETRY_POLICY_DEFAULT = {
@@ -173,18 +178,8 @@ class PipelineMasterGUI:
         "- Mobius: more HDR-like rolloff.\n"
         "- Hable: brighter SDR-style look."
     )
-    DEPTH_AUTO_INFO = (
-        "Auto mode: source scenes are downscaled with a selectable factor (0.50..1.00)\n"
-        "and processed directly with DepthCrafter. RealESRGAN is skipped in the auto chain,\n"
-        "so the final auto resolution follows the DepthCrafter multiplier.\n"
-        "If you want optional ESRGAN 2x/4x restore, switch to Manual mode and enable it there."
-    )
-    DEPTH_MANUAL_INFO = (
-        "Manual mode: choose parameters freely and optionally enable RealESRGAN as a separate\n"
-        "step (bundled 2x anime model or bundled 4x plus model).\n"
-        "Segmenting is not supported in this script.\n"
-        "If you need segmenting, use depthcrafter_gui_seg.py manually."
-    )
+    DEPTH_AUTO_INFO = ""
+    DEPTH_MANUAL_INFO = ""
     DEPTH_STREAM_WARNING = (
         "Stream mode uses chunked streaming inference and is much less sensitive to total clip length,\n"
         "so it can often start and finish on files that Original mode cannot open at the same resolution.\n\n"
@@ -567,7 +562,7 @@ class PipelineMasterGUI:
             value=str(self._config.get("depth_overlap", "15"))
         )
         self.depth_inference_steps_var = tk.StringVar(
-            value=str(self._config.get("depth_inference_steps", "5"))
+            value=str(self._config.get("depth_inference_steps", "4"))
         )
         self.depth_cpu_offload_var = tk.StringVar(
             value=self._config.get("depth_cpu_offload", "model")
@@ -734,7 +729,7 @@ class PipelineMasterGUI:
             value=bool(self._config.get("inpaint_dynamic_chunk", True))
         )
         self.inpaint_cpu_offload_var = tk.StringVar(
-            value=self._config.get("inpaint_cpu_offload", "model")
+            value=self._config.get("inpaint_cpu_offload", "none")
         )
         self.inpaint_tile_mode_var = tk.StringVar(
             value=str(
@@ -745,10 +740,10 @@ class PipelineMasterGUI:
             )
         )
         self.inpaint_tile1_max_size_var = tk.StringVar(
-            value=str(self._config.get("inpaint_tile1_max_size", "22"))
+            value=str(self._config.get("inpaint_tile1_max_size", "4,26,33,44,61,89"))
         )
         self.inpaint_tile2_max_size_var = tk.StringVar(
-            value=str(self._config.get("inpaint_tile2_max_size", "55"))
+            value=str(self._config.get("inpaint_tile2_max_size", "72,87,108,118,118,118"))
         )
         self.inpaint_dynamic_visible_chunk_steps5_var = tk.StringVar(
             value=str(
@@ -801,6 +796,12 @@ class PipelineMasterGUI:
         )
         self.inpaint_use_sharpness_csv_var = tk.BooleanVar(
             value=bool(self._config.get("inpaint_use_sharpness_csv", True))
+        )
+        self.inpaint_dynamic_resolution_var = tk.BooleanVar(
+            value=bool(self._config.get("inpaint_dynamic_resolution", True))
+        )
+        self.inpaint_resolution_limit_var = tk.StringVar(
+            value=str(self._config.get("inpaint_resolution_limit", "90%"))
         )
         self.inpaint_use_sharpen_var = tk.BooleanVar(
             value=bool(self._config.get("inpaint_use_sharpen", True))
@@ -982,14 +983,14 @@ class PipelineMasterGUI:
                         dcfg.get("worker_mode", self.DEPTH_RETRY_POLICY_DEFAULT[profile].get("worker_mode", "original"))
                     )
                 ),
-                "window_size": tk.StringVar(
-                    value=self._normalize_depth_retry_window_size(
-                        dcfg.get("window_size", self.DEPTH_RETRY_POLICY_DEFAULT[profile].get("window_size", "65"))
+                "window_offset": tk.StringVar(
+                    value=self._normalize_depth_retry_offset(
+                        dcfg.get("window_offset", self.DEPTH_RETRY_POLICY_DEFAULT[profile].get("window_offset", "0"))
                     )
                 ),
-                "overlap": tk.StringVar(
-                    value=self._normalize_depth_retry_overlap(
-                        dcfg.get("overlap", self.DEPTH_RETRY_POLICY_DEFAULT[profile].get("overlap", "15"))
+                "overlap_offset": tk.StringVar(
+                    value=self._normalize_depth_retry_offset(
+                        dcfg.get("overlap_offset", self.DEPTH_RETRY_POLICY_DEFAULT[profile].get("overlap_offset", "0"))
                     )
                 ),
             }
@@ -1048,7 +1049,7 @@ class PipelineMasterGUI:
         if self.depth_overlap_var.get().strip() == "":
             self.depth_overlap_var.set("15")
         if self.depth_inference_steps_var.get().strip() == "":
-            self.depth_inference_steps_var.set("5")
+            self.depth_inference_steps_var.set("4")
         self.depth_scale_factor_var.set(
             self._normalize_depth_scale_factor(self.depth_scale_factor_var.get())
         )
@@ -1078,7 +1079,7 @@ class PipelineMasterGUI:
             self.inpaint_frames_chunk_var.set("22")
         self._inpaint_chunk_manual_cache = self.inpaint_frames_chunk_var.get().strip() or "22"
         if self.inpaint_cpu_offload_var.get().strip() == "":
-            self.inpaint_cpu_offload_var.set("model")
+            self.inpaint_cpu_offload_var.set("none")
         if self.inpaint_overlap_var.get().strip() == "":
             self.inpaint_overlap_var.set("2")
         if self.inpaint_tail_pad_var.get().strip() == "":
@@ -1086,9 +1087,11 @@ class PipelineMasterGUI:
         if self.inpaint_tile_mode_var.get().strip() not in {"1", "2", "1 and 2"}:
             self.inpaint_tile_mode_var.set("1 and 2")
         if self.inpaint_tile1_max_size_var.get().strip() == "":
-            self.inpaint_tile1_max_size_var.set("22")
+            self.inpaint_tile1_max_size_var.set("4,26,33,44,61,89")
         if self.inpaint_tile2_max_size_var.get().strip() == "":
-            self.inpaint_tile2_max_size_var.set("55")
+            self.inpaint_tile2_max_size_var.set("72,87,108,118,118,118")
+        if self.inpaint_resolution_limit_var.get().strip() not in {"100%", "90%", "80%", "70%", "60%", "50%"}:
+            self.inpaint_resolution_limit_var.set("90%")
         if self.inpaint_dynamic_visible_chunk_steps5_var.get().strip() == "":
             self.inpaint_dynamic_visible_chunk_steps5_var.set(
                 self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS5_DEFAULT
@@ -1660,11 +1663,6 @@ class PipelineMasterGUI:
             state="readonly",
         )
         self.depth_codec_entry.grid(row=0, column=1, sticky="w", padx=(6, 12))
-        ttk.Label(
-            encode_frame,
-            text="Final depthmap output is fixed grayscale-safe x264. This codec only affects the temporary color preprocess.",
-            justify="left",
-        ).grid(row=0, column=2, columnspan=2, sticky="w")
 
         cmd_frame = ttk.LabelFrame(parent, text="Command Preview", padding=8)
         cmd_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
@@ -2189,6 +2187,16 @@ class PipelineMasterGUI:
         )
         self.inpaint_cpu_offload_combo.grid(row=0, column=5, sticky="w", padx=(6, 12))
 
+        ttk.Label(params_frame, text="Res / Max Res:").grid(row=0, column=6, sticky="w")
+        self.inpaint_resolution_limit_combo = ttk.Combobox(
+            params_frame,
+            textvariable=self.inpaint_resolution_limit_var,
+            values=["100%", "90%", "80%", "70%", "60%", "50%"],
+            width=8,
+            state="readonly",
+        )
+        self.inpaint_resolution_limit_combo.grid(row=0, column=7, sticky="w", padx=(6, 12))
+
         ttk.Label(params_frame, text="Tile:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.inpaint_tile_mode_combo = ttk.Combobox(
             params_frame,
@@ -2201,21 +2209,15 @@ class PipelineMasterGUI:
 
         ttk.Label(params_frame, text="Tile 1 Max Size:").grid(row=1, column=2, sticky="w", pady=(8, 0))
         self.inpaint_tile1_max_size_entry = ttk.Entry(
-            params_frame, textvariable=self.inpaint_tile1_max_size_var, width=8
+            params_frame, textvariable=self.inpaint_tile1_max_size_var, width=20
         )
         self.inpaint_tile1_max_size_entry.grid(row=1, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
 
         ttk.Label(params_frame, text="Tile 2 Max Size:").grid(row=1, column=4, sticky="w", pady=(8, 0))
         self.inpaint_tile2_max_size_entry = ttk.Entry(
-            params_frame, textvariable=self.inpaint_tile2_max_size_var, width=8
+            params_frame, textvariable=self.inpaint_tile2_max_size_var, width=20
         )
         self.inpaint_tile2_max_size_entry.grid(row=1, column=5, sticky="w", padx=(6, 12), pady=(8, 0))
-
-        ttk.Label(params_frame, text="Input Bias:").grid(row=1, column=6, sticky="w", pady=(8, 0))
-        self.inpaint_input_bias_entry = ttk.Entry(
-            params_frame, textvariable=self.inpaint_input_bias_var, width=8
-        )
-        self.inpaint_input_bias_entry.grid(row=1, column=7, sticky="w", padx=(6, 12), pady=(8, 0))
 
         ttk.Label(params_frame, text="Overlap:").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.inpaint_overlap_entry = ttk.Entry(
@@ -2229,6 +2231,18 @@ class PipelineMasterGUI:
         )
         self.inpaint_tail_pad_entry.grid(row=2, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
 
+        ttk.Label(params_frame, text="Input Bias:").grid(row=2, column=4, sticky="w", pady=(8, 0))
+        self.inpaint_input_bias_entry = ttk.Entry(
+            params_frame, textvariable=self.inpaint_input_bias_var, width=8
+        )
+        self.inpaint_input_bias_entry.grid(row=2, column=5, sticky="w", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(params_frame, text="Inference steps:").grid(row=2, column=6, sticky="w", pady=(8, 0))
+        self.inpaint_inference_steps_entry = ttk.Entry(
+            params_frame, textvariable=self.inpaint_inference_steps_var, width=8
+        )
+        self.inpaint_inference_steps_entry.grid(row=2, column=7, sticky="w", padx=(6, 12), pady=(8, 0))
+
         self.inpaint_use_sharpness_check = ttk.Checkbutton(
             params_frame,
             text="Use sharpness CSV (auto steps)",
@@ -2237,11 +2251,13 @@ class PipelineMasterGUI:
         )
         self.inpaint_use_sharpness_check.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
-        ttk.Label(params_frame, text="Inference steps:").grid(row=3, column=4, sticky="w", pady=(8, 0))
-        self.inpaint_inference_steps_entry = ttk.Entry(
-            params_frame, textvariable=self.inpaint_inference_steps_var, width=8
+        self.inpaint_dynamic_resolution_check = ttk.Checkbutton(
+            params_frame,
+            text="Dynamic resolution",
+            variable=self.inpaint_dynamic_resolution_var,
+            command=self._on_inpaint_dynamic_resolution_toggle,
         )
-        self.inpaint_inference_steps_entry.grid(row=3, column=5, sticky="w", padx=(6, 12), pady=(8, 0))
+        self.inpaint_dynamic_resolution_check.grid(row=3, column=4, columnspan=2, sticky="w", pady=(8, 0))
 
         ttk.Label(params_frame, text="Sharpness CSV workers:").grid(
             row=3, column=6, sticky="w", pady=(8, 0)
@@ -2275,7 +2291,7 @@ class PipelineMasterGUI:
         dynamic_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         dynamic_frame.grid_columnconfigure(1, weight=1)
 
-        ttk.Label(dynamic_frame, text="Chunk @ 5.0 steps:").grid(row=0, column=0, sticky="w")
+        ttk.Label(dynamic_frame, text="Chunk @ 3.0 steps:").grid(row=0, column=0, sticky="w")
         self.inpaint_dynamic_visible_chunk_steps5_entry = ttk.Entry(
             dynamic_frame,
             textvariable=self.inpaint_dynamic_visible_chunk_steps5_var,
@@ -2285,7 +2301,7 @@ class PipelineMasterGUI:
             row=0, column=1, sticky="w", padx=(6, 0)
         )
 
-        ttk.Label(dynamic_frame, text="Chunk @ 6.0 steps:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(dynamic_frame, text="Chunk @ 4.0 steps:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.inpaint_dynamic_visible_chunk_steps6_entry = ttk.Entry(
             dynamic_frame,
             textvariable=self.inpaint_dynamic_visible_chunk_steps6_var,
@@ -2295,7 +2311,7 @@ class PipelineMasterGUI:
             row=1, column=1, sticky="w", padx=(6, 0), pady=(8, 0)
         )
 
-        ttk.Label(dynamic_frame, text="Chunk @ 7.0 steps:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(dynamic_frame, text="Chunk @ 5.0 steps:").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.inpaint_dynamic_visible_chunk_steps7_entry = ttk.Entry(
             dynamic_frame,
             textvariable=self.inpaint_dynamic_visible_chunk_steps7_var,
@@ -2305,7 +2321,7 @@ class PipelineMasterGUI:
             row=2, column=1, sticky="w", padx=(6, 0), pady=(8, 0)
         )
 
-        ttk.Label(dynamic_frame, text="Chunk @ 8.0+ steps:").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(dynamic_frame, text="Chunk @ 6.0+ steps:").grid(row=3, column=0, sticky="w", pady=(8, 0))
         self.inpaint_dynamic_visible_chunk_steps8_plus_entry = ttk.Entry(
             dynamic_frame,
             textvariable=self.inpaint_dynamic_visible_chunk_steps8_plus_var,
@@ -2364,24 +2380,28 @@ class PipelineMasterGUI:
             buttons, text="Run Inpainting", command=self._run_inpaint_placeholder
         )
         self.inpaint_run_btn.grid(row=0, column=2, padx=6)
+        self.inpaint_benchmark_btn = ttk.Button(
+            buttons, text="Benchmark", command=self._start_inpaint_tile_benchmark
+        )
+        self.inpaint_benchmark_btn.grid(row=0, column=3, padx=6)
         self.inpaint_sharpen_run_btn = ttk.Button(
             buttons, text="Run Sharpen", command=self._start_inpaint_sharpen
         )
-        self.inpaint_sharpen_run_btn.grid(row=0, column=3, padx=6)
+        self.inpaint_sharpen_run_btn.grid(row=0, column=4, padx=6)
         self.inpaint_verify_quick_btn = ttk.Button(
             buttons, text="Verify Scenes", command=self._start_inpaint_verify_quick
         )
-        self.inpaint_verify_quick_btn.grid(row=0, column=4, padx=6)
+        self.inpaint_verify_quick_btn.grid(row=0, column=5, padx=6)
         self.inpaint_sharpen_verify_quick_btn = ttk.Button(
             buttons, text="Verify Sharpen", command=self._start_inpaint_sharpen_verify_quick
         )
-        self.inpaint_sharpen_verify_quick_btn.grid(row=0, column=5, padx=6)
+        self.inpaint_sharpen_verify_quick_btn.grid(row=0, column=6, padx=6)
         self.inpaint_stop_btn = ttk.Button(
             buttons, text="Stop", command=self._stop_inpaint_placeholder, state=tk.DISABLED
         )
-        self.inpaint_stop_btn.grid(row=0, column=6, padx=6)
+        self.inpaint_stop_btn.grid(row=0, column=7, padx=6)
         ttk.Button(buttons, text="Clear Log", command=self._clear_inpaint_log).grid(
-            row=0, column=7, padx=6
+            row=0, column=8, padx=6
         )
 
         status_frame = ttk.Frame(parent)
@@ -2411,12 +2431,17 @@ class PipelineMasterGUI:
         iscroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.inpaint_log_text.yview)
         iscroll.grid(row=0, column=1, sticky="ns")
         self.inpaint_log_text.configure(yscrollcommand=iscroll.set)
+        self.inpaint_resolution_limit_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._preview_inpaint_command(),
+        )
 
         self._inpaint_manual_widgets = [
             self.inpaint_input_bias_entry,
             self.inpaint_overlap_entry,
             self.inpaint_tail_pad_entry,
             self.inpaint_use_sharpness_check,
+            self.inpaint_dynamic_resolution_check,
         ]
 
         self._on_inpaint_mode_changed()
@@ -2520,6 +2545,8 @@ class PipelineMasterGUI:
         self.inpaint_overlap_var.set("2")
         self.inpaint_tail_pad_var.set("1")
         self.inpaint_use_sharpness_csv_var.set(True)
+        self.inpaint_dynamic_resolution_var.set(True)
+        self.inpaint_resolution_limit_var.set("90%")
         self.inpaint_use_sharpen_var.set(True)
         self.inpaint_inference_steps_var.set("8")
         self.inpaint_dynamic_visible_chunk_steps5_var.set(
@@ -2544,6 +2571,9 @@ class PipelineMasterGUI:
     def _on_inpaint_dynamic_chunk_toggle(self) -> None:
         self._apply_inpaint_control_states()
 
+    def _on_inpaint_dynamic_resolution_toggle(self) -> None:
+        self._apply_inpaint_control_states()
+
     def _on_inpaint_sharpen_toggle(self) -> None:
         self._apply_inpaint_control_states()
 
@@ -2562,6 +2592,8 @@ class PipelineMasterGUI:
 
         if not mode_manual:
             self.inpaint_dynamic_chunk_var.set(True)
+            self.inpaint_dynamic_resolution_var.set(True)
+            self.inpaint_resolution_limit_var.set("90%")
             dynamic_chunk = True
 
         if dynamic_chunk:
@@ -2572,6 +2604,7 @@ class PipelineMasterGUI:
             self.inpaint_frames_chunk_entry.configure(state=tk.NORMAL if mode_manual else tk.DISABLED)
 
         self.inpaint_dynamic_chunk_check.configure(state=tk.DISABLED if not mode_manual else tk.NORMAL)
+        self.inpaint_resolution_limit_combo.configure(state=tk.DISABLED if not mode_manual else "readonly")
         self.inpaint_tile_mode_combo.configure(state=tk.DISABLED if not mode_manual else "readonly")
         self.inpaint_tile1_max_size_entry.configure(state=tk.NORMAL)
         self.inpaint_tile2_max_size_entry.configure(state=tk.NORMAL)
@@ -2606,120 +2639,7 @@ class PipelineMasterGUI:
         self._refresh_pipeline_status_panel()
 
     def _build_inpaint_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
-        input_dir = self.inpaint_input_var.get().strip()
-        output_dir = self.inpaint_output_var.get().strip()
-        mask_dir = self.inpaint_mask_var.get().strip()
-        work_dir = self.work_folder_var.get().strip() or "./work"
-        sharp_base = os.path.normpath(work_dir)
-        sharp_csv_path = self.inpaint_sharpness_csv_var.get().strip()
-        use_sharpness_csv = bool(self.inpaint_use_sharpness_csv_var.get())
-        codec_value = self._normalize_ffmpeg_codec(
-            self.inpaint_codec_var.get(),
-            self.DEFAULT_SCENE_CODEC,
-        )
-        self.inpaint_codec_var.set(codec_value)
-        chunk_size = self._parse_inpaint_positive_int(
-            self._get_inpaint_chunk_manual_value(),
-            "Chunk Size",
-        )
-        tile1_max_size = self._parse_inpaint_positive_int(
-            self.inpaint_tile1_max_size_var.get(),
-            "Tile 1 Max Size",
-        )
-        tile2_max_size = self._parse_inpaint_positive_int(
-            self.inpaint_tile2_max_size_var.get(),
-            "Tile 2 Max Size",
-        )
-        overlap = self._parse_inpaint_nonnegative_int(
-            self.inpaint_overlap_var.get(),
-            "Overlap",
-        )
-        tail_pad = self._parse_inpaint_nonnegative_int(
-            self.inpaint_tail_pad_var.get(),
-            "TailPad",
-        )
-        input_bias = self._parse_inpaint_bounded_float(
-            self.inpaint_input_bias_var.get(),
-            "Input Bias",
-            min_value=0.0,
-            max_value=1.0,
-        )
-        fixed_steps = self._parse_inpaint_positive_float(
-            self.inpaint_inference_steps_var.get(),
-            "Inference steps",
-        )
-        dynamic_steps5 = self._parse_inpaint_positive_int(
-            self.inpaint_dynamic_visible_chunk_steps5_var.get(),
-            "Chunk @ 5.0 steps",
-        )
-        dynamic_steps6 = self._parse_inpaint_positive_int(
-            self.inpaint_dynamic_visible_chunk_steps6_var.get(),
-            "Chunk @ 6.0 steps",
-        )
-        dynamic_steps7 = self._parse_inpaint_positive_int(
-            self.inpaint_dynamic_visible_chunk_steps7_var.get(),
-            "Chunk @ 7.0 steps",
-        )
-        dynamic_steps8_plus = self._parse_inpaint_positive_int(
-            self.inpaint_dynamic_visible_chunk_steps8_plus_var.get(),
-            "Chunk @ 8.0+ steps",
-        )
-        dynamic_hold_divisor = self._parse_inpaint_positive_float(
-            self.inpaint_dynamic_hold_divisor_var.get(),
-            "Static Mask Divisor",
-        )
-        tile_mode = self.inpaint_tile_mode_var.get().strip() or "1 and 2"
-        if tile_mode not in {"1", "2", "1 and 2"}:
-            raise ValueError("Tile must be one of: 1, 2, 1 and 2.")
-
-        env_updates: dict[str, str] = {
-            "PYTHON": sys.executable,
-            "RUNNER": str(runner_path("batch_inpainting_runner.py")),
-            "INPUT_DIR": input_dir,
-            "OUTPUT_DIR": output_dir,
-            "GLOB": "*.mp4",
-            "REPLACE_MASK_FOLDER": mask_dir,
-            "USE_REPLACE_MASK": "1",
-            "OFFLOAD_TYPE": self.inpaint_cpu_offload_var.get().strip() or "model",
-            "CHUNK_SIZE": str(chunk_size),
-            "ENABLE_DYNAMIC_CHUNK": "1" if bool(self.inpaint_dynamic_chunk_var.get()) else "0",
-            "TILE_MODE": tile_mode,
-            "TILE1_MAX_SIZE": str(tile1_max_size),
-            "TILE2_MAX_SIZE": str(tile2_max_size),
-            "DYNAMIC_VISIBLE_CHUNK_STEPS5": str(dynamic_steps5),
-            "DYNAMIC_VISIBLE_CHUNK_STEPS6": str(dynamic_steps6),
-            "DYNAMIC_VISIBLE_CHUNK_STEPS7": str(dynamic_steps7),
-            "DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS": str(dynamic_steps8_plus),
-            "DYNAMIC_HOLD_DIVISOR": str(dynamic_hold_divisor),
-            "OVERLAP": str(overlap),
-            "TAIL_PAD": str(tail_pad),
-            "ORIGINAL_INPUT_BLEND_STRENGTH": str(input_bias),
-            "OUTPUT_CODEC": codec_value,
-            "OUTPUT_ENCODING_MODE": self._current_global_encoder_mode(),
-            "OUTPUT_EXTRA_ARGS": self._current_global_ffmpeg_extra_args(),
-            "NO_SHARPNESS_CSV": "0" if use_sharpness_csv else "1",
-            "SHARPNESS_BASE": sharp_base,
-            "SHARPNESS_CSV_PATH": sharp_csv_path,
-            "FIXED_STEPS": str(fixed_steps),
-            # Hardcoded unsupported features in this tab.
-            "ENABLE_POST_INPAINTING_BLEND": "0",
-            "DISABLE_COLOR_TRANSFER": "1",
-            "STOP_MARKER": os.path.join(
-                output_dir or os.path.join(work_dir, self.STANDARD_SUBDIRS["inpaint"]),
-                ".stop_after_current",
-            ),
-            "RETRY_POLICY_JSON": self._build_retry_policy_json(
-                self.inpaint_retry_policy_vars,
-                self.inpaint_cpu_offload_var.get().strip() or "model",
-            ),
-        }
-
-        cmd = ["bash", str(runner_path("run_inpainting_runner.sh"))]
-        preview = " ".join(
-            [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
-            + [shlex.quote(x) for x in cmd]
-        )
-        return cmd, env_updates, preview
+        return pm_builders.build_inpaint_runner_payload(self)
 
     def _preview_inpaint_command(self) -> None:
         try:
@@ -2904,6 +2824,206 @@ class PipelineMasterGUI:
                     pass
             self._log_queue.put(("inpaint_done", {"step": "inpaint", "success": step_success}))
 
+    def _start_inpaint_tile_benchmark(self) -> None:
+        if self._inpaint_thread and self._inpaint_thread.is_alive():
+            messagebox.showinfo("Benchmark", "Another inpainting task is running.")
+            return
+        if self._verify_running:
+            messagebox.showinfo("Benchmark", "Stop verification before benchmarking.")
+            return
+        script_path = utilities_path("benchmark_inpaint_tile1_vram.py")
+        if not script_path.is_file():
+            messagebox.showerror("Benchmark", f"Script not found:\n{script_path}")
+            return
+        input_dir = self.inpaint_input_var.get().strip()
+        mask_dir = self.inpaint_mask_var.get().strip()
+        sample_input = ""
+        sample_mask = ""
+        if input_dir and os.path.isdir(input_dir):
+            sample_files = self._collect_video_files_for_patterns(input_dir, self.VERIFY_VIDEO_PATTERNS)
+            for sample in sample_files:
+                mask_hits = sorted(glob.glob(os.path.join(mask_dir, f"{sample.stem}_replace_mask.*"))) if mask_dir else []
+                if mask_hits:
+                    sample_input = str(sample)
+                    sample_mask = mask_hits[0]
+                    break
+            if not sample_input and sample_files:
+                sample_input = str(sample_files[0])
+        bench_cfg_dir = repo_root() / "configs"
+        bench_cfg_dir.mkdir(parents=True, exist_ok=True)
+        raw_csv = bench_cfg_dir / "inpaint_tile1_chunk_benchmark_raw.csv"
+        json_out = bench_cfg_dir / "inpaint_tile1_chunk_benchmark.json"
+        if json_out.is_file():
+            rerun = messagebox.askyesno(
+                "Inpaint Tile Benchmark",
+                (
+                    "A tile benchmark already exists.\n\n"
+                    "Yes: rerun the benchmark.\n"
+                    "No: apply the safe Tile 1/Tile 2 values from the last benchmark."
+                ),
+            )
+            if not rerun:
+                try:
+                    self._apply_inpaint_tile_benchmark_results(json_out)
+                    self.inpaint_status_var.set("Benchmark values restored")
+                except Exception as exc:
+                    messagebox.showerror(
+                        "Inpaint Tile Benchmark",
+                        f"Could not apply the previous benchmark values:\n{exc}",
+                    )
+                return
+        warning = (
+            "This benchmark can take a long time, but it normally only needs to be "
+            "run once per machine/GPU.\n\n"
+            "Before starting, close other GPU-heavy apps and make sure VRAM is as "
+            "free as possible. The benchmark intentionally keeps increasing chunk "
+            "size until it finds the real OOM boundary."
+        )
+        if not messagebox.askyesno("Inpaint Tile Benchmark", warning + "\n\nStart benchmark now?"):
+            return
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--out-csv",
+            str(raw_csv),
+            "--json-out",
+            str(json_out),
+            "--adaptive-oom",
+            "--adaptive-scales",
+            "100,90,80,70,60,50",
+            "--adaptive-tiles",
+            "1,2",
+            "--adaptive-start-chunk-tile1",
+            "20",
+            "--adaptive-start-chunk-tile2",
+            "50",
+            "--adaptive-step",
+            "5",
+            "--tile-num",
+            "1",
+            "--steps",
+            "1",
+            "--tail-pad",
+            self.inpaint_tail_pad_var.get().strip() or "1",
+            "--overlap",
+            self.inpaint_overlap_var.get().strip() or "2",
+            "--include-decode",
+            "--synthetic-mask-ratio",
+            "0.20",
+            "--offload-type",
+            self.inpaint_cpu_offload_var.get().strip() or "none",
+            "--retry-policy-json",
+            self._build_retry_policy_json(
+                self.inpaint_retry_policy_vars,
+                self.inpaint_cpu_offload_var.get().strip() or "none",
+            ),
+            "--allocator-profile",
+            "run",
+        ]
+        if sample_input:
+            cmd.extend(["--sample-input", sample_input])
+        if sample_mask:
+            cmd.extend(["--sample-mask", sample_mask])
+        elif mask_dir:
+            cmd.extend(["--sample-mask-folder", mask_dir])
+        self._inpaint_stop_requested = False
+        self._inpaint_stop_clicks = 0
+        self.inpaint_status_var.set("Running inpaint tile benchmark...")
+        self.inpaint_progress_var.set(0.0)
+        self._set_inpaint_running(True)
+        self._append_inpaint_log("=== Inpaint tile benchmark started ===")
+        if sample_input:
+            self._append_inpaint_log(f"[BENCH] sample input: {sample_input}")
+            self._append_inpaint_log(f"[BENCH] sample mask: {sample_mask or '(auto/none)'}")
+        else:
+            self._append_inpaint_log("[BENCH] no sample input found; using synthetic 20% mask benchmark")
+        self._append_inpaint_log("CMD: " + " ".join(shlex.quote(x) for x in cmd))
+        self._inpaint_stop_marker_path = ""
+        self._inpaint_thread = threading.Thread(
+            target=self._run_inpaint_benchmark_worker,
+            args=(cmd, str(json_out)),
+            daemon=True,
+        )
+        self._inpaint_thread.start()
+
+    def _run_inpaint_benchmark_worker(self, cmd: list[str], json_out: str) -> None:
+        proc = None
+        step_success = False
+        try:
+            preexec = os.setsid if hasattr(os, "setsid") else None
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                preexec_fn=preexec,
+            )
+            self._inpaint_process = proc
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip("\n")
+                if line:
+                    self._log_queue.put(("inpaint_line", f"[BENCH] {line}"))
+            rc = proc.wait()
+            if self._inpaint_stop_requested:
+                self._log_queue.put(("inpaint_status", "Benchmark stopped by user"))
+            elif rc == 0:
+                step_success = True
+                self._log_queue.put(("inpaint_status", "Benchmark completed"))
+                self._log_queue.put(("inpaint_progress", "100"))
+                self._log_queue.put(("inpaint_line", f"[BENCH] output: {json_out}"))
+            else:
+                self._log_queue.put(("inpaint_status", f"Benchmark failed (exit {rc})"))
+        except Exception as exc:
+            self._log_queue.put(("inpaint_line", f"[BENCH][ERROR] {exc}"))
+            self._log_queue.put(("inpaint_status", "Benchmark failed"))
+        finally:
+            self._inpaint_process = None
+            if proc and proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            self._log_queue.put(("inpaint_done", {"step": "benchmark", "success": step_success, "json_out": json_out}))
+
+    @staticmethod
+    def _format_benchmark_chunk_values(raw_values: object) -> str:
+        if not isinstance(raw_values, list):
+            raise ValueError("Expected a list of six chunk values.")
+        values: list[str] = []
+        for raw in raw_values[:6]:
+            value = int(float(raw))
+            if value < 1:
+                raise ValueError("Chunk values must be positive.")
+            values.append(str(value))
+        if not values:
+            raise ValueError("No chunk values found.")
+        while len(values) < 6:
+            values.append(values[-1])
+        return ",".join(values)
+
+    def _apply_inpaint_tile_benchmark_results(self, json_path: object) -> None:
+        path = Path(str(json_path or "")).expanduser()
+        if not path.is_absolute():
+            path = repo_root() / path
+        if not path.is_file():
+            raise FileNotFoundError(f"Benchmark JSON not found: {path}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Benchmark JSON is not an object.")
+        tile1_values = self._format_benchmark_chunk_values(payload.get("tile1_max_chunks"))
+        tile2_values = self._format_benchmark_chunk_values(payload.get("tile2_max_chunks"))
+        self.inpaint_tile1_max_size_var.set(tile1_values)
+        self.inpaint_tile2_max_size_var.set(tile2_values)
+        self._save_config()
+        self._preview_inpaint_command()
+        self._append_inpaint_log(
+            f"[BENCH] Applied safe defaults from benchmark: tile1={tile1_values} tile2={tile2_values}"
+        )
+        self._append_inpaint_log("[BENCH] Runtime uses the visible GUI values; manual edits override the benchmark.")
+
     def _start_inpaint_sharpness_csv(self, resume_inpaint_after: bool = False) -> None:
         # Enable auto-resume only when Sharpness CSV is launched as Inpaint preflight.
         self._inpaint_resume_after_sharpness = False
@@ -3044,36 +3164,7 @@ class PipelineMasterGUI:
             self._log_queue.put(("inpaint_done", {"step": "sharpness_csv", "success": step_success}))
 
     def _build_inpaint_sharpen_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
-        output_dir = self.inpaint_sharpen_output_var.get().strip()
-        env_updates: dict[str, str] = {
-            "PYTHON": sys.executable,
-            "RUNNER": str(runner_path("batch_inpaint_sharpen_runner.py")),
-            "INPUT_DIR": self.inpaint_output_var.get().strip(),
-            "MASK_DIR": self.inpaint_mask_var.get().strip(),
-            "OUTPUT_DIR": output_dir,
-            "SHARPNESS_CSV_PATH": self.inpaint_sharpness_csv_var.get().strip(),
-            "GLOB": "*.mp4",
-            "WORKERS": self.inpaint_sharpen_workers_var.get().strip() or "19",
-            "STOP_MARKER": os.path.join(
-                output_dir or os.path.join(
-                    self.work_folder_var.get().strip() or "./work",
-                    self.STANDARD_SUBDIRS["inpaint_sharpen"],
-                ),
-                ".stop_after_current",
-            ),
-            "SKIP_EXISTING": "1",
-            "OUTPUT_CODEC": "libx264",
-            "OUTPUT_PRESET": "fast",
-            "OUTPUT_PIX_FMT": "yuv444p",
-            "OUTPUT_CRF": "0",
-            "OUTPUT_EXTRA_ARGS": "",
-        }
-        cmd = ["bash", str(runner_path("run_inpaint_sharpen_runner.sh"))]
-        preview = " ".join(
-            [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
-            + [shlex.quote(x) for x in cmd]
-        )
-        return cmd, env_updates, preview
+        return pm_builders.build_inpaint_sharpen_runner_payload(self)
 
     def _start_inpaint_sharpen(self, resume_after_sharpness: bool = False) -> None:
         self._inpaint_resume_after_sharpen = False
@@ -3713,6 +3804,7 @@ class PipelineMasterGUI:
         self.inpaint_preview_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
         self.inpaint_sharp_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
         self.inpaint_run_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
+        self.inpaint_benchmark_btn.configure(state=tk.DISABLED if is_running else tk.NORMAL)
         sharpen_run_state = tk.DISABLED if (is_running or not self._sharpen_step_enabled_in_current_mode()) else tk.NORMAL
         self.inpaint_sharpen_run_btn.configure(state=sharpen_run_state)
         self.inpaint_stop_btn.configure(state=tk.NORMAL if is_running else tk.DISABLED)
@@ -4487,78 +4579,7 @@ class PipelineMasterGUI:
         self._refresh_pipeline_status_panel()
 
     def _build_merge_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
-        output_dir = self.merge_output_var.get().strip()
-        workers = self._get_merge_worker_count()
-        use_parallel = workers >= 2
-        ct_mode = self.merge_ct_auto_mode_var.get().strip() or "CSV Blend"
-        preferred_inpainted_dir = self._preferred_inpainted_dir_for_consumers()
-        output_format_ui = self.merge_output_format_var.get().strip()
-        output_format_runner = (
-            "Half SBS (Left-Right)"
-            if output_format_ui == "Half SBS"
-            else "Full SBS (Left-Right)"
-        )
-        codec_value = self._normalize_ffmpeg_codec(
-            self.merge_codec_var.get(),
-            self.DEFAULT_SCENE_CODEC,
-        )
-        self.merge_codec_var.set(codec_value)
-        env_updates: dict[str, str] = {
-            "PYTHON": sys.executable,
-            "RUNNER": str(
-                runner_path(
-                    "merging_nogui_batch_parallel.py" if use_parallel else "merging_nogui_batch.py"
-                )
-            ),
-            "INPAINTED_FOLDER": self.merge_inpainted_var.get().strip(),
-            "PREFERRED_INPAINTED_FOLDER": preferred_inpainted_dir,
-            "SPLATTED_FOLDER": self.merge_splatted_var.get().strip(),
-            "ORIGINAL_FOLDER": self.merge_original_var.get().strip(),
-            "OUTPUT_FOLDER": output_dir,
-            "REPLACE_MASK_FOLDER": self.merge_replace_mask_var.get().strip(),
-            "PREPROCESSED_MASK_FOLDER": self.merge_mask_formerge_var.get().strip(),
-            "CT_PRESET": self.merge_ct_preset_var.get().strip() or "1",
-            "CT_AUTO_MODE": ct_mode,
-            "CT_CSV_BLEND_PATH": self.merge_autoct_csv_var.get().strip(),
-            "OUTPUT_FORMAT": output_format_runner,
-            "CHUNK_SIZE": self.merge_chunks_var.get().strip() or "20",
-            "USE_GPU": "1" if self.merge_use_gpu_var.get() else "0",
-            "CT_EXCLUDE_BLACK_IN_TARGET": "1" if self.merge_ct_exclude_black_var.get() else "0",
-            "CT_STRENGTH": "1",
-            "CT_BLACK_THRESH": "0",
-            "CT_MIN_VALID_RATIO": "0",
-            "CT_MIN_VALID": "0",
-            "CT_RING_WIDTH": "20",
-            "CT_CLAMP_L_MIN": "0.1",
-            "CT_CLAMP_L_MAX": "2",
-            "CT_CLAMP_AB_MIN": "0.1",
-            "CT_CLAMP_AB_MAX": "3",
-            "PAD_TO_16_9": "0",
-            "ADD_BORDERS": "0",
-            "STOP_MARKER": os.path.join(output_dir or "./work/sbs", ".stop_after_current"),
-            "MERGE_DEBUG": "0",
-            "FFMPEG_CODEC": codec_value,
-            "ENCODING_MODE": self._current_global_encoder_mode(),
-            "FFMPEG_EXTRA_ARGS": self._current_global_ffmpeg_extra_args(),
-            "RESTART_EVERY": "1",
-        }
-        if use_parallel:
-            env_updates["WORKERS"] = str(workers)
-        cmd = [
-            "bash",
-            str(
-                runner_path(
-                    "run_merging_nogui_batch_parallel.sh"
-                    if use_parallel
-                    else "run_merging_nogui_batch.sh"
-                )
-            ),
-        ]
-        preview = " ".join(
-            [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
-            + [shlex.quote(x) for x in cmd]
-        )
-        return cmd, env_updates, preview
+        return pm_builders.build_merge_runner_payload(self)
 
     def _preview_merge_command(self) -> None:
         try:
@@ -4579,45 +4600,7 @@ class PipelineMasterGUI:
         self.merge_log_text.configure(state=tk.DISABLED)
 
     def _build_mask_formerge_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
-        mask_workers_raw = self.merge_mask_formerge_workers_var.get().strip()
-        try:
-            mask_workers = max(1, int(mask_workers_raw))
-        except Exception:
-            autoct_raw = self.merge_autoct_workers_var.get().strip()
-            try:
-                mask_workers = max(1, int(autoct_raw))
-            except Exception:
-                mask_workers = 8
-        if str(mask_workers) != mask_workers_raw:
-            self.merge_mask_formerge_workers_var.set(str(mask_workers))
-        env_updates: dict[str, str] = {
-            "PYTHON": sys.executable,
-            "RUNNER": str(runner_path("mask_formerge_nogui.py")),
-            "REPLACE_MASK_FOLDER": self.merge_replace_mask_var.get().strip(),
-            "OUTPUT_FOLDER": self.merge_mask_formerge_var.get().strip(),
-            "INPUT_GLOB": "*_replace_mask.*",
-            "WORKERS": str(mask_workers),
-            "CHUNK_SIZE": self.merge_chunks_var.get().strip() or "20",
-            "USE_GPU": "1" if bool(self.merge_use_gpu_var.get()) else "0",
-            "MASK_BINARIZE_THRESHOLD": self.merge_mask_binarize_var.get().strip() or "0.5",
-            "MASK_DILATE_KERNEL_SIZE": self.merge_mask_dilate_var.get().strip() or "2",
-            "MASK_BLUR_KERNEL_SIZE": self.merge_mask_blur_var.get().strip() or "4",
-            "SHADOW_LENGTH_PX": self.merge_shadow_length_var.get().strip() or "25",
-            "SHADOW_CURVE": self.merge_shadow_curve_var.get().strip() or "0",
-            "SHADOW_WIDTH_ADAPTIVE": "1" if bool(self.merge_dynamic_shadow_width_var.get()) else "0",
-            "SKIP_EXISTING": "1",
-            "STOP_MARKER": os.path.join(
-                self.merge_mask_formerge_var.get().strip() or "./work/mask_for_merge",
-                ".stop_after_current",
-            ),
-        }
-        cmd = ["/usr/bin/env", "bash", str(runner_path("run_mask_formerge_nogui.sh"))]
-        preview = (
-            " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items())
-            + " "
-            + " ".join(shlex.quote(x) for x in cmd)
-        )
-        return cmd, env_updates, preview
+        return pm_builders.build_mask_formerge_runner_payload(self)
 
     def _run_merge_mask_placeholder(self) -> None:
         if self._merge_thread and self._merge_thread.is_alive():
@@ -6260,97 +6243,19 @@ class PipelineMasterGUI:
         return self._quality_flag_for_codec(encoder, "hevc_nvenc", "cq")
 
     def _join_layout_for_seg_mono(self) -> str:
-        return "half_sbs" if self.merge_output_format_var.get().strip() == "Half SBS" else "full_sbs"
+        return pm_builders.join_layout_for_seg_mono(self)
 
     def _build_join_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
-        out_path = self.join_output_var.get().strip()
-        quality_value = self.join_crf_var.get().strip() or "12"
-        encoder = self._normalize_ffmpeg_codec(self.join_encoder_var.get(), "hevc_nvenc")
-        self.join_encoder_var.set(encoder)
-        preset = self.join_preset_var.get().strip() or "p7"
-        pix_fmt = self.join_pix_fmt_var.get().strip() or "yuv420p"
-        extra_args = self.join_extra_args_var.get().strip()
-        quality_flag = self._join_quality_flag()
-
-        env_updates: dict[str, str] = {
-            "DIR_SBS": self.join_input_var.get().strip(),
-            "PATTERN": "*_sbs.mp4",
-            "OUT": out_path,
-            "FFMPEG_BIN": "ffmpeg",
-            "ENCODER": encoder,
-            "PRESET": preset,
-            "QUALITY_FLAG": quality_flag,
-            "QUALITY_VALUE": quality_value,
-            "CQ": quality_value,
-            "CRF": quality_value,
-            "PIX_FMT": pix_fmt,
-            "EXTRA_ARGS": extra_args,
-            # Force final height to 1080 while preserving center framing:
-            # if shorter -> pad, if taller (e.g. temporary crop pad) -> crop.
-            "VF": "pad=iw:max(ih\\,1080):0:(max(ih\\,1080)-ih)/2:black,crop=iw:1080:0:(ih-1080)/2",
-        }
-        cmd = ["bash", str(utilities_path("Rejoin_HEVC_NVENC.sh"))]
-        preview = " ".join(
-            [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
-            + [shlex.quote(x) for x in cmd]
-        )
-        return cmd, env_updates, preview
+        return pm_builders.build_join_runner_payload(self)
 
     def _default_remux_output_path(self) -> str:
-        source_path = self.scene_input_var.get().strip()
-        join_path = self.join_output_var.get().strip()
-        if join_path:
-            out_dir = Path(join_path).resolve().parent
-        else:
-            work_dir = Path(self.work_folder_var.get().strip() or "./work").resolve()
-            out_dir = work_dir / self.STANDARD_SUBDIRS["join"]
-        src_stem = Path(source_path).stem if source_path else "source"
-        return str((out_dir / f"{src_stem}_3D_remux.mkv").resolve())
+        return pm_builders.default_remux_output_path(self)
 
     def _build_join_remux_payload(self) -> tuple[list[str], dict[str, str], str, str]:
-        source_path = self.scene_input_var.get().strip()
-        video_3d_path = self.join_output_var.get().strip()
-        out_path = self._default_remux_output_path()
-        env_updates: dict[str, str] = {
-            "SOURCE_FILE": source_path,
-            "VIDEO_3D_FILE": video_3d_path,
-            "OUT_FILE": out_path,
-            "MKVMERGE_BIN": "mkvmerge",
-            "OVERWRITE": "1",
-        }
-        cmd = ["bash", str(utilities_path("remux_replace_video_mkvtoolnix.sh"))]
-        preview = " ".join(
-            [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
-            + [shlex.quote(x) for x in cmd]
-        )
-        return cmd, env_updates, preview, out_path
+        return pm_builders.build_join_remux_payload(self)
 
     def _build_join_prepare_mono_cmd(self) -> list[str]:
-        merge_codec = self._normalize_ffmpeg_codec(
-            self.merge_codec_var.get(),
-            self.scene_codec_var.get().strip() or self.DEFAULT_SCENE_CODEC,
-        )
-        self.merge_codec_var.set(merge_codec)
-        return [
-            sys.executable,
-            str(utilities_path("prepare_seg_mono_to_sbs.py")),
-            "--seg-mono-dir",
-            str(Path(self.join_seg_mono_var.get().strip()).resolve()),
-            "--sbs-dir",
-            str(Path(self.join_input_var.get().strip()).resolve()),
-            "--layout",
-            self._join_layout_for_seg_mono(),
-            "--ffmpeg-bin",
-            "ffmpeg",
-            "--ffprobe-bin",
-            "ffprobe",
-            "--codec",
-            merge_codec,
-            "--encoder-mode",
-            self._current_global_encoder_mode(),
-            "--extra-ffmpeg-args",
-            self._current_global_ffmpeg_extra_args(),
-        ]
+        return pm_builders.build_join_prepare_mono_cmd(self)
 
     def _preview_join_command(self) -> None:
         try:
@@ -7208,13 +7113,13 @@ class PipelineMasterGUI:
                 out_row["worker_mode"] = self._normalize_depth_runtime_mode(
                     raw.get("worker_mode", out_row["worker_mode"])
                 )
-            if "window_size" in out_row:
-                out_row["window_size"] = self._normalize_depth_retry_window_size(
-                    raw.get("window_size", out_row["window_size"])
+            if "window_offset" in out_row:
+                out_row["window_offset"] = self._normalize_depth_retry_offset(
+                    raw.get("window_offset", out_row["window_offset"])
                 )
-            if "overlap" in out_row:
-                out_row["overlap"] = self._normalize_depth_retry_overlap(
-                    raw.get("overlap", out_row["overlap"])
+            if "overlap_offset" in out_row:
+                out_row["overlap_offset"] = self._normalize_depth_retry_offset(
+                    raw.get("overlap_offset", out_row["overlap_offset"])
                 )
             out[profile] = out_row
         return out
@@ -7255,13 +7160,13 @@ class PipelineMasterGUI:
                 payload["worker_mode"] = self._normalize_depth_runtime_mode(
                     row["worker_mode"].get()
                 )
-            if "window_size" in row:
-                payload["window_size"] = self._normalize_depth_retry_window_size(
-                    row["window_size"].get()
+            if "window_offset" in row:
+                payload["window_offset"] = self._normalize_depth_retry_offset(
+                    row["window_offset"].get()
                 )
-            if "overlap" in row:
-                payload["overlap"] = self._normalize_depth_retry_overlap(
-                    row["overlap"].get()
+            if "overlap_offset" in row:
+                payload["overlap_offset"] = self._normalize_depth_retry_offset(
+                    row["overlap_offset"].get()
                 )
             out[profile] = payload
         return out
@@ -7302,22 +7207,32 @@ class PipelineMasterGUI:
                 )
                 out[profile]["worker_mode"] = worker_mode
                 out[profile]["worker_script"] = self._resolve_depth_worker_script(worker_mode)
-            if "window_size" in row:
-                out[profile]["window_size"] = int(
+            if "window_offset" in row:
+                base_window = int(
                     self._normalize_depth_retry_window_size(
-                        self.depth_chunk_size_var.get()
-                        if is_depth_run_row
-                        else row["window_size"].get()
+                        self.depth_chunk_size_var.get(),
+                        "65",
                     )
                 )
-            if "overlap" in row:
-                out[profile]["overlap"] = int(
+                window_offset = int(
+                    self._normalize_depth_retry_offset(
+                        "0" if is_depth_run_row else row["window_offset"].get()
+                    )
+                )
+                out[profile]["window_size"] = max(1, base_window + window_offset)
+            if "overlap_offset" in row:
+                base_overlap = int(
                     self._normalize_depth_retry_overlap(
-                        self.depth_overlap_var.get()
-                        if is_depth_run_row
-                        else row["overlap"].get()
+                        self.depth_overlap_var.get(),
+                        "15",
                     )
                 )
+                overlap_offset = int(
+                    self._normalize_depth_retry_offset(
+                        "0" if is_depth_run_row else row["overlap_offset"].get()
+                    )
+                )
+                out[profile]["overlap"] = max(0, base_overlap + overlap_offset)
         return out
 
     def _build_retry_policy_json(
@@ -7346,10 +7261,10 @@ class PipelineMasterGUI:
                 row["cpu_offload_mode"].set(str(drow["cpu_offload_mode"]))
                 if "worker_mode" in row and "worker_mode" in drow:
                     row["worker_mode"].set(str(drow["worker_mode"]))
-                if "window_size" in row and "window_size" in drow:
-                    row["window_size"].set(str(drow["window_size"]))
-                if "overlap" in row and "overlap" in drow:
-                    row["overlap"].set(str(drow["overlap"]))
+                if "window_offset" in row and "window_offset" in drow:
+                    row["window_offset"].set(str(drow["window_offset"]))
+                if "overlap_offset" in row and "overlap_offset" in drow:
+                    row["overlap_offset"].set(str(drow["overlap_offset"]))
 
     def _save_config_if_ready(self) -> None:
         if not getattr(self, "_config_save_ready", False):
@@ -7363,12 +7278,6 @@ class PipelineMasterGUI:
         inherited_worker_mode = self._normalize_depth_runtime_mode(
             self.depth_runtime_mode_var.get()
         )
-        inherited_window = self._normalize_depth_retry_window_size(
-            self.depth_chunk_size_var.get().strip() or "65"
-        )
-        inherited_overlap = self._normalize_depth_retry_overlap(
-            self.depth_overlap_var.get().strip() or "15"
-        )
         for profile in self.RETRY_POLICY_PROFILES:
             row = self.depth_retry_policy_vars.get(profile)
             if row is None:
@@ -7381,10 +7290,6 @@ class PipelineMasterGUI:
             row["cpu_offload_mode"].set(inherited_offload)
             if "worker_mode" in row:
                 row["worker_mode"].set(inherited_worker_mode)
-            if "window_size" in row:
-                row["window_size"].set(inherited_window)
-            if "overlap" in row:
-                row["overlap"].set(inherited_overlap)
 
     def _set_depth_retry_widget_states(self) -> None:
         for profile in self.RETRY_POLICY_PROFILES:
@@ -7398,7 +7303,7 @@ class PipelineMasterGUI:
             overlap = self._depth_retry_overlap_widgets.get(profile)
             inherited_toggle = self._depth_retry_inherited_widgets.get(profile)
             combo_state = tk.DISABLED if inherited else "readonly"
-            entry_state = tk.DISABLED if inherited else tk.NORMAL
+            entry_state = tk.DISABLED if inherited else "readonly"
             if offload is not None:
                 offload.configure(state=combo_state)
             if worker is not None:
@@ -7454,8 +7359,8 @@ class PipelineMasterGUI:
             header.extend(
                 [
                     ("script", "Script"),
-                    ("window", "Window"),
-                    ("overlap", "Overlap"),
+                    ("window", "Chunk Δ"),
+                    ("overlap", "Overlap Δ"),
                 ]
             )
         if show_inherited:
@@ -7518,23 +7423,25 @@ class PipelineMasterGUI:
                 worker_combo.grid(row=ridx, column=col, sticky="w", pady=2)
                 worker_combo.bind("<<ComboboxSelected>>", lambda _e: change_cb())
                 col += 1
-                window_entry = ttk.Entry(
+                window_entry = ttk.Combobox(
                     parent,
-                    textvariable=row["window_size"],
+                    textvariable=row["window_offset"],
+                    values=self.DEPTH_RETRY_OFFSET_CHOICES,
+                    state="readonly",
                     width=6,
                 )
                 window_entry.grid(row=ridx, column=col, sticky="w", pady=2)
-                window_entry.bind("<FocusOut>", lambda _e: change_cb())
-                window_entry.bind("<Return>", lambda _e: change_cb())
+                window_entry.bind("<<ComboboxSelected>>", lambda _e: change_cb())
                 col += 1
-                overlap_entry = ttk.Entry(
+                overlap_entry = ttk.Combobox(
                     parent,
-                    textvariable=row["overlap"],
+                    textvariable=row["overlap_offset"],
+                    values=self.DEPTH_RETRY_OFFSET_CHOICES,
+                    state="readonly",
                     width=6,
                 )
                 overlap_entry.grid(row=ridx, column=col, sticky="w", pady=2)
-                overlap_entry.bind("<FocusOut>", lambda _e: change_cb())
-                overlap_entry.bind("<Return>", lambda _e: change_cb())
+                overlap_entry.bind("<<ComboboxSelected>>", lambda _e: change_cb())
                 self._depth_retry_worker_widgets[profile] = worker_combo
                 self._depth_retry_window_widgets[profile] = window_entry
                 self._depth_retry_overlap_widgets[profile] = overlap_entry
@@ -8626,68 +8533,19 @@ class PipelineMasterGUI:
         self._pipeline_start_resume()
 
     def _default_pipeline_step_state(self) -> dict[str, dict[str, object]]:
-        return {
-            key: {"completed": False, "verified": "none"}
-            for key, _ in self.PIPELINE_STEPS
-        }
+        return pm_state.default_pipeline_step_state(self)
 
     def _pipeline_state_path(self) -> Path:
-        work_dir = self.work_folder_var.get().strip() or "./work"
-        return Path(work_dir).resolve() / self.PIPELINE_STATE_FILENAME
+        return pm_state.pipeline_state_path(self)
 
     def _load_pipeline_state(self) -> None:
-        state_path = self._pipeline_state_path()
-        self._pipeline_step_state = self._default_pipeline_step_state()
-        if state_path.is_file():
-            try:
-                data = json.loads(state_path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    steps = data.get("steps")
-                    if isinstance(steps, dict):
-                        for key, _label in self.PIPELINE_STEPS:
-                            entry = steps.get(key)
-                            if isinstance(entry, dict):
-                                self._pipeline_step_state[key]["completed"] = bool(entry.get("completed", False))
-                                ver = str(entry.get("verified", "none")).strip().lower()
-                                if ver in {"quick", "deep"}:
-                                    self._pipeline_step_state[key]["verified"] = "quick"
-                                else:
-                                    self._pipeline_step_state[key]["verified"] = "none"
-                    verify_after = str(data.get("verify_after", "")).strip()
-                    if verify_after in self.PIPELINE_VERIFY_CHOICES:
-                        self.pipeline_verify_after_var.set(verify_after)
-                    elif verify_after.lower() == "deep":
-                        self.pipeline_verify_after_var.set("Quick")
-            except Exception:
-                pass
-        self._sync_pipeline_csv_done_flags()
-        self._refresh_pipeline_status_panel()
+        pm_state.load_pipeline_state(self)
 
     def _save_pipeline_state(self) -> None:
-        state_path = self._pipeline_state_path()
-        try:
-            state_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "verify_after": self.pipeline_verify_after_var.get().strip(),
-                "steps": self._pipeline_step_state,
-            }
-            state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        pm_state.save_pipeline_state(self)
 
     def _is_pipeline_step_required(self, step: str) -> bool:
-        if self._pipeline_test_active and step in {"mono_to_sbs", "join", "remux"}:
-            return False
-        if step == "sharpness_csv":
-            return (
-                self.inpaint_mode_var.get().strip() == "Auto (recommended)"
-                or bool(self.inpaint_use_sharpness_csv_var.get())
-            )
-        if step == "sharpen":
-            return self._sharpen_step_enabled_in_current_mode()
-        if step == "autoct_csv":
-            return self.merge_ct_auto_mode_var.get().strip() == "CSV Blend"
-        return True
+        return pm_state.is_pipeline_step_required(self, step)
 
     def _refresh_pipeline_status_panel(self) -> None:
         if self._pipeline_test_active:
@@ -8797,7 +8655,7 @@ class PipelineMasterGUI:
         self.depth_mode_var.set("Auto (recommended)")
         self.depth_chunk_size_var.set("65")
         self.depth_overlap_var.set("15")
-        self.depth_inference_steps_var.set("5")
+        self.depth_inference_steps_var.set("4")
         self.depth_cpu_offload_var.set("model")
         self.depth_seed_var.set("42")
         self.depth_guidance_scale_var.set("1.0")
@@ -8824,10 +8682,12 @@ class PipelineMasterGUI:
         self.inpaint_frames_chunk_var.set("22")
         self._inpaint_chunk_manual_cache = "22"
         self.inpaint_dynamic_chunk_var.set(True)
-        self.inpaint_cpu_offload_var.set("model")
+        self.inpaint_cpu_offload_var.set("none")
         self.inpaint_tile_mode_var.set("1 and 2")
-        self.inpaint_tile1_max_size_var.set("22")
-        self.inpaint_tile2_max_size_var.set("55")
+        self.inpaint_tile1_max_size_var.set("4,26,33,44,61,89")
+        self.inpaint_tile2_max_size_var.set("72,87,108,118,118,118")
+        self.inpaint_dynamic_resolution_var.set(True)
+        self.inpaint_resolution_limit_var.set("90%")
         self.inpaint_dynamic_visible_chunk_steps5_var.set(
             self.INPAINT_DYNAMIC_VISIBLE_CHUNK_STEPS5_DEFAULT
         )
@@ -8889,11 +8749,7 @@ class PipelineMasterGUI:
         step: str,
         value: bool,
     ) -> None:
-        if step not in state:
-            return
-        state[step]["completed"] = bool(value)
-        if not value:
-            state[step]["verified"] = "none"
+        pm_state.pipeline_set_completed_in_state(state, step, value)
 
     @staticmethod
     def _pipeline_set_verified_in_state(
@@ -8901,10 +8757,7 @@ class PipelineMasterGUI:
         step: str,
         mode: str,
     ) -> None:
-        if step not in state:
-            return
-        mode_low = str(mode).strip().lower()
-        state[step]["verified"] = "quick" if mode_low in {"quick", "deep"} else "none"
+        pm_state.pipeline_set_verified_in_state(state, step, mode)
 
     def _pipeline_set_completed(self, step: str, value: bool) -> None:
         self._pipeline_set_completed_in_state(self._pipeline_step_state, step, value)
@@ -8914,10 +8767,7 @@ class PipelineMasterGUI:
 
     @staticmethod
     def _pipeline_verified_rank(mode: str) -> int:
-        mode_low = str(mode).strip().lower()
-        if mode_low == "quick":
-            return 1
-        return 0
+        return pm_state.pipeline_verified_rank(mode)
 
     def _pipeline_set_verified_best_in_state(
         self,
@@ -8925,12 +8775,7 @@ class PipelineMasterGUI:
         step: str,
         mode: str,
     ) -> None:
-        if step not in state:
-            return
-        mode_low = "quick" if str(mode).strip().lower() in {"quick", "deep"} else "none"
-        current = str(state[step].get("verified", "none"))
-        if self._pipeline_verified_rank(mode_low) >= self._pipeline_verified_rank(current):
-            self._pipeline_set_verified_in_state(state, step, mode_low)
+        pm_state.pipeline_set_verified_best_in_state(state, step, mode)
 
     def _pipeline_set_verified_best(self, step: str, mode: str) -> None:
         self._pipeline_set_verified_best_in_state(self._pipeline_step_state, step, mode)
@@ -8939,15 +8784,10 @@ class PipelineMasterGUI:
         self,
         state: dict[str, dict[str, object]],
     ) -> None:
-        sharp_done = Path(self.inpaint_sharpness_csv_var.get().strip()).is_file()
-        autoct_done = Path(self.merge_autoct_csv_var.get().strip()).is_file()
-        self._pipeline_set_completed_in_state(state, "sharpness_csv", sharp_done)
-        self._pipeline_set_completed_in_state(state, "autoct_csv", autoct_done)
-        self._pipeline_set_verified_in_state(state, "sharpness_csv", "none")
-        self._pipeline_set_verified_in_state(state, "autoct_csv", "none")
+        pm_state.sync_pipeline_csv_done_flags_in_state(self, state)
 
     def _sync_pipeline_csv_done_flags(self) -> None:
-        self._sync_pipeline_csv_done_flags_in_state(self._pipeline_step_state)
+        pm_state.sync_pipeline_csv_done_flags(self)
 
     def _pipeline_mark_previous_steps_done_verified_in_state(
         self,
@@ -8955,17 +8795,9 @@ class PipelineMasterGUI:
         step: str,
         mode: str,
     ) -> None:
-        step_keys = [k for k, _ in self.PIPELINE_STEPS]
-        if step not in step_keys:
-            return
-        target_mode = "quick" if str(mode).strip().lower() in {"quick", "deep"} else "none"
-        upto_idx = step_keys.index(step)
-        for k in step_keys[: upto_idx + 1]:
-            if k in self.PIPELINE_CSV_STEPS:
-                continue
-            self._pipeline_set_completed_in_state(state, k, True)
-            if k in self.PIPELINE_STEPS_WITH_VERIFY:
-                self._pipeline_set_verified_best_in_state(state, k, target_mode)
+        pm_state.pipeline_mark_previous_steps_done_verified_in_state(
+            self, state, step, mode
+        )
 
     def _pipeline_mark_previous_steps_done_verified(self, step: str, mode: str) -> None:
         self._pipeline_mark_previous_steps_done_verified_in_state(
@@ -8978,14 +8810,9 @@ class PipelineMasterGUI:
         step: str,
         include_current: bool = True,
     ) -> None:
-        step_keys = [k for k, _ in self.PIPELINE_STEPS]
-        if step not in step_keys:
-            return
-        start = step_keys.index(step)
-        if not include_current:
-            start += 1
-        for k in step_keys[start:]:
-            self._pipeline_set_completed_in_state(state, k, False)
+        pm_state.pipeline_invalidate_from_in_state(
+            self, state, step, include_current=include_current
+        )
 
     def _pipeline_invalidate_from(self, step: str, include_current: bool = True) -> None:
         self._pipeline_invalidate_from_in_state(
@@ -10083,239 +9910,34 @@ class PipelineMasterGUI:
         return True
 
     def _pipeline_start_resume(self) -> None:
-        if self._any_pipeline_activity():
-            messagebox.showinfo("Start/Resume", "Another task is currently running.")
-            self._pipeline_sync_noninteractive_mode()
-            return
-        self._pipeline_pause_after_split_scenes = False
-        if not self._pipeline_test_active and self._pipeline_split_scenes_gate_pending():
-            gate_msg = (
-                "Pipeline will pause after Split Scenes verification.\n\n"
-                "When Split Scenes verify is done, move clips you do NOT want to convert "
-                "into the seg-mono folder.\n\n"
-                "Then press Start/Resume again to continue."
-            )
-            self._append_pipeline_popup_log("INFO", "Start/Resume", gate_msg)
-            self._show_pipeline_force_info("Start/Resume", gate_msg)
-            self._pipeline_pause_after_split_scenes = True
-        self._pipeline_ui_noninteractive = True
-        self._append_pipeline_popup_log(
-            "INFO",
-            "Start/Resume",
-            "Non-interactive mode enabled: popups are suppressed and routed to this log.",
-        )
-        self._pipeline_reset_skip_notices()
-        self._pipeline_autorun = True
-        self._pipeline_pending_action = None
-        self.pipeline_run_status_var.set("Start/Resume running...")
-        self._pipeline_trigger_next_action()
+        pm_orchestrator.pipeline_start_resume(self)
 
     def _pipeline_split_scenes_gate_pending(self) -> bool:
-        st = self._pipeline_step_state.get("split_scenes", {"completed": False, "verified": "none"})
-        if not bool(st.get("completed", False)):
-            return True
-        verify_mode = self.pipeline_verify_after_var.get().strip().lower()
-        verified = str(st.get("verified", "none")).strip().lower()
-        if verify_mode == "quick":
-            return verified != "quick"
-        return False
+        return pm_orchestrator.pipeline_split_scenes_gate_pending(self)
 
     def _pipeline_reset_skip_notices(self) -> None:
-        self._pipeline_skip_notice_steps.clear()
+        pm_orchestrator.pipeline_reset_skip_notices(self)
 
     def _pipeline_maybe_log_completed_autoct_skip(self, next_step: str) -> None:
-        if "autoct_csv" in self._pipeline_skip_notice_steps:
-            return
-        if not self._is_pipeline_step_required("autoct_csv"):
-            return
-        step_state = (
-            self._pipeline_test_step_state
-            if self._pipeline_test_active
-            else self._pipeline_step_state
-        )
-        if not bool((step_state.get("autoct_csv") or {}).get("completed", False)):
-            return
-        step_order = [name for name, _label in self.PIPELINE_STEPS]
-        try:
-            next_idx = step_order.index(str(next_step).strip())
-            autoct_idx = step_order.index("autoct_csv")
-        except ValueError:
-            return
-        if next_idx <= autoct_idx:
-            return
-        msg = (
-            "[AUTOCT] Existing CSV already valid for current test subset. "
-            "Skipping AutoCT CSV step."
-            if self._pipeline_test_active
-            else "[AUTOCT] Existing CSV already marked complete. Skipping AutoCT CSV step."
-        )
-        self._append_merge_log(msg)
-        self._pipeline_skip_notice_steps.add("autoct_csv")
+        pm_orchestrator.pipeline_maybe_log_completed_autoct_skip(self, next_step)
 
     def _show_pipeline_force_info(self, title: str, message: str) -> None:
-        fn = self._messagebox_originals.get("showinfo")
-        if callable(fn):
-            try:
-                fn(title, message)
-                return
-            except Exception:
-                pass
-        try:
-            messagebox.showinfo(title, message)
-        except Exception:
-            pass
+        pm_orchestrator.show_pipeline_force_info(self, title, message)
 
     def _pipeline_trigger_next_action(self) -> None:
-        if not self._pipeline_autorun:
-            self._pipeline_sync_noninteractive_mode()
-            return
-        if self._any_pipeline_activity():
-            return
-        action = self._pipeline_next_action()
-        if action is None:
-            self._pipeline_autorun = False
-            self._pipeline_pending_action = None
-            if self._pipeline_test_active:
-                self._restore_test_scene_subset()
-            self.pipeline_run_status_var.set("Pipeline: all required steps completed")
-            self._pipeline_sync_noninteractive_mode()
-            return
-
-        step, act, mode = action
-        self._pipeline_maybe_log_completed_autoct_skip(step)
-        self._pipeline_pending_action = (step, act, mode)
-        started = False
-        if act == "run":
-            started = self._pipeline_dispatch_run(step)
-        else:
-            started = self._pipeline_dispatch_verify(step, mode)
-        if not started:
-            self._pipeline_autorun = False
-            self._pipeline_pending_action = None
-            if self._pipeline_test_active:
-                self._restore_test_scene_subset()
-            self.pipeline_run_status_var.set(f"Pipeline stopped: could not start {step} {act}")
-            self._pipeline_sync_noninteractive_mode()
-            return
+        pm_orchestrator.pipeline_trigger_next_action(self)
 
     def _pipeline_next_action(self) -> tuple[str, str, str] | None:
-        verify_mode = self.pipeline_verify_after_var.get().strip().lower()
-        if self._pipeline_test_active:
-            self._pipeline_recompute_test_step_state()
-        step_state = (
-            self._pipeline_test_step_state
-            if self._pipeline_test_active
-            else self._pipeline_step_state
-        )
-        for step, _label in self.PIPELINE_STEPS:
-            if not self._is_pipeline_step_required(step):
-                continue
-            st = step_state.get(step, {"completed": False, "verified": "none"})
-            if not bool(st.get("completed", False)):
-                return step, "run", "none"
-            if self._pipeline_test_active and step in {"scenedetect", "split_scenes"}:
-                continue
-            if step in self.PIPELINE_STEPS_WITH_VERIFY and verify_mode == "quick":
-                current = str(st.get("verified", "none"))
-                if current != "quick":
-                    return step, "verify", "quick"
-        return None
+        return pm_orchestrator.pipeline_next_action(self)
 
     def _pipeline_dispatch_run(self, step: str) -> bool:
-        self.pipeline_run_status_var.set(f"Running step: {step}")
-        if step == "scenedetect":
-            before = bool(self._scene_thread and self._scene_thread.is_alive())
-            self._start_scene_detect()
-            return bool(self._scene_thread and self._scene_thread.is_alive()) and not before
-        if step == "split_scenes":
-            before = bool(self._scene_thread and self._scene_thread.is_alive())
-            self._start_split_scenes()
-            return bool(self._scene_thread and self._scene_thread.is_alive()) and not before
-        if step == "depthcrafter":
-            before = bool(self._depth_thread and self._depth_thread.is_alive())
-            self._run_depth_placeholder()
-            return bool(self._depth_thread and self._depth_thread.is_alive()) and not before
-        if step == "splatting":
-            before = bool(self._splat_thread and self._splat_thread.is_alive())
-            self._run_splat_placeholder()
-            return bool(self._splat_thread and self._splat_thread.is_alive()) and not before
-        if step == "sharpness_csv":
-            before = bool(self._inpaint_thread and self._inpaint_thread.is_alive())
-            self._start_inpaint_sharpness_csv()
-            return bool(self._inpaint_thread and self._inpaint_thread.is_alive()) and not before
-        if step == "inpaint":
-            before = bool(self._inpaint_thread and self._inpaint_thread.is_alive())
-            self._run_inpaint_placeholder()
-            return bool(self._inpaint_thread and self._inpaint_thread.is_alive()) and not before
-        if step == "sharpen":
-            before = bool(self._inpaint_thread and self._inpaint_thread.is_alive())
-            self._start_inpaint_sharpen()
-            return bool(self._inpaint_thread and self._inpaint_thread.is_alive()) and not before
-        if step == "autoct_csv":
-            before = bool(self._merge_thread and self._merge_thread.is_alive())
-            self._start_merge_autoct_csv()
-            return bool(self._merge_thread and self._merge_thread.is_alive()) and not before
-        if step == "mask_for_merge":
-            before = bool(self._merge_thread and self._merge_thread.is_alive())
-            self._run_merge_mask_placeholder()
-            return bool(self._merge_thread and self._merge_thread.is_alive()) and not before
-        if step == "merging":
-            before = bool(self._merge_thread and self._merge_thread.is_alive())
-            self._run_merge_placeholder()
-            return bool(self._merge_thread and self._merge_thread.is_alive()) and not before
-        if step == "mono_to_sbs":
-            before = bool(self._join_thread and self._join_thread.is_alive())
-            self._run_join_prepare_mono()
-            return bool(self._join_thread and self._join_thread.is_alive()) and not before
-        if step == "join":
-            before = bool(self._join_thread and self._join_thread.is_alive())
-            self._run_join_scenes()
-            return bool(self._join_thread and self._join_thread.is_alive()) and not before
-        if step == "remux":
-            before = bool(self._join_thread and self._join_thread.is_alive())
-            self._start_join_remux()
-            return bool(self._join_thread and self._join_thread.is_alive()) and not before
-        return False
+        return pm_orchestrator.pipeline_dispatch_run(self, step)
 
     def _pipeline_dispatch_verify(self, step: str, mode: str) -> bool:
-        self.pipeline_run_status_var.set(f"Verifying {step} ({mode})")
-        before = self._verify_running
-        if step == "split_scenes":
-            self._start_verify_quick()
-        elif step == "depthcrafter":
-            self._start_depth_verify_quick()
-        elif step == "splatting":
-            self._start_splat_verify_quick()
-        elif step == "inpaint":
-            self._start_inpaint_verify_quick()
-        elif step == "sharpen":
-            self._start_inpaint_sharpen_verify_quick()
-        elif step == "mask_for_merge":
-            self._start_merge_mask_verify_quick()
-        elif step == "merging":
-            self._start_merge_verify_quick()
-        elif step == "mono_to_sbs":
-            self._start_join_mono_verify()
-        elif step == "join":
-            # Join has only one verify mode; reuse it for pipeline verification.
-            self._start_join_verify()
-        else:
-            return False
-        return self._verify_running and not before
+        return pm_orchestrator.pipeline_dispatch_verify(self, step, mode)
 
     def _any_pipeline_activity(self) -> bool:
-        return any(
-            [
-                bool(self._scene_thread and self._scene_thread.is_alive()),
-                bool(self._analysis_thread and self._analysis_thread.is_alive()),
-                bool(self._depth_thread and self._depth_thread.is_alive()),
-                bool(self._splat_thread and self._splat_thread.is_alive()),
-                bool(self._inpaint_thread and self._inpaint_thread.is_alive()),
-                bool(self._merge_thread and self._merge_thread.is_alive()) or self._merge_group_alive(),
-                bool(self._join_thread and self._join_thread.is_alive()),
-                bool(self._verify_running),
-            ]
-        )
+        return pm_orchestrator.any_pipeline_activity(self)
 
     def _pipeline_on_run_finished(
         self,
@@ -10324,54 +9946,12 @@ class PipelineMasterGUI:
         *,
         mark_completed: bool = True,
     ) -> None:
-        pending = self._pipeline_pending_action
-        state = (
-            self._pipeline_test_step_state
-            if self._pipeline_test_active
-            else self._pipeline_step_state
+        pm_orchestrator.pipeline_on_run_finished(
+            self,
+            step,
+            success,
+            mark_completed=mark_completed,
         )
-        if success:
-            self._pipeline_set_completed_in_state(state, step, bool(mark_completed))
-            self._pipeline_set_verified_in_state(state, step, "none")
-            if step in self.PIPELINE_CSV_STEPS:
-                self._sync_pipeline_csv_done_flags_in_state(state)
-            self._refresh_pipeline_status_panel()
-            if not self._pipeline_test_active:
-                self._save_pipeline_state()
-        if pending and pending[0] == step and pending[1] == "run":
-            self._pipeline_pending_action = None
-            if not success:
-                self._pipeline_autorun = False
-                if self._pipeline_test_active:
-                    self._restore_test_scene_subset()
-                self.pipeline_run_status_var.set(f"Pipeline stopped: step failed ({step})")
-                self._pipeline_sync_noninteractive_mode()
-                return
-            if not mark_completed:
-                self._pipeline_autorun = False
-                self.pipeline_run_status_var.set(
-                    f"Pipeline paused: {step} ran in incomplete mode and was not marked complete."
-                )
-                self._pipeline_sync_noninteractive_mode()
-                return
-            if step == "split_scenes" and self._pipeline_pause_after_split_scenes and not self._pipeline_test_active:
-                verify_mode = self.pipeline_verify_after_var.get().strip().lower()
-                if verify_mode != "quick":
-                    self._pipeline_pause_after_split_scenes = False
-                    self._pipeline_autorun = False
-                    pause_msg = (
-                        "Split Scenes completed.\n\n"
-                        "Please move clips you do NOT want to convert into seg-mono,\n"
-                        "then press Start/Resume again to continue."
-                    )
-                    self.pipeline_run_status_var.set(
-                        "Paused after Split Scenes. Move files to seg-mono, then Start/Resume."
-                    )
-                    self._append_pipeline_popup_log("INFO", "Split Scenes Pause", pause_msg)
-                    self._show_pipeline_force_info("Split Scenes Pause", pause_msg)
-                    self._pipeline_sync_noninteractive_mode()
-                    return
-            self._pipeline_trigger_next_action()
 
     def _pipeline_on_verify_finished(
         self,
@@ -10380,64 +9960,13 @@ class PipelineMasterGUI:
         mode: str,
         retry_on_failure: bool = True,
     ) -> None:
-        pending = self._pipeline_pending_action
-        state = (
-            self._pipeline_test_step_state
-            if self._pipeline_test_active
-            else self._pipeline_step_state
+        pm_orchestrator.pipeline_on_verify_finished(
+            self,
+            step,
+            success,
+            mode,
+            retry_on_failure=retry_on_failure,
         )
-        if success:
-            self._pipeline_mark_previous_steps_done_verified_in_state(state, step, mode)
-            self._sync_pipeline_csv_done_flags_in_state(state)
-            self._refresh_pipeline_status_panel()
-            if not self._pipeline_test_active:
-                self._save_pipeline_state()
-        else:
-            self._pipeline_invalidate_active_from(step)
-        if pending and pending[0] == step and pending[1] == "verify":
-            self._pipeline_pending_action = None
-            if not success:
-                if self._pipeline_autorun:
-                    if not retry_on_failure:
-                        self._pipeline_autorun = False
-                        if self._pipeline_test_active:
-                            self._restore_test_scene_subset()
-                        self.pipeline_run_status_var.set(
-                            f"Pipeline stopped: verify failed ({step}), manual fix required."
-                        )
-                        self._pipeline_sync_noninteractive_mode()
-                        return
-                    self.pipeline_run_status_var.set(
-                        f"Verify failed on {step}: re-running previous step output."
-                    )
-                    self._pipeline_trigger_next_action()
-                    return
-                self._pipeline_autorun = False
-                if self._pipeline_test_active:
-                    self._restore_test_scene_subset()
-                self.pipeline_run_status_var.set(f"Pipeline stopped: verify failed ({step})")
-                self._pipeline_sync_noninteractive_mode()
-                return
-            if step == "split_scenes" and self._pipeline_pause_after_split_scenes and not self._pipeline_test_active:
-                self._pipeline_pause_after_split_scenes = False
-                self._pipeline_autorun = False
-                pause_msg = (
-                    "Split Scenes verify completed.\n\n"
-                    "Please move clips you do NOT want to convert into seg-mono,\n"
-                    "then press Start/Resume again to continue."
-                )
-                self.pipeline_run_status_var.set(
-                    "Paused after Split Scenes verify. Move files to seg-mono, then Start/Resume."
-                )
-                self._append_pipeline_popup_log("INFO", "Split Scenes Verify Pause", pause_msg)
-                self._show_pipeline_force_info("Split Scenes Verify Pause", pause_msg)
-                self._pipeline_sync_noninteractive_mode()
-                return
-            self._pipeline_trigger_next_action()
-        elif not success:
-            self.pipeline_run_status_var.set(
-                f"Verify failed on {step}: cleared this step and downstream flags."
-            )
 
     def _open_depth_input_folder(self) -> None:
         folder = self.depth_input_var.get().strip()
@@ -10466,6 +9995,11 @@ class PipelineMasterGUI:
     def _reset_depth_auto_locked_defaults(self) -> None:
         # Fields disabled in Auto mode are informational and update dynamically.
         self.depth_runtime_mode_var.set("original")
+        self.depth_overlap_var.set("15")
+        self.depth_inference_steps_var.set("4")
+        self.depth_seed_var.set("42")
+        self.depth_scale_factor_var.set(self.DEFAULT_DEPTH_SCALE_FACTOR)
+        self.depth_scale_factor_text_var.set(f"{float(self.depth_scale_factor_var.get()):.2f}x")
         self.depth_worker_script_var.set(self._resolve_depth_worker_script("original"))
         self._update_depth_resolution_preview()
 
@@ -10492,14 +10026,18 @@ class PipelineMasterGUI:
 
     def _apply_depth_control_states(self) -> None:
         mode_manual = self.depth_mode_var.get().strip() == "Manual"
-        state_auto = tk.NORMAL
-        state_res = tk.NORMAL if mode_manual else tk.DISABLED
 
-        self.depth_chunk_size_entry.configure(state=state_auto)
-        self.depth_overlap_entry.configure(state=state_auto)
-        self.depth_inference_steps_entry.configure(state=state_auto)
-        self.depth_seed_entry.configure(state=state_auto)
-        self.depth_scale_factor_scale.configure(state=state_auto)
+        self.depth_chunk_size_entry.configure(state=tk.NORMAL)
+        if mode_manual:
+            self.depth_overlap_entry.configure(state=tk.NORMAL)
+            self.depth_inference_steps_entry.configure(state=tk.NORMAL)
+            self.depth_seed_entry.configure(state=tk.NORMAL)
+            self.depth_scale_factor_scale.configure(state=tk.NORMAL)
+        else:
+            self.depth_overlap_entry.configure(state=tk.DISABLED)
+            self.depth_inference_steps_entry.configure(state=tk.DISABLED)
+            self.depth_seed_entry.configure(state=tk.DISABLED)
+            self.depth_scale_factor_scale.configure(state=tk.DISABLED)
         self.depth_cpu_offload_combo.configure(state="readonly")
         if mode_manual:
             self.depth_runtime_mode_combo.configure(state="readonly")
@@ -10509,8 +10047,8 @@ class PipelineMasterGUI:
         self.depth_worker_script_var.set(
             self._resolve_depth_worker_script(self.depth_runtime_mode_var.get())
         )
-        self.depth_res_x_entry.configure(state=state_res)
-        self.depth_res_y_entry.configure(state=state_res)
+        self.depth_res_x_entry.configure(state=tk.DISABLED)
+        self.depth_res_y_entry.configure(state=tk.DISABLED)
 
         self._sync_depth_to_splat_input_path()
         self._update_depth_resolution_preview()
@@ -10696,6 +10234,24 @@ class PipelineMasterGUI:
             parsed = int(float(fallback))
         return str(max(0, parsed))
 
+    def _normalize_depth_retry_offset(self, value: object, fallback: str = "0") -> str:
+        sval = str(value or "").strip()
+        if sval.startswith("+"):
+            sval = sval[1:]
+        try:
+            parsed = int(float(sval))
+        except Exception:
+            fb = str(fallback).strip()
+            if fb.startswith("+"):
+                fb = fb[1:]
+            try:
+                parsed = int(float(fb))
+            except Exception:
+                parsed = 0
+        parsed = max(-20, min(20, parsed))
+        parsed = int(round(parsed / 5.0) * 5)
+        return f"+{parsed}" if parsed > 0 else str(parsed)
+
     def _current_global_encoder_mode(self) -> str:
         mode = normalize_global_encoder_mode(self.global_encoder_mode_var.get())
         if self.global_encoder_mode_var.get().strip() != mode:
@@ -10738,58 +10294,7 @@ class PipelineMasterGUI:
         self._preview_merge_command()
 
     def _build_depth_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
-        final_upscale = "False"
-        depth_codec = self._normalize_ffmpeg_codec(
-            self.depth_codec_var.get(),
-            self.DEFAULT_SCENE_CODEC,
-        )
-        self.depth_codec_var.set(depth_codec)
-        depth_runtime_mode = self._normalize_depth_runtime_mode(
-            self.depth_runtime_mode_var.get()
-        )
-        self.depth_runtime_mode_var.set(depth_runtime_mode)
-        depth_worker_script = self._resolve_depth_worker_script(depth_runtime_mode)
-        self.depth_worker_script_var.set(depth_worker_script)
-        scene_strip_pad_top, scene_strip_pad_bottom = self._depth_scene_strip_pad()
-        scale_factor = self._get_depth_scale_factor()
-
-        env_updates: dict[str, str] = {
-            "PYTHON": sys.executable,
-            "WORKER_SCRIPT": depth_worker_script,
-            "INPUT_DIR": self.depth_input_var.get().strip(),
-            "OUTPUT_DIR": self.depth_output_var.get().strip(),
-            "GLOB": self.depth_glob_var.get().strip() or "*.mp4",
-            "WINDOW_SIZE": self.depth_chunk_size_var.get().strip(),
-            "OVERLAP": self.depth_overlap_var.get().strip(),
-            "INFERENCE_STEPS": self.depth_inference_steps_var.get().strip(),
-            "GUIDANCE_SCALE": self.depth_guidance_scale_var.get().strip() or "1.0",
-            "SEED": self.depth_seed_var.get().strip(),
-            "CPU_OFFLOAD_MODE": self.depth_cpu_offload_var.get().strip(),
-            "DECODE_CHUNK_SIZE": self.depth_decode_chunk_size_var.get().strip() or "2",
-            "DEBUG_MEM": "True" if self.depth_debug_mem_var.get() else "False",
-            "FINAL_UPSCALE": final_upscale,
-            "SCALE_FACTOR": f"{scale_factor:.2f}",
-            "RESTART_EVERY": self.depth_restart_every_var.get().strip() or "100",
-            "PAD_ALIGN_BOTTOM": "True",
-            "SCENE_STRIP_PAD_TOP": str(scene_strip_pad_top),
-            "SCENE_STRIP_PAD_BOTTOM": str(scene_strip_pad_bottom),
-            "FFMPEG_CODEC": depth_codec,
-            "STOP_MARKER": os.path.join(
-                self.depth_output_var.get().strip() or "./work/depthmap",
-                ".stop_after_current",
-            ),
-            "RETRY_POLICY_JSON": self._build_retry_policy_json(
-                self.depth_retry_policy_vars,
-                self.depth_cpu_offload_var.get().strip() or "model",
-            ),
-        }
-
-        cmd = ["bash", str(runner_path("run_depthcrafter_nogui_batch.sh"))]
-        preview = " ".join(
-            [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
-            + [shlex.quote(x) for x in cmd]
-        )
-        return cmd, env_updates, preview
+        return pm_builders.build_depth_runner_payload(self)
 
     def _preview_depth_command(self) -> None:
         try:
@@ -11244,90 +10749,7 @@ class PipelineMasterGUI:
         self._preview_splat_command()
 
     def _build_splat_runner_payload(self) -> tuple[list[str], dict[str, str], str]:
-        layout_ui = self.splat_layout_var.get().strip()
-        layout_cli = {
-            "Single Warp": "single_warp",
-            "Dual": "dual",
-            "Quad": "quad",
-        }.get(layout_ui, "single_warp")
-        codec_value = self._normalize_ffmpeg_codec(
-            self.splat_codec_var.get(),
-            self.DEFAULT_SCENE_CODEC,
-        )
-        self.splat_codec_var.set(codec_value)
-        workers_raw = self.splat_workers_var.get().strip()
-        try:
-            workers = max(1, int(workers_raw))
-        except Exception:
-            workers = 8
-            self.splat_workers_var.set(str(workers))
-        auto_conv_ui = self.splat_auto_convergence_var.get().strip()
-        auto_conv_cli = {
-            "Off": "Off",
-            "Min Borders": "MinBorders",
-            "Average": "Average",
-            "Peak": "Peak",
-            "Hybrid": "Hybrid",
-        }.get(auto_conv_ui, "MinBorders")
-        replace_mask_enabled = True
-
-        env_updates: dict[str, str] = {
-            "PYTHON": sys.executable,
-            "RUNNER": str(runner_path("batch_splatting_runner.py")),
-            "INPUT_SOURCE_CLIPS": self.splat_input_clips_var.get().strip(),
-            "INPUT_DEPTH_MAPS": self.splat_input_depth_var.get().strip(),
-            "OUTPUT_SPLATTED": self.splat_output_var.get().strip(),
-            "MASK_OUTPUT": self.splat_mask_output_var.get().strip(),
-            "FULL_RES_BATCH_SIZE": self.splat_batch_size_var.get().strip() or "50",
-            "WORKERS": str(workers),
-            "DISPARITY": self.splat_disparity_var.get().strip() or "20",
-            "OUTPUT_LAYOUT": layout_cli,
-            "AUTO_CONVERGENCE_MODE": auto_conv_cli,
-            "DILATE_X": self.splat_dilate_x_var.get().strip() or "3",
-            "DILATE_Y": self.splat_dilate_y_var.get().strip() or "1.5",
-            "BLUR_X": self.splat_blur_x_var.get().strip() or "0",
-            "BLUR_Y": self.splat_blur_y_var.get().strip() or "0",
-            "DILATE_LEFT": self.splat_dilate_left_var.get().strip() or "1",
-            "BLUR_BALANCE": self.splat_blur_balance_var.get().strip() or "0.5",
-            "GAMMA": self.splat_gamma_var.get().strip() or "1",
-            "CONVERGENCE": self.splat_convergence_var.get().strip() or "50",
-            "STAIR_SMOOTH": "1" if self.splat_stair_smooth_var.get() else "0",
-            "STAIR_SMOOTH_KERNEL": self.splat_stair_kernel_var.get().strip() or "3",
-            "STAIR_SMOOTH_X_OFF": self.splat_stair_x_off_var.get().strip() or "2",
-            "STAIR_SMOOTH_STRIP": self.splat_stair_strip_var.get().strip() or "4",
-            "STAIR_SMOOTH_STRENGTH": self.splat_stair_strength_var.get().strip() or "1",
-            "USE_REPLACE_MASK": "1" if replace_mask_enabled else "0",
-            "REPLACE_MASK_SCALE": self.splat_replace_mask_scale_var.get().strip() or "1",
-            "REPLACE_MASK_MIN": self.splat_replace_mask_min_var.get().strip() or "1",
-            "REPLACE_MASK_MAX": self.splat_replace_mask_max_var.get().strip() or "32",
-            "REPLACE_MASK_GAP": self.splat_replace_mask_gap_var.get().strip() or "0",
-            "REPLACE_MASK_EDGE": "1" if self.splat_replace_mask_edge_var.get() else "0",
-            # Fixed hardcoded settings (not exposed in GUI).
-            "ENABLE_FULL_RES": "True",
-            "ENABLE_LOW_RES": "False",
-            "PROCESS_LENGTH": "-1",
-            "ADD_BORDERS": "False",
-            "REPLACE_MASK_CODEC": "ffv1",
-            "FFMPEG_CODEC": codec_value,
-            "ENCODER_MODE": self._current_global_encoder_mode(),
-            "FFMPEG_EXTRA_ARGS": self._current_global_ffmpeg_extra_args(),
-            "STOP_MARKER": os.path.join(
-                self.splat_output_var.get().strip() or "./work/splat",
-                ".stop_after_current",
-            ),
-        }
-
-        launcher_name = (
-            str(runner_path("run_splatting_runner_parallel.sh"))
-            if workers >= 2
-            else str(runner_path("run_splatting_runner.sh"))
-        )
-        cmd = ["bash", launcher_name]
-        preview = " ".join(
-            [f"{k}={shlex.quote(str(v))}" for k, v in env_updates.items()]
-            + [shlex.quote(x) for x in cmd]
-        )
-        return cmd, env_updates, preview
+        return pm_builders.build_splat_runner_payload(self)
 
     def _preview_splat_command(self) -> None:
         try:
@@ -16129,7 +15551,19 @@ class PipelineMasterGUI:
                         ):
                             should_resume_sharpen = True
                     self._set_inpaint_running(False)
-                    if step_name in {"sharpness_csv", "inpaint", "sharpen"}:
+                    if step_name == "benchmark":
+                        if success:
+                            try:
+                                self._apply_inpaint_tile_benchmark_results(
+                                    payload.get("json_out") if isinstance(payload, dict) else ""
+                                )
+                            except Exception as exc:
+                                success = False
+                                self._append_inpaint_log(
+                                    f"[BENCH][ERROR] Could not apply benchmark results: {exc}"
+                                )
+                                self.inpaint_status_var.set("Benchmark completed, apply failed")
+                    elif step_name in {"sharpness_csv", "inpaint", "sharpen"}:
                         self._pipeline_on_run_finished(step_name, success)
                     else:
                         status_txt = self.inpaint_status_var.get().strip().lower()
@@ -16170,7 +15604,11 @@ class PipelineMasterGUI:
                         stop_label = (
                             "Sharpness CSV"
                             if step_name == "sharpness_csv"
-                            else ("Sharpen" if step_name == "sharpen" else "Inpainting")
+                            else (
+                                "Sharpen"
+                                if step_name == "sharpen"
+                                else ("Benchmark" if step_name == "benchmark" else "Inpainting")
+                            )
                         )
                         self._append_inpaint_log(f"[STOP] {stop_label} stopped.")
                         self._finalize_pipeline_stop(stop_label)
@@ -16917,126 +16355,7 @@ class PipelineMasterGUI:
         self.root.after(120, self._poll_log_queue)
 
     def _collect_config(self) -> dict:
-        return {
-            "window_geometry": self._current_window_geometry(),
-            "work_folder": self.work_folder_var.get().strip(),
-            "scene_input": self.scene_input_var.get().strip(),
-            "scene_detector": self.scene_detector_var.get().strip(),
-            "scene_threshold": self.scene_threshold_var.get().strip(),
-            "scene_backend": self.scene_backend_var.get().strip(),
-            "scene_crop_mode": self.scene_crop_mode_var.get().strip(),
-            "scene_crop_custom": self.scene_crop_custom_var.get().strip(),
-            "scene_crop_target_h": self.scene_crop_target_h_var.get().strip(),
-            "scene_layout": self.scene_layout_var.get().strip(),
-            "scene_tonemap": self.scene_tonemap_var.get().strip(),
-            "scene_codec": self.scene_codec_var.get().strip(),
-            "global_encoder_mode": self._current_global_encoder_mode(),
-            "global_ffmpeg_extra_args": self._current_global_ffmpeg_extra_args(),
-            "depth_mode": self.depth_mode_var.get().strip(),
-            "depth_chunk_size": self.depth_chunk_size_var.get().strip(),
-            "depth_overlap": self.depth_overlap_var.get().strip(),
-            "depth_inference_steps": self.depth_inference_steps_var.get().strip(),
-            "depth_cpu_offload": self.depth_cpu_offload_var.get().strip(),
-            "depth_seed": self.depth_seed_var.get().strip(),
-            "depth_guidance_scale": self.depth_guidance_scale_var.get().strip(),
-            "depth_decode_chunk_size": self.depth_decode_chunk_size_var.get().strip(),
-            "depth_restart_every": self.depth_restart_every_var.get().strip(),
-            "depth_debug_mem": bool(self.depth_debug_mem_var.get()),
-            "depth_glob": self.depth_glob_var.get().strip(),
-            "depth_runtime_mode": self._normalize_depth_runtime_mode(
-                self.depth_runtime_mode_var.get()
-            ),
-            "depth_worker_script": self.depth_worker_script_var.get().strip(),
-            "depth_scale_factor": f"{self._get_depth_scale_factor():.2f}",
-            "depth_res_x": self.depth_res_x_var.get().strip(),
-            "depth_res_y": self.depth_res_y_var.get().strip(),
-            "depth_codec": self.depth_codec_var.get().strip(),
-            "splat_mode": self.splat_mode_var.get().strip(),
-            "splat_batch_size": self.splat_batch_size_var.get().strip(),
-            "splat_workers": self.splat_workers_var.get().strip(),
-            "splat_disparity": self.splat_disparity_var.get().strip(),
-            "splat_layout": self.splat_layout_var.get().strip(),
-            "splat_auto_convergence": self.splat_auto_convergence_var.get().strip(),
-            "splat_dilate_x": self.splat_dilate_x_var.get().strip(),
-            "splat_dilate_y": self.splat_dilate_y_var.get().strip(),
-            "splat_blur_x": self.splat_blur_x_var.get().strip(),
-            "splat_blur_y": self.splat_blur_y_var.get().strip(),
-            "splat_dilate_left": self.splat_dilate_left_var.get().strip(),
-            "splat_blur_balance": self.splat_blur_balance_var.get().strip(),
-            "splat_gamma": self.splat_gamma_var.get().strip(),
-            "splat_convergence": self.splat_convergence_var.get().strip(),
-            "splat_stair_smooth": bool(self.splat_stair_smooth_var.get()),
-            "splat_stair_kernel": self.splat_stair_kernel_var.get().strip(),
-            "splat_stair_x_off": self.splat_stair_x_off_var.get().strip(),
-            "splat_stair_strip": self.splat_stair_strip_var.get().strip(),
-            "splat_stair_strength": self.splat_stair_strength_var.get().strip(),
-            "splat_replace_mask": bool(self.splat_replace_mask_var.get()),
-            "splat_replace_mask_scale": self.splat_replace_mask_scale_var.get().strip(),
-            "splat_replace_mask_min": self.splat_replace_mask_min_var.get().strip(),
-            "splat_replace_mask_max": self.splat_replace_mask_max_var.get().strip(),
-            "splat_replace_mask_gap": self.splat_replace_mask_gap_var.get().strip(),
-            "splat_replace_mask_edge": bool(self.splat_replace_mask_edge_var.get()),
-            "splat_codec": self.splat_codec_var.get().strip(),
-            "inpaint_mode": self.inpaint_mode_var.get().strip(),
-            "inpaint_frames_chunk": self._get_inpaint_chunk_manual_value(),
-            "inpaint_dynamic_chunk": bool(self.inpaint_dynamic_chunk_var.get()),
-            "inpaint_cpu_offload": self.inpaint_cpu_offload_var.get().strip(),
-            "inpaint_tile_mode": self.inpaint_tile_mode_var.get().strip(),
-            "inpaint_tile1_max_size": self.inpaint_tile1_max_size_var.get().strip(),
-            "inpaint_tile2_max_size": self.inpaint_tile2_max_size_var.get().strip(),
-            "inpaint_dynamic_visible_chunk_steps5": self.inpaint_dynamic_visible_chunk_steps5_var.get().strip(),
-            "inpaint_dynamic_visible_chunk_steps6": self.inpaint_dynamic_visible_chunk_steps6_var.get().strip(),
-            "inpaint_dynamic_visible_chunk_steps7": self.inpaint_dynamic_visible_chunk_steps7_var.get().strip(),
-            "inpaint_dynamic_visible_chunk_steps8_plus": self.inpaint_dynamic_visible_chunk_steps8_plus_var.get().strip(),
-            "inpaint_dynamic_hold_divisor": self.inpaint_dynamic_hold_divisor_var.get().strip(),
-            "inpaint_input_bias": self.inpaint_input_bias_var.get().strip(),
-            "inpaint_overlap": self.inpaint_overlap_var.get().strip(),
-            "inpaint_tail_pad": self.inpaint_tail_pad_var.get().strip(),
-            "inpaint_use_sharpness_csv": bool(self.inpaint_use_sharpness_csv_var.get()),
-            "inpaint_sharpness_workers": self.inpaint_sharpness_workers_var.get().strip(),
-            "inpaint_use_sharpen": bool(self.inpaint_use_sharpen_var.get()),
-            "inpaint_sharpen_workers": self.inpaint_sharpen_workers_var.get().strip(),
-            "inpaint_inference_steps": self.inpaint_inference_steps_var.get().strip(),
-            "inpaint_codec": self.inpaint_codec_var.get().strip(),
-            "merge_mode": self.merge_mode_var.get().strip(),
-            "merge_autoct_workers": self.merge_autoct_workers_var.get().strip(),
-            "merge_mask_formerge_workers": self.merge_mask_formerge_workers_var.get().strip(),
-            "merge_parallel": bool(self._get_merge_worker_count() >= 2),
-            "merge_parallel_workers": self.merge_parallel_workers_var.get().strip(),
-            "merge_use_gpu": bool(self.merge_use_gpu_var.get()),
-            "merge_output_format": self.merge_output_format_var.get().strip(),
-            "merge_chunks": self.merge_chunks_var.get().strip(),
-            "merge_mask_binarize": self.merge_mask_binarize_var.get().strip(),
-            "merge_mask_dilate": self.merge_mask_dilate_var.get().strip(),
-            "merge_mask_blur": self.merge_mask_blur_var.get().strip(),
-            "merge_shadow_length": self.merge_shadow_length_var.get().strip(),
-            "merge_shadow_curve": self.merge_shadow_curve_var.get().strip(),
-            "merge_dynamic_shadow_width": bool(self.merge_dynamic_shadow_width_var.get()),
-            "merge_use_replace_mask": bool(self.merge_use_replace_mask_var.get()),
-            "merge_ct_preset": self.merge_ct_preset_var.get().strip(),
-            "merge_ct_auto_mode": self.merge_ct_auto_mode_var.get().strip(),
-            "merge_ct_exclude_black": bool(self.merge_ct_exclude_black_var.get()),
-            "merge_codec": self.merge_codec_var.get().strip(),
-            "join_mode": self.join_mode_var.get().strip(),
-            "join_encoder": self.join_encoder_var.get().strip(),
-            "join_crf": self.join_crf_var.get().strip(),
-            "join_preset": self.join_preset_var.get().strip(),
-            "join_pix_fmt": self.join_pix_fmt_var.get().strip(),
-            "join_extra_args": self.join_extra_args_var.get().strip(),
-            "scene_split_threads": self.scene_split_threads_var.get().strip(),
-            "verify_scenes_workers": self.verify_scenes_workers_var.get().strip(),
-            "pipeline_verify_after": self.pipeline_verify_after_var.get().strip(),
-            "pipeline_test_run_files": self.pipeline_test_run_files_var.get().strip(),
-            "depth_retry_policy": self._collect_retry_policy_config_from_vars(
-                self.depth_retry_policy_vars
-            ),
-            "inpaint_retry_policy": self._collect_retry_policy_config_from_vars(
-                self.inpaint_retry_policy_vars
-            ),
-            "resume_enabled": bool(self.resume_enabled_var.get()),
-            "stop_on_error": bool(self.stop_on_error_var.get()),
-            "auto_advance": bool(self.auto_advance_var.get()),
-        }
+        return pm_config.collect_config(self)
 
     def _current_window_geometry(self) -> str:
         try:

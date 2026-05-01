@@ -984,7 +984,6 @@ class InpaintingGUI(ThemedTk):
 
         # Safety Check 1: Hires folder is the same as the low-res input folder
         if os.path.normpath(low_res_input_folder) == os.path.normpath(hires_blend_folder):
-            logger.warning("Hi-Res Blend Folder is the same as Input Folder. Disabling Hi-Res blending.")
             return None
         
         # 1. Extract Base Name and Splatting Suffix
@@ -1192,6 +1191,7 @@ class InpaintingGUI(ThemedTk):
         base_video_name: str,
         input_layout: object,
         tile_num: int,
+        dynamic_resolution_scale: Optional[float] = None,
         update_info_callback=None,
         overlap: int = 0,
         original_input_blend_strength: float = 0.0,
@@ -1267,17 +1267,45 @@ class InpaintingGUI(ThemedTk):
             self.after(0, lambda: messagebox.showerror("Resolution Error", error_msg))
             return None
 
+        model_w, model_h = output_display_w, output_display_h
+        if dynamic_resolution_scale is not None and float(dynamic_resolution_scale) < 0.999:
+            model_w, model_h = self._dynamic_resolution_target_size(
+                output_display_w,
+                output_display_h,
+                float(dynamic_resolution_scale),
+                tile_num,
+            )
+            logger.info(
+                f"Dynamic resolution enabled for {base_video_name}: "
+                f"{output_display_w}x{output_display_h} -> {model_w}x{model_h} "
+                f"(scale={float(dynamic_resolution_scale):.2f}, tile={tile_num})"
+            )
+
         # Compute padded canvas size (matches pad_for_tiling behavior)
-        dummy = torch.zeros((1, 3, output_display_h, output_display_w), dtype=torch.float32)
+        dummy = torch.zeros((1, 3, model_h, model_w), dtype=torch.float32)
         dummy_padded = pad_for_tiling(dummy, tile_num, tile_overlap=(128, 128))
         padded_H, padded_W = int(dummy_padded.shape[2]), int(dummy_padded.shape[3])
         del dummy, dummy_padded
 
         if update_info_callback:
             display_frames_info = f"{actual_frames_to_process_count} (out of {total_frames_in_video})" if process_length != -1 else str(total_frames_in_video)
-            self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h}", display_frames_info, overlap, original_input_blend_strength))
+            display_res = f"{output_display_w}x{output_display_h}"
+            if (model_w, model_h) != (output_display_w, output_display_h):
+                display_res = f"{display_res} -> {model_w}x{model_h}"
+            self.after(0, lambda: update_info_callback(base_video_name, display_res, display_frames_info, overlap, original_input_blend_strength))
 
-        return vr, actual_frames_to_process_count, padded_H, padded_W, video_stream_info, fps
+        return (
+            vr,
+            actual_frames_to_process_count,
+            padded_H,
+            padded_W,
+            video_stream_info,
+            fps,
+            output_display_h,
+            output_display_w,
+            model_h,
+            model_w,
+        )
 
     def _read_and_prepare_chunk_from_reader(
         self,
@@ -1287,6 +1315,7 @@ class InpaintingGUI(ThemedTk):
         base_video_name: str,
         input_layout: object,
         tile_num: int,
+        model_size: Optional[Tuple[int, int]] = None,
         replace_mask_vr: Optional[VideoReader] = None,
     ):
         """Read [start_idx:end_idx) from decord and prepare (warped_padded, mask_padded, warped_unpadded, mask_unpadded, left_unpadded)."""
@@ -1347,10 +1376,26 @@ class InpaintingGUI(ThemedTk):
         self._save_debug_image(mask_gray, "02_mask_initial_grayscale", base_video_name, start_idx)
 
         mask_unpadded = self._process_mask_pipeline_direct(mask_gray, base_video_name)
+        warped_for_model = warped_unpadded
+        mask_for_model = mask_unpadded
+        if model_size is not None:
+            model_h, model_w = int(model_size[0]), int(model_size[1])
+            if model_h > 0 and model_w > 0 and (model_h, model_w) != (warped_unpadded.shape[2], warped_unpadded.shape[3]):
+                warped_for_model = self._resize_frames_for_dynamic_resolution(
+                    warped_unpadded,
+                    size=(model_h, model_w),
+                    direction="down",
+                )
+                mask_for_model = F.interpolate(
+                    mask_unpadded,
+                    size=(model_h, model_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).clamp(0.0, 1.0)
 
         # Pad for tiling (for pipeline input)
-        warped_padded = pad_for_tiling(warped_unpadded, tile_num, tile_overlap=(128, 128))
-        mask_padded = pad_for_tiling(mask_unpadded, tile_num, tile_overlap=(128, 128))
+        warped_padded = pad_for_tiling(warped_for_model, tile_num, tile_overlap=(128, 128))
+        mask_padded = pad_for_tiling(mask_for_model, tile_num, tile_overlap=(128, 128))
 
         return warped_padded, mask_padded, warped_unpadded, mask_unpadded, left_unpadded
     
@@ -1364,6 +1409,7 @@ class InpaintingGUI(ThemedTk):
         update_info_callback: Optional[Callable],
         overlap: int, # Needed for display, not logic here
         original_input_blend_strength: float,
+        dynamic_resolution_scale: Optional[float] = None,
         process_length: int = -1,
         replace_mask_vr: Optional[VideoReader] = None,
     ) -> Optional[Tuple[
@@ -1572,6 +1618,32 @@ class InpaintingGUI(ThemedTk):
         frames_warpped_original_unpadded_normalized = frames_warpped_normalized[:num_frames_original].clone()
         frames_mask_processed_unpadded_original_length = current_processed_mask[:num_frames_original].clone()
 
+        model_w, model_h = output_display_w, output_display_h
+        if dynamic_resolution_scale is not None and float(dynamic_resolution_scale) < 0.999:
+            model_w, model_h = self._dynamic_resolution_target_size(
+                output_display_w,
+                output_display_h,
+                float(dynamic_resolution_scale),
+                tile_num,
+            )
+            logger.info(
+                f"Dynamic resolution enabled for {base_video_name}: "
+                f"{output_display_w}x{output_display_h} -> {model_w}x{model_h} "
+                f"(scale={float(dynamic_resolution_scale):.2f}, tile={tile_num})"
+            )
+            if (model_h, model_w) != (output_display_h, output_display_w):
+                frames_warpped_normalized = self._resize_frames_for_dynamic_resolution(
+                    frames_warpped_normalized,
+                    size=(model_h, model_w),
+                    direction="down",
+                )
+                current_processed_mask = F.interpolate(
+                    current_processed_mask,
+                    size=(model_h, model_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).clamp(0.0, 1.0)
+
         # --- Pad for Tiling (for pipeline input) ---
         frames_warpped_padded = pad_for_tiling(frames_warpped_normalized, tile_num, tile_overlap=(128, 128))
         frames_mask_padded = pad_for_tiling(current_processed_mask, tile_num, tile_overlap=(128, 128))
@@ -1581,11 +1653,15 @@ class InpaintingGUI(ThemedTk):
         # Update GUI with video info after processing initial dimensions
         if update_info_callback:
             display_frames_info = f"{actual_frames_to_process_count} (out of {total_frames_in_video})" if process_length != -1 else str(total_frames_in_video)
-            self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h}", display_frames_info, overlap, original_input_blend_strength))
+            display_res = f"{output_display_w}x{output_display_h}"
+            if (model_w, model_h) != (output_display_w, output_display_h):
+                display_res = f"{display_res} -> {model_w}x{model_h}"
+            self.after(0, lambda: update_info_callback(base_video_name, display_res, display_frames_info, overlap, original_input_blend_strength))
 
         return (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
                 num_frames_original, padded_H, padded_W, video_stream_info, fps,
-                frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length)
+                frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length,
+                model_h, model_w)
         # This function primarily affects the GUI state.
         logger.debug(f"Blend parameters state set to: {state}")
     
@@ -2122,6 +2198,63 @@ class InpaintingGUI(ThemedTk):
         return chunk_8
 
     @staticmethod
+    def _tile_dimension_is_compatible(size: int, tile_num: int, tile_overlap: int = 128) -> bool:
+        size = int(size)
+        tile_num = max(1, int(tile_num))
+        if size <= 0 or size % 8 != 0:
+            return False
+        if tile_num <= 1:
+            return True
+        tile_size = (size + int(tile_overlap) * (tile_num - 1)) // tile_num
+        return tile_size > 0 and tile_size % 8 == 0
+
+    @classmethod
+    def _dynamic_resolution_target_size(
+        cls,
+        width: int,
+        height: int,
+        scale: float,
+        tile_num: int,
+    ) -> Tuple[int, int]:
+        """Return a <=source size that is divisible by 8 and tile-compatible."""
+        src_w = max(8, int(width))
+        src_h = max(8, int(height))
+        scale = max(0.1, min(1.0, float(scale)))
+        target_h = max(8, int(round(src_h * scale)) // 8 * 8)
+        target_h = min(src_h - (src_h % 8), target_h)
+        for h in range(target_h, 7, -8):
+            if not cls._tile_dimension_is_compatible(h, tile_num):
+                continue
+            ideal_w = int(round(src_w * (h / float(src_h)))) // 8 * 8
+            ideal_w = min(src_w - (src_w % 8), max(8, ideal_w))
+            for w in range(ideal_w, 7, -8):
+                if cls._tile_dimension_is_compatible(w, tile_num):
+                    return w, h
+        return max(8, src_w - (src_w % 8)), max(8, src_h - (src_h % 8))
+
+    @staticmethod
+    def _resize_frames_for_dynamic_resolution(
+        frames: torch.Tensor,
+        *,
+        size: Tuple[int, int],
+        direction: str,
+    ) -> torch.Tensor:
+        """Resize RGB tensors for the dynamic-resolution path with conservative filters."""
+        target_h, target_w = int(size[0]), int(size[1])
+        if frames.shape[2] == target_h and frames.shape[3] == target_w:
+            return frames
+        if direction == "down":
+            return F.interpolate(frames, size=(target_h, target_w), mode="area").clamp(0.0, 1.0)
+        # PyTorch has no Lanczos; bicubic+antialias is the least bad tensor path.
+        return F.interpolate(
+            frames,
+            size=(target_h, target_w),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).clamp(0.0, 1.0)
+
+    @staticmethod
     def _normalize_tile_mode(tile_mode: Optional[str], tile_num: int = 1) -> str:
         raw = str(tile_mode or "").strip().lower()
         if raw in {"1", "tile 1"}:
@@ -2190,6 +2323,7 @@ class InpaintingGUI(ThemedTk):
         replace_mask_path: str,
         process_length: int,
         effective_inference_steps: float,
+        chunk_planner_effective_steps: Optional[float],
         overlap: int,
         frames_chunk: int,
         enable_dynamic_chunk: bool,
@@ -2208,6 +2342,7 @@ class InpaintingGUI(ThemedTk):
         normalized_tile_mode = self._normalize_tile_mode(tile_mode, tile_num=tile_num)
         effective_steps = max(1.0, float(effective_inference_steps))
         model_steps = max(1, self._round_half_up(effective_steps))
+        planner_steps = max(1.0, float(chunk_planner_effective_steps if chunk_planner_effective_steps is not None else effective_steps))
 
         if tile1_max_size is None:
             tile1_limit = None
@@ -2224,7 +2359,7 @@ class InpaintingGUI(ThemedTk):
         if not math.isfinite(hold_divisor) or hold_divisor <= 0.0:
             hold_divisor = DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR
         visible_chunk_from_steps = self._visible_chunk_from_steps(
-            effective_steps,
+            planner_steps,
             visible_chunk_steps5=dynamic_visible_chunk_steps5,
             visible_chunk_steps6=dynamic_visible_chunk_steps6,
             visible_chunk_steps7=dynamic_visible_chunk_steps7,
@@ -2288,6 +2423,7 @@ class InpaintingGUI(ThemedTk):
         visible_chunk_final = max(1, processed_chunk_final - current_overlap)
         return {
             "effective_steps": float(effective_steps),
+            "chunk_planner_effective_steps": float(planner_steps),
             "model_steps": int(model_steps),
             "visible_chunk_from_steps": float(visible_chunk_from_steps),
             "max_hold_frames": int(max_hold),
@@ -2318,6 +2454,8 @@ class InpaintingGUI(ThemedTk):
         tile2_max_size: Optional[int] = None,
         vf: Optional[str] = None,
         effective_inference_steps: float = 5.0,
+        chunk_planner_effective_steps: Optional[float] = None,
+        dynamic_resolution_scale: Optional[float] = None,
         stop_event: Optional[threading.Event] = None,
         update_info_callback=None,
         original_input_blend_strength: float = 0.8,
@@ -2390,6 +2528,7 @@ class InpaintingGUI(ThemedTk):
             replace_mask_path=replace_mask_path,
             process_length=process_length,
             effective_inference_steps=effective_inference_steps,
+            chunk_planner_effective_steps=chunk_planner_effective_steps,
             overlap=overlap,
             frames_chunk=frames_chunk,
             enable_dynamic_chunk=enable_dynamic_chunk,
@@ -2409,6 +2548,7 @@ class InpaintingGUI(ThemedTk):
         logger.info(
             "[chunk-plan] "
             f"effective_steps={chunk_plan['effective_steps']:.2f} "
+            f"planner_steps={chunk_plan['chunk_planner_effective_steps']:.2f} "
             f"model_steps={chunk_plan['model_steps']} "
             f"visible_from_steps={chunk_plan['visible_chunk_from_steps']:.2f} "
             f"max_hold={chunk_plan['max_hold_frames']} "
@@ -2456,6 +2596,7 @@ class InpaintingGUI(ThemedTk):
                 base_video_name=base_video_name,
                 input_layout=input_layout,
                 tile_num=tile_num,
+                dynamic_resolution_scale=dynamic_resolution_scale,
                 update_info_callback=update_info_callback,
                 overlap=overlap,
                 original_input_blend_strength=original_input_blend_strength,
@@ -2463,7 +2604,18 @@ class InpaintingGUI(ThemedTk):
             )
             if stream_prep is None:
                 return False, None
-            video_reader, num_frames_original, padded_H, padded_W, video_stream_info, fps = stream_prep
+            (
+                video_reader,
+                num_frames_original,
+                padded_H,
+                padded_W,
+                video_stream_info,
+                fps,
+                original_output_h,
+                original_output_w,
+                model_output_h,
+                model_output_w,
+            ) = stream_prep
             if replace_mask_vr is not None and len(replace_mask_vr) < num_frames_original:
                 logger.error(
                     f"Replace mask has fewer frames than input for {base_video_name}: "
@@ -2480,6 +2632,7 @@ class InpaintingGUI(ThemedTk):
                 update_info_callback=update_info_callback,
                 overlap=overlap,
                 original_input_blend_strength=original_input_blend_strength,
+                dynamic_resolution_scale=dynamic_resolution_scale,
                 process_length=process_length,
                 replace_mask_vr=replace_mask_vr,
             )
@@ -2489,7 +2642,10 @@ class InpaintingGUI(ThemedTk):
 
             (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
             num_frames_original, padded_H, padded_W, video_stream_info, fps,
-            frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length) = prepared_inputs
+            frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length,
+            model_output_h, model_output_w) = prepared_inputs
+            original_output_h = int(frames_warpped_original_unpadded_normalized.shape[2])
+            original_output_w = int(frames_warpped_original_unpadded_normalized.shape[3])
 
         
         # 3. INPAINTING CHUNKS (The main loop)
@@ -2520,8 +2676,8 @@ class InpaintingGUI(ThemedTk):
         video_only_path = None
         if stream_encode_enabled:
             # Determine output frame size (after finalization/concat)
-            out_H = padded_H
-            out_W = padded_W
+            out_H = original_output_h
+            out_W = original_output_w
             if is_quad_input:
                 out_W = out_W * 2  # SBS
             # Encode directly to the output MP4 (no audio).
@@ -2574,6 +2730,7 @@ class InpaintingGUI(ThemedTk):
                  warped_unpadded_slice, mask_unpadded_slice, left_unpadded_slice) = self._read_and_prepare_chunk_from_reader(
                      vr=video_reader, start_idx=i, end_idx=end_idx_for_slicing,
                      base_video_name=base_video_name, input_layout=input_layout, tile_num=tile_num,
+                     model_size=(model_output_h, model_output_w),
                      replace_mask_vr=replace_mask_vr,
                  )
             else:
@@ -2716,6 +2873,13 @@ class InpaintingGUI(ThemedTk):
             if stream_encode_enabled and ffmpeg_p is not None:
                 # Crop to padded canvas
                 chunk_new = chunk_new[:, :, :padded_H, :padded_W]
+                chunk_new = chunk_new[:, :, :model_output_h, :model_output_w]
+                if (model_output_h, model_output_w) != (original_output_h, original_output_w):
+                    chunk_new = self._resize_frames_for_dynamic_resolution(
+                        chunk_new,
+                        size=(original_output_h, original_output_w),
+                        direction="up",
+                    )
 
                 # Per-chunk unpadded tensors for post-processing (match emitted frames)
                 chunk_len = chunk_new.shape[0]
@@ -2772,17 +2936,17 @@ class InpaintingGUI(ThemedTk):
                     # Ensure left is on CPU and matches
                     left_cpu = left_chunk.cpu()
                     # Pad/crop left to match padded canvas (tile_num>1 can increase padded size)
-                    if left_cpu.shape[2] != padded_H or left_cpu.shape[3] != padded_W:
-                        pad_bottom = max(0, padded_H - left_cpu.shape[2])
-                        pad_right = max(0, padded_W - left_cpu.shape[3])
+                    if left_cpu.shape[2] != original_output_h or left_cpu.shape[3] != original_output_w:
+                        pad_bottom = max(0, original_output_h - left_cpu.shape[2])
+                        pad_right = max(0, original_output_w - left_cpu.shape[3])
                         if pad_bottom > 0 or pad_right > 0:
                             left_cpu = F.pad(left_cpu, (0, pad_right, 0, pad_bottom), mode="constant", value=0.0)
-                        left_cpu = left_cpu[:, :, :padded_H, :padded_W]
+                        left_cpu = left_cpu[:, :, :original_output_h, :original_output_w]
                     else:
-                        left_cpu = left_cpu[:, :, :padded_H, :padded_W]
+                        left_cpu = left_cpu[:, :, :original_output_h, :original_output_w]
                     right_cpu = chunk_new.cpu()
-                    if right_cpu.shape[2] != padded_H or right_cpu.shape[3] != padded_W:
-                        right_cpu = right_cpu[:, :, :padded_H, :padded_W]
+                    if right_cpu.shape[2] != original_output_h or right_cpu.shape[3] != original_output_w:
+                        right_cpu = right_cpu[:, :, :original_output_h, :original_output_w]
                     if left_cpu.shape[:3] != right_cpu.shape[:3]:
                         raise RuntimeError(f"SBS shape mismatch: left {left_cpu.shape} vs right {right_cpu.shape}")
                     out_chunk = torch.cat([left_cpu, right_cpu], dim=3)
@@ -2842,6 +3006,13 @@ class InpaintingGUI(ThemedTk):
             return False, None
 
         frames_output_final = frames_output[:, :, :padded_H, :padded_W][:num_frames_original]
+        frames_output_final = frames_output_final[:, :, :model_output_h, :model_output_w]
+        if (model_output_h, model_output_w) != (original_output_h, original_output_w):
+            frames_output_final = self._resize_frames_for_dynamic_resolution(
+                frames_output_final,
+                size=(original_output_h, original_output_w),
+                direction="up",
+            )
         
         
         # If we did NOT preload (stream_input_enabled) and we're in the non-streaming fallback,

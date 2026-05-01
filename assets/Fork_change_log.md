@@ -203,3 +203,12 @@ Still testing, may need some fine tuning<br>
 - [fix] Stop/Graceful Stop should work correctly now on all steps from both scripts and pipeline master gui
 - [fix] rare NaN case on AutoCT
 - [fix] MinBorder auto convergence clamps was missing
+
+2026-04-24 (headless pipeline + dynamic inpaint resolution + speed optimizations)
+- [new] Headless script for Pipeline Master
+- [new] Dynamic resolution will now adapt resolution from 50% to 100% dynamically, greatly reducing inference time with abysmal differences in most cases
+- [new] resolution drop-down can be used to set the max resolution in dynamic mode and the fixed resolution in static mode
+- [new] benchmark mode will test and setup inpaint chunk sizes based on your GPU
+- [change] new preset changes, "speed" aimed with minimal quality loss, lowered number of inference steps based on sharpness.csv, lowered depthmap steps from 5 to 4, lowered max inpaint resolution to 90%, depthcrafter retries are now faster if the first run fails, with this new setup the first run will process scenes up to ~10 sec, retry 1 up to ~20 sec at 0.95x speed, retry 2 up to ~30 sec at 0.33x speed, retry 3 any length with 1x speed but with stream script (that misses file level latents, only overlap level) 
+- [change] depthcrafter retries are now relative to the chunk size (offsets) so they will adapt automatically based on the chunk size without having to tune them manually
+- [fix] Missing requirements for docker setup to enable full headless pipeline

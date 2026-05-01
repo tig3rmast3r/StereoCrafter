@@ -59,6 +59,7 @@ find . -maxdepth 2 -type f -name "*.sh" -print0 | xargs -0 chmod +x
 
 Notes:
 - Stage 1 installs system deps, validates preinstalled torch stack, and installs Python deps from `requirements.docker.no_torch.txt`.
+- The Vast stage1 flow now also installs `mkvtoolnix` and `python3-tk`, and the Docker requirements include `av` + `scenedetect`, so full-pipeline features like `SceneDetect`, `Sharpness CSV`, headless master import, and final `Remux` are covered too.
 - The standard Vast flow now skips the optional Forward-Warp CUDA build (`BUILD_FORWARD_WARP=false`).
 - Stage 2 downloads model weights from Hugging Face.
 

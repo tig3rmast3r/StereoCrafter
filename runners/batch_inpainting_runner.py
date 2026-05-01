@@ -580,20 +580,90 @@ def _round_half_up(value: float) -> int:
 def _steps_from_sharpness(val: float) -> float:
     """
     Continuous rule:
-    raw <= 1100 -> 5.0
+    raw <= 1100 -> 3.0
     every additional 1100 sharpness points adds +1.0 step
     clamp to 8.0
+
+    The dynamic chunk planner can still see this through
+    _chunk_planner_steps_from_model_steps(), preserving the old 5..8 chunk
+    behavior for the new 3..6 model-step range.
     """
     try:
         v = float(val)
     except Exception:
-        return 5.0
+        return 3.0
 
     if v <= 1100.0:
-        return 5.0
+        return 3.0
 
-    steps = 5.0 + ((v - 1100.0) / 1100.0)
-    return max(5.0, min(8.0, steps))
+    steps = 3.0 + ((v - 1100.0) / 1100.0)
+    return max(3.0, min(8.0, steps))
+
+
+def _chunk_planner_steps_from_model_steps(model_effective_steps: float) -> float:
+    return max(5.0, min(8.0, float(model_effective_steps) + 2.0))
+
+
+def _dynamic_resolution_scale_from_steps(model_effective_steps: float) -> float:
+    rounded = max(3, min(8, _round_half_up(model_effective_steps)))
+    return 0.50 + (float(rounded) - 3.0) * 0.10
+
+
+def _clamp_resolution_scale(value: float) -> float:
+    return max(0.50, min(1.0, float(value)))
+
+
+def _parse_chunk_limit_list(value) -> list[int]:
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    if not parts:
+        return [22]
+    parsed: list[int] = []
+    for part in parts:
+        parsed.append(max(1, int(float(part))))
+    return parsed
+
+
+def _chunk_limit_for_scale(value, dynamic_scale: float | None) -> int:
+    limits = _parse_chunk_limit_list(value)
+    if len(limits) == 1 or dynamic_scale is None:
+        return limits[0]
+    if dynamic_scale >= 0.995:
+        idx = 0
+    elif dynamic_scale >= 0.895:
+        idx = 1
+    elif dynamic_scale >= 0.795:
+        idx = 2
+    elif dynamic_scale >= 0.695:
+        idx = 3
+    elif dynamic_scale >= 0.595:
+        idx = 4
+    else:
+        idx = 5
+    return limits[min(idx, len(limits) - 1)]
+
+
+def _load_repo_benchmark_tile1_limits() -> str | None:
+    for path in (
+        REPO_ROOT / "inpaint_tile1_chunk_benchmark.json",
+        REPO_ROOT / "inpaint_tile1_chunk_benchmark.csv",
+    ):
+        if not path.is_file():
+            continue
+        try:
+            if path.suffix.lower() == ".json":
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                values = raw.get("tile1_max_chunks") if isinstance(raw, dict) else None
+                if isinstance(values, list) and values:
+                    return ",".join(str(max(1, int(v))) for v in values[:6])
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            for row in rows:
+                raw_values = row.get("tile1_max_chunks") or row.get("max_chunks") or ""
+                if raw_values.strip():
+                    return raw_values.strip()
+        except Exception as exc:
+            print(f"[WARN] failed reading benchmark limits from {path}: {exc}")
+    return None
 
 
 
@@ -803,23 +873,39 @@ def run_batch(args):
             if sharp_val is None:
                 effective_steps = max(1.0, float(args.fixed_steps))
                 model_steps = _round_half_up(effective_steps)
+                planner_steps = effective_steps
                 print(
                     f"[INFO] effective_steps={effective_steps:.2f} "
+                    f"planner_steps={planner_steps:.2f} "
                     f"model_steps={model_steps} (fixed)"
                 )
             else:
                 effective_steps = _steps_from_sharpness(sharp_val)
                 model_steps = _round_half_up(effective_steps)
+                planner_steps = _chunk_planner_steps_from_model_steps(effective_steps)
                 print(
                     f"[INFO] effective_steps={effective_steps:.2f} "
+                    f"planner_steps={planner_steps:.2f} "
                     f"model_steps={model_steps} (sharp_raw={sharp_val:.2f})"
                 )
+            resolution_scale = _clamp_resolution_scale(float(args.resolution_scale))
+            if bool(args.enable_dynamic_resolution):
+                dynamic_resolution_scale = min(
+                    _dynamic_resolution_scale_from_steps(effective_steps),
+                    resolution_scale,
+                )
+            else:
+                dynamic_resolution_scale = resolution_scale if resolution_scale < 0.999 else None
+            if dynamic_resolution_scale is not None:
+                print(f"[INFO] dynamic_resolution scale={dynamic_resolution_scale:.2f}")
+            tile1_max_size = _chunk_limit_for_scale(args.tile1_max_size, dynamic_resolution_scale)
+            tile2_max_size = _chunk_limit_for_scale(args.tile2_max_size, dynamic_resolution_scale)
 
             frames_chunk = max(1, int(args.chunk_size))
             print(
                 f"[INFO] chunk_setup dynamic={bool(args.enable_dynamic_chunk)} "
                 f"chunk_size={frames_chunk} tile_mode={args.tile_mode} "
-                f"tile1_max={int(args.tile1_max_size)} tile2_max={int(args.tile2_max_size)} "
+                f"tile1_max={int(tile1_max_size)} tile2_max={int(tile2_max_size)} "
                 f"overlap={int(args.overlap)} tail_pad={int(args.tail_pad)} "
                 f"steps5={int(args.dynamic_visible_chunk_steps5)} "
                 f"steps6={int(args.dynamic_visible_chunk_steps6)} "
@@ -904,10 +990,12 @@ def run_batch(args):
                         tail_pad=tail_pad,
                         enable_dynamic_chunk=bool(args.enable_dynamic_chunk),
                         tile_mode=args.tile_mode,
-                        tile1_max_size=args.tile1_max_size,
-                        tile2_max_size=args.tile2_max_size,
+                        tile1_max_size=tile1_max_size,
+                        tile2_max_size=tile2_max_size,
                         vf=None,
                         effective_inference_steps=effective_steps,
+                        chunk_planner_effective_steps=planner_steps,
+                        dynamic_resolution_scale=dynamic_resolution_scale,
                         stop_event=stop_event,
                         update_info_callback=None,
                         original_input_blend_strength=args.original_input_blend_strength,
@@ -1041,6 +1129,13 @@ def main():
                    help="Ignore sharpness.csv and use --fixed_steps for all files")
     p.add_argument("--fixed_steps", type=float, default=8.0,
                    help="Fallback effective steps when sharpness.csv is missing or ignored")
+    p.add_argument("--resolution_scale", type=float, default=1.0,
+                   help="Dynamic resolution max scale when enabled, fixed model scale when disabled.")
+    p.add_argument("--enable_dynamic_resolution", dest="enable_dynamic_resolution", action="store_true",
+                   help="Resize inpaint inputs dynamically from model steps, then upscale back to source size.")
+    p.add_argument("--disable_dynamic_resolution", dest="enable_dynamic_resolution", action="store_false",
+                   help="Keep inpaint inputs at source resolution.")
+    p.set_defaults(enable_dynamic_resolution=False)
     p.add_argument("--chunk_size", type=int, default=22,
                    help="Processed chunk size (visible + overlap, no tail) used when dynamic chunk is disabled.")
     p.add_argument("--enable_dynamic_chunk", dest="enable_dynamic_chunk", action="store_true",
@@ -1049,8 +1144,8 @@ def main():
                    help="Use fixed --chunk_size instead of dynamic chunk selection.")
     p.set_defaults(enable_dynamic_chunk=True)
     p.add_argument("--tile_mode", type=str, default="1 and 2", choices=["1", "2", "1 and 2"])
-    p.add_argument("--tile1_max_size", type=int, default=22)
-    p.add_argument("--tile2_max_size", type=int, default=55)
+    p.add_argument("--tile1_max_size", type=str, default="22")
+    p.add_argument("--tile2_max_size", type=str, default="55")
     p.add_argument("--dynamic_visible_chunk_steps5", type=int, default=igs.DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS5)
     p.add_argument("--dynamic_visible_chunk_steps6", type=int, default=igs.DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS6)
     p.add_argument("--dynamic_visible_chunk_steps7", type=int, default=igs.DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS7)
