@@ -257,7 +257,7 @@ def build_inpaint_runner_payload(gui: Any) -> tuple[list[str], dict[str, str], s
         "GLOB": "*.mp4",
         "REPLACE_MASK_FOLDER": mask_dir,
         "USE_REPLACE_MASK": "1",
-        "OFFLOAD_TYPE": gui.inpaint_cpu_offload_var.get().strip() or "model",
+        "OFFLOAD_TYPE": gui.inpaint_cpu_offload_var.get().strip() or "none",
         "CHUNK_SIZE": str(chunk_size),
         "ENABLE_DYNAMIC_CHUNK": "1" if bool(gui.inpaint_dynamic_chunk_var.get()) else "0",
         "TILE_MODE": tile_mode,
@@ -288,7 +288,7 @@ def build_inpaint_runner_payload(gui: Any) -> tuple[list[str], dict[str, str], s
         ),
         "RETRY_POLICY_JSON": gui._build_retry_policy_json(
             gui.inpaint_retry_policy_vars,
-            gui.inpaint_cpu_offload_var.get().strip() or "model",
+            gui.inpaint_cpu_offload_var.get().strip() or "none",
         ),
     }
 
