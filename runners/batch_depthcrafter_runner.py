@@ -324,7 +324,7 @@ def run(
     suffix: str = "_depth",
     # DepthCrafter knobs
     guidance_scale: float = 1.0,
-    inference_steps: int = 5,
+    inference_steps: int = 4,
     window_size: int = 64,
     overlap: int = 16,
     seed: int = 42,
@@ -1112,7 +1112,7 @@ def main():
     ap.add_argument("--suffix", default="_depth")
 
     ap.add_argument("--guidance_scale", type=float, default=1.0)
-    ap.add_argument("--inference_steps", type=int, default=5)
+    ap.add_argument("--inference_steps", type=int, default=4)
     ap.add_argument("--window_size", type=int, default=64)
     ap.add_argument("--overlap", type=int, default=16)
     ap.add_argument("--seed", type=int, default=42)

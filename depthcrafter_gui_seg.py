@@ -150,7 +150,7 @@ class DepthCrafterGUI:
         self.input_dir_or_file_var = tk.StringVar(value=os.path.normpath("./input_clips"))
         self.output_dir = tk.StringVar(value=os.path.normpath("./output_depthmaps"))
         self.guidance_scale = tk.DoubleVar(value=1.0)
-        self.inference_steps = tk.IntVar(value=5)
+        self.inference_steps = tk.IntVar(value=4)
         self.seed = tk.IntVar(value=42)
         self.cpu_offload = tk.StringVar(value="model")
         self.use_cudnn_benchmark = tk.BooleanVar(value=False)

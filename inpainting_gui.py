@@ -55,7 +55,7 @@ DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS5 = 38
 DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS6 = 26
 DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS7 = 18
 DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS = 14
-DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR = 3.0
+DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR = 2.0
 
 _ACTIVE_FFMPEG_WRITERS: set[subprocess.Popen] = set()
 _ACTIVE_FFMPEG_LOCK = threading.Lock()
@@ -226,6 +226,15 @@ class InpaintingGUI(ThemedTk):
             tile_mode_default = "1 and 2"
         self.enable_dynamic_chunk_var = tk.BooleanVar(
             value=bool(self.app_config.get("enable_dynamic_chunk", True))
+        )
+        self.enable_dynamic_resolution_var = tk.BooleanVar(
+            value=bool(self.app_config.get("enable_dynamic_resolution", False))
+        )
+        self.resolution_limit_var = tk.StringVar(
+            value=str(self.app_config.get("resolution_limit", "100%"))
+        )
+        self.static_mask_divisor_var = tk.StringVar(
+            value=str(self.app_config.get("static_mask_divisor", DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR))
         )
         self.tile_mode_var = tk.StringVar(value=tile_mode_default)
         self.tile1_max_size_var = tk.StringVar(
@@ -1101,6 +1110,9 @@ class InpaintingGUI(ThemedTk):
             "num_inference_steps": self.num_inference_steps_var.get(),
             "tile_num": str(self._legacy_tile_num_from_mode(self.tile_mode_var.get())),
             "enable_dynamic_chunk": self.enable_dynamic_chunk_var.get(),
+            "enable_dynamic_resolution": self.enable_dynamic_resolution_var.get(),
+            "resolution_limit": self.resolution_limit_var.get(),
+            "static_mask_divisor": self.static_mask_divisor_var.get(),
             "tile_mode": self.tile_mode_var.get(),
             "tile1_max_size": self.tile1_max_size_var.get(),
             "tile2_max_size": self.tile2_max_size_var.get(),
@@ -1846,6 +1858,8 @@ class InpaintingGUI(ThemedTk):
             self.tile1_max_size_entry.configure(state=tile_limit_state)
         if hasattr(self, "tile2_max_size_entry"):
             self.tile2_max_size_entry.configure(state=tile_limit_state)
+        if hasattr(self, "static_mask_divisor_entry"):
+            self.static_mask_divisor_entry.configure(state=tile_limit_state)
         logger.debug(
             "Dynamic chunk controls updated: dynamic=%s chunk_size=%s tile_limits=%s",
             dynamic_enabled,
@@ -1854,6 +1868,55 @@ class InpaintingGUI(ThemedTk):
         )
         if save:
             self.save_config()
+
+    @staticmethod
+    def _parse_chunk_limit_list(raw: object, label: str) -> list[int]:
+        values: list[int] = []
+        for part in str(raw or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            value = int(float(part))
+            if value < 1:
+                raise ValueError(f"{label} values must be >= 1")
+            values.append(value)
+        if not values:
+            raise ValueError(f"{label} must contain at least one positive value")
+        return values
+
+    @staticmethod
+    def _chunk_limit_for_scale(values: list[int], dynamic_scale: Optional[float]) -> int:
+        if len(values) == 1 or dynamic_scale is None:
+            return values[0]
+        if dynamic_scale >= 0.995:
+            idx = 0
+        elif dynamic_scale >= 0.895:
+            idx = 1
+        elif dynamic_scale >= 0.795:
+            idx = 2
+        elif dynamic_scale >= 0.695:
+            idx = 3
+        elif dynamic_scale >= 0.595:
+            idx = 4
+        else:
+            idx = 5
+        return values[min(idx, len(values) - 1)]
+
+    @staticmethod
+    def _dynamic_resolution_scale_from_steps(model_effective_steps: float) -> float:
+        rounded = max(3, min(8, InpaintingGUI._round_half_up(float(model_effective_steps))))
+        return 0.50 + (float(rounded) - 3.0) * 0.10
+
+    @staticmethod
+    def _parse_resolution_limit(raw: object) -> float:
+        text = str(raw or "100%").strip().replace("%", "")
+        try:
+            value = float(text)
+        except Exception:
+            value = 100.0
+        if value > 1.0:
+            value /= 100.0
+        return max(0.50, min(1.0, value))
     
     def create_widgets(self):
         
@@ -2009,7 +2072,34 @@ class InpaintingGUI(ThemedTk):
         ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
-        # Row 4: Tile Limits (active only with Dynamic Chunk)
+        # Row 4: Dynamic resolution controls
+        dynamic_resolution_check = ttk.Checkbutton(
+            param_frame,
+            text="Enable Dynamic Resolution",
+            variable=self.enable_dynamic_resolution_var,
+            command=self.save_config,
+        )
+        dynamic_resolution_check.grid(row=current_row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        Tooltip(
+            dynamic_resolution_check,
+            "Scale model resolution from effective steps, then upscale output back to source size.",
+        )
+
+        resolution_limit_label = ttk.Label(param_frame, text="Max Resolution:")
+        resolution_limit_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(resolution_limit_label, "Maximum model scale when Dynamic Resolution is enabled.")
+        self.resolution_limit_combo = ttk.Combobox(
+            param_frame,
+            textvariable=self.resolution_limit_var,
+            values=["100%", "90%", "80%", "70%", "60%", "50%"],
+            width=8,
+            state="readonly",
+        )
+        self.resolution_limit_combo.grid(row=current_row, column=3, sticky="w", padx=5)
+        self.resolution_limit_combo.bind("<<ComboboxSelected>>", lambda _e: self.save_config())
+        current_row += 1
+
+        # Row 5: Tile Limits (active only with Dynamic Chunk)
         tile1_max_label = ttk.Label(param_frame, text="Tile 1 Max Size:")
         tile1_max_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(
@@ -2019,7 +2109,7 @@ class InpaintingGUI(ThemedTk):
         self.tile1_max_size_entry = ttk.Entry(
             param_frame,
             textvariable=self.tile1_max_size_var,
-            width=10,
+            width=18,
         )
         self.tile1_max_size_entry.grid(row=current_row, column=1, sticky="w", padx=5)
 
@@ -2032,21 +2122,36 @@ class InpaintingGUI(ThemedTk):
         self.tile2_max_size_entry = ttk.Entry(
             param_frame,
             textvariable=self.tile2_max_size_var,
-            width=10,
+            width=18,
         )
         self.tile2_max_size_entry.grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
-        # Row 5: Output CRF (Left) & Process Length (Right)
-        output_crf_label = ttk.Label(param_frame, text="Output Quality (CRF/QP):")
-        output_crf_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(output_crf_label, self.help_data.get("output_crf", ""))
-        ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
+        # Row 6: Static mask divisor and process length
+        static_divisor_label = ttk.Label(param_frame, text="Static Mask Divisor:")
+        static_divisor_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(
+            static_divisor_label,
+            "Dynamic chunk hold divisor. Lower values reserve more chunk length for static masks.",
+        )
+        self.static_mask_divisor_entry = ttk.Entry(
+            param_frame,
+            textvariable=self.static_mask_divisor_var,
+            width=10,
+        )
+        self.static_mask_divisor_entry.grid(row=current_row, column=1, sticky="w", padx=5)
 
         process_length_label = ttk.Label(param_frame, text="Process Length:")
         process_length_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
         Tooltip(process_length_label, self.help_data.get("process_length", "Number of frames to process. Use -1 for all frames."))
         ttk.Entry(param_frame, textvariable=self.process_length_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
+        current_row += 1
+
+        # Row 7: Output CRF
+        output_crf_label = ttk.Label(param_frame, text="Output Quality (CRF/QP):")
+        output_crf_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(output_crf_label, self.help_data.get("output_crf", ""))
+        ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
         current_row += 1
 
         self._toggle_dynamic_chunk_controls(save=False)
@@ -3126,6 +3231,9 @@ class InpaintingGUI(ThemedTk):
         self.use_replace_mask_var.set(False)
         self.num_inference_steps_var.set("5")
         self.enable_dynamic_chunk_var.set(True)
+        self.enable_dynamic_resolution_var.set(False)
+        self.resolution_limit_var.set("100%")
+        self.static_mask_divisor_var.set(str(DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR))
         self.tile_mode_var.set("1 and 2")
         self.tile1_max_size_var.set("22")
         self.tile2_max_size_var.set("55")
@@ -3213,7 +3321,10 @@ class InpaintingGUI(ThemedTk):
             gui_tail_pad,
             gui_original_input_blend_strength,
             gui_output_crf,
-            process_length
+            process_length,
+            enable_dynamic_resolution,
+            resolution_scale,
+            static_mask_divisor,
         ):
         """
         Orchestrates the batch processing of videos, handling sidecar JSON,
@@ -3254,6 +3365,14 @@ class InpaintingGUI(ThemedTk):
                 current_original_input_blend_strength = gui_original_input_blend_strength
                 current_output_crf = gui_output_crf # NEW: Initialize current_output_crf
                 current_process_length = process_length # NEW: Current process_length (from GUI initially)
+                dynamic_resolution_scale = None
+                if enable_dynamic_resolution:
+                    dynamic_resolution_scale = min(
+                        self._dynamic_resolution_scale_from_steps(float(num_inference_steps)),
+                        float(resolution_scale),
+                    )
+                current_tile1_max_size = self._chunk_limit_for_scale(tile1_max_size, dynamic_resolution_scale)
+                current_tile2_max_size = self._chunk_limit_for_scale(tile2_max_size, dynamic_resolution_scale)
 
                 json_path = os.path.splitext(video_path)[0] + ".spsidecar"
                 if os.path.exists(json_path):
@@ -3316,15 +3435,17 @@ class InpaintingGUI(ThemedTk):
                     tile_num=legacy_tile_num,
                     enable_dynamic_chunk=enable_dynamic_chunk,
                     tile_mode=tile_mode if enable_dynamic_chunk else None,
-                    tile1_max_size=tile1_max_size if enable_dynamic_chunk else None,
-                    tile2_max_size=tile2_max_size if enable_dynamic_chunk else None,
+                    tile1_max_size=current_tile1_max_size if enable_dynamic_chunk else None,
+                    tile2_max_size=current_tile2_max_size if enable_dynamic_chunk else None,
                     vf=None, 
                     effective_inference_steps=num_inference_steps,
+                    dynamic_resolution_scale=dynamic_resolution_scale,
                     stop_event=self.stop_event,
                     update_info_callback=_threaded_update_info_callback, 
                     original_input_blend_strength=current_original_input_blend_strength,
                     output_crf=current_output_crf,
-                    process_length=current_process_length
+                    process_length=current_process_length,
+                    static_mask_divisor=static_mask_divisor,
                 )
                 
                 if completed:
@@ -3387,8 +3508,11 @@ class InpaintingGUI(ThemedTk):
             tile_mode = self._normalize_tile_mode(self.tile_mode_var.get(), tile_num=2)
             self.tile_mode_var.set(tile_mode)
             enable_dynamic_chunk = bool(self.enable_dynamic_chunk_var.get())
-            tile1_max_size = int(self.tile1_max_size_var.get())
-            tile2_max_size = int(self.tile2_max_size_var.get())
+            enable_dynamic_resolution = bool(self.enable_dynamic_resolution_var.get())
+            resolution_scale = self._parse_resolution_limit(self.resolution_limit_var.get())
+            static_mask_divisor = float(self.static_mask_divisor_var.get())
+            tile1_max_size = self._parse_chunk_limit_list(self.tile1_max_size_var.get(), "Tile 1 Max Size")
+            tile2_max_size = self._parse_chunk_limit_list(self.tile2_max_size_var.get(), "Tile 2 Max Size")
             frames_chunk = int(self.frames_chunk_var.get())
             gui_overlap = int(self.overlap_var.get())
             gui_tail_pad = int(self.tail_pad_var.get())
@@ -3399,13 +3523,13 @@ class InpaintingGUI(ThemedTk):
             if process_length != -1 and process_length <= 0:
                 raise ValueError("Process Length must be -1 or a positive integer.")
             
-            if num_inference_steps < 1.0 or frames_chunk < 1 or tile1_max_size < 1 or tile2_max_size < 1 or gui_overlap  < 0 or \
+            if num_inference_steps < 1.0 or frames_chunk < 1 or static_mask_divisor <= 0.0 or gui_overlap  < 0 or \
                gui_tail_pad < 0 or \
                not (0.0 <= gui_original_input_blend_strength  <= 1.0) or gui_output_crf < 0: # NEW VALIDATION for CRF
                 raise ValueError("Invalid parameter values")
         except ValueError:
             # UPDATED ERROR MESSAGE
-            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1.0, Frames Chunk >=1, Tile 1/2 Max Size >=1, Frame Overlap >=0, Tail Pad >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0.")
+            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1.0, Frames Chunk >=1, Tile 1/2 Max Size >=1 (single value or comma list), Static Mask Divisor >0, Frame Overlap >=0, Tail Pad >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0.")
             return
         offload_type = self.offload_type_var.get()
 
@@ -3422,7 +3546,7 @@ class InpaintingGUI(ThemedTk):
         self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
 
         threading.Thread(target=self.run_batch_process,
-                         args=(input_folder, output_folder, num_inference_steps, tile_mode, offload_type, enable_dynamic_chunk, tile1_max_size, tile2_max_size, frames_chunk, gui_overlap, gui_tail_pad, gui_original_input_blend_strength, gui_output_crf, process_length),
+                         args=(input_folder, output_folder, num_inference_steps, tile_mode, offload_type, enable_dynamic_chunk, tile1_max_size, tile2_max_size, frames_chunk, gui_overlap, gui_tail_pad, gui_original_input_blend_strength, gui_output_crf, process_length, enable_dynamic_resolution, resolution_scale, static_mask_divisor),
                          daemon=True).start()
 
     def stop_processing(self):
