@@ -28,7 +28,11 @@ from dependency.stereocrafter_util import (
     encode_frames_to_mp4, read_video_frames_decord
 )
 from dependency.ffmpeg_encoding_profiles import (
+    FFMPEG_CODEC_CHOICES,
+    GLOBAL_ENCODER_MODE_CHOICES,
     append_ffmpeg_extra_args,
+    normalize_codec,
+    normalize_global_encoder_mode,
     resolve_color_encoding_profile,
 )
 from pipelines.stereo_video_inpainting import (
@@ -56,6 +60,10 @@ DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS6 = 26
 DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS7 = 18
 DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS = 14
 DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR = 2.0
+DEFAULT_TILE1_CHUNK_BUCKETS_4090 = "4,26,33,44,61,89"
+DEFAULT_TILE2_CHUNK_BUCKETS_4090 = "72,87,108,118,118,118"
+DEFAULT_OUTPUT_CODEC = "libx264"
+DEFAULT_OUTPUT_ENCODER_MODE = "lossless"
 
 _ACTIVE_FFMPEG_WRITERS: set[subprocess.Popen] = set()
 _ACTIVE_FFMPEG_LOCK = threading.Lock()
@@ -208,8 +216,11 @@ class InpaintingGUI(ThemedTk):
         self._is_startup = True
         self.debug_mode_var = tk.BooleanVar(value=self.app_config.get("debug_mode_enabled", False))
 
-        self.input_folder_var = tk.StringVar(value=self.app_config.get("input_folder", "./output_splatted"))
-        self.output_folder_var = tk.StringVar(value=self.app_config.get("output_folder", "./completed_output"))
+        self.input_folder_var = tk.StringVar(value=self.app_config.get("input_folder", "./work/splat/"))
+        self.output_folder_var = tk.StringVar(value=self.app_config.get("output_folder", "./work/output/"))
+        self.sharpness_csv_path_var = tk.StringVar(
+            value=self.app_config.get("sharpness_csv_path", "./work/sharpness.csv")
+        )
         self.num_inference_steps_var = tk.StringVar(value=str(self.app_config.get("num_inference_steps", 5)))
         if "tile_mode" in self.app_config:
             tile_mode_default = self._normalize_tile_mode(
@@ -228,31 +239,41 @@ class InpaintingGUI(ThemedTk):
             value=bool(self.app_config.get("enable_dynamic_chunk", True))
         )
         self.enable_dynamic_resolution_var = tk.BooleanVar(
-            value=bool(self.app_config.get("enable_dynamic_resolution", False))
+            value=bool(self.app_config.get("enable_dynamic_resolution", True))
         )
         self.resolution_limit_var = tk.StringVar(
-            value=str(self.app_config.get("resolution_limit", "100%"))
+            value=str(self.app_config.get("resolution_limit", "90%"))
         )
         self.static_mask_divisor_var = tk.StringVar(
             value=str(self.app_config.get("static_mask_divisor", DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR))
         )
         self.tile_mode_var = tk.StringVar(value=tile_mode_default)
         self.tile1_max_size_var = tk.StringVar(
-            value=str(self.app_config.get("tile1_max_size", 22))
+            value=str(self.app_config.get("tile1_max_size", DEFAULT_TILE1_CHUNK_BUCKETS_4090))
         )
         self.tile2_max_size_var = tk.StringVar(
-            value=str(self.app_config.get("tile2_max_size", 55))
+            value=str(self.app_config.get("tile2_max_size", DEFAULT_TILE2_CHUNK_BUCKETS_4090))
         )
         self.frames_chunk_var = tk.StringVar(value=str(self.app_config.get("frames_chunk", 23)))
         self.overlap_var = tk.StringVar(value=str(self.app_config.get("frame_overlap", 2)))
         self.tail_pad_var = tk.StringVar(value=str(self.app_config.get("tail_pad", 1)))
         self.original_input_blend_strength_var = tk.StringVar(value=str(self.app_config.get("original_input_blend_strength", 0.0)))
         self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
+        self.output_codec_var = tk.StringVar(
+            value=normalize_codec(self.app_config.get("output_codec", DEFAULT_OUTPUT_CODEC), DEFAULT_OUTPUT_CODEC)
+        )
+        self.encoder_mode_var = tk.StringVar(
+            value=normalize_global_encoder_mode(
+                self.app_config.get("encoder_mode", DEFAULT_OUTPUT_ENCODER_MODE),
+                DEFAULT_OUTPUT_ENCODER_MODE,
+            )
+        )
         self.process_length_var = tk.StringVar(value=str(self.app_config.get("process_length", -1)))
-        self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "model"))
-        self.hires_blend_folder_var = tk.StringVar(value=self.app_config.get("hires_blend_folder", "./output_splatted_hires"))
-        self.replace_mask_folder_var = tk.StringVar(value=self.app_config.get("replace_mask_folder", ""))
-        self.use_replace_mask_var = tk.BooleanVar(value=self.app_config.get("use_replace_mask", False))
+        self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "none"))
+        self.hires_blend_folder_var = tk.StringVar(value=self.app_config.get("hires_blend_folder", ""))
+        self.replace_mask_folder_var = tk.StringVar(value=self.app_config.get("replace_mask_folder", "./work/mask/"))
+        self.use_replace_mask_var = tk.BooleanVar(value=self.app_config.get("use_replace_mask", True))
+        self.resume_skip_existing_var = tk.BooleanVar(value=self.app_config.get("resume_skip_existing", True))
         
         # --- NEW: Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
         self.mask_initial_threshold_var = tk.StringVar(value=str(self.app_config.get("mask_initial_threshold", 0.3)))
@@ -660,6 +681,15 @@ class InpaintingGUI(ThemedTk):
         folder = filedialog.askdirectory(initialdir=self.input_folder_var.get())
         if folder:
             self.input_folder_var.set(folder)
+
+    def _browse_sharpness_csv(self):
+        filename = filedialog.askopenfilename(
+            initialdir=os.path.dirname(self.sharpness_csv_path_var.get() or self.input_folder_var.get()) or ".",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Select sharpness.csv",
+        )
+        if filename:
+            self.sharpness_csv_path_var.set(filename)
 
     def _browse_output(self):
         folder = filedialog.askdirectory(initialdir=self.output_folder_var.get())
@@ -1096,9 +1126,11 @@ class InpaintingGUI(ThemedTk):
             # Folder Configurations
             "input_folder": self.input_folder_var.get(),
             "output_folder": self.output_folder_var.get(),
+            "sharpness_csv_path": self.sharpness_csv_path_var.get(),
             "hires_blend_folder": self.hires_blend_folder_var.get(),
             "replace_mask_folder": self.replace_mask_folder_var.get(),
             "use_replace_mask": self.use_replace_mask_var.get(),
+            "resume_skip_existing": self.resume_skip_existing_var.get(),
 
             # GUI State Configurations
             "dark_mode_enabled": self.dark_mode_var.get(),
@@ -1122,6 +1154,8 @@ class InpaintingGUI(ThemedTk):
             "tail_pad": self.tail_pad_var.get(),
             "original_input_blend_strength": self.original_input_blend_strength_var.get(),            
             "output_crf": self.output_crf_var.get(),
+            "output_codec": self.output_codec_var.get(),
+            "encoder_mode": normalize_global_encoder_mode(self.encoder_mode_var.get()),
             "offload_type": self.offload_type_var.get(),
 
             # --- Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
@@ -1955,10 +1989,20 @@ class InpaintingGUI(ThemedTk):
         ttk.Button(folder_frame, text="Browse", command=self._browse_input).grid(row=current_row, column=2, padx=5)
         current_row += 1
 
+        sharpness_label = ttk.Label(folder_frame, text="Sharpness CSV:")
+        sharpness_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(
+            sharpness_label,
+            "Required when Dynamic Chunk or Dynamic Resolution is enabled. Create it with python ./Utilities/analyze_inpaint_sharpness.py",
+        )
+        ttk.Entry(folder_frame, textvariable=self.sharpness_csv_path_var, width=40).grid(row=current_row, column=1, padx=5, sticky="ew")
+        ttk.Button(folder_frame, text="Browse", command=self._browse_sharpness_csv).grid(row=current_row, column=2, padx=5)
+        current_row += 1
+
         # --- NEW: Hi-Res Blend Folder ---
         hires_label = ttk.Label(folder_frame, text="Hi-Res Blend Folder:")
         hires_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(hires_label, "Folder containing matching high-resolution splatted files for final blending.")
+        Tooltip(hires_label, "Optional input folder containing matching high-resolution splatted files for final blending. Leave empty to disable.")
         ttk.Entry(folder_frame, textvariable=self.hires_blend_folder_var, width=40).grid(row=current_row, column=1, padx=5, sticky="ew")
         ttk.Button(folder_frame, text="Browse", command=self._browse_hires_folder).grid(row=current_row, column=2, padx=5)
         current_row += 1
@@ -1976,6 +2020,18 @@ class InpaintingGUI(ThemedTk):
             variable=self.use_replace_mask_var,
         )
         replace_mask_check.grid(row=current_row, column=1, columnspan=2, sticky="w", padx=5, pady=(0, 4))
+        current_row += 1
+
+        resume_check = ttk.Checkbutton(
+            folder_frame,
+            text="Resume / Skip Existing (do not move inputs)",
+            variable=self.resume_skip_existing_var,
+        )
+        resume_check.grid(row=current_row, column=1, columnspan=2, sticky="w", padx=5, pady=(0, 4))
+        Tooltip(
+            resume_check,
+            "When enabled, existing outputs are skipped and source files are not moved to finished folders.",
+        )
         current_row += 1
         
         # Output Folder
@@ -2147,11 +2203,37 @@ class InpaintingGUI(ThemedTk):
         ttk.Entry(param_frame, textvariable=self.process_length_var, width=10).grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
-        # Row 7: Output CRF
+        # Row 7: Output encoding
         output_crf_label = ttk.Label(param_frame, text="Output Quality (CRF/QP):")
         output_crf_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(output_crf_label, self.help_data.get("output_crf", ""))
         ttk.Entry(param_frame, textvariable=self.output_crf_var, width=10).grid(row=current_row, column=1, sticky="w", padx=5)
+
+        output_codec_label = ttk.Label(param_frame, text="Codec:")
+        output_codec_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        self.output_codec_combo = ttk.Combobox(
+            param_frame,
+            textvariable=self.output_codec_var,
+            values=FFMPEG_CODEC_CHOICES,
+            state="readonly",
+            width=12,
+        )
+        self.output_codec_combo.grid(row=current_row, column=3, sticky="w", padx=5)
+        self.output_codec_combo.bind("<<ComboboxSelected>>", lambda _e: self.save_config())
+        current_row += 1
+
+        encoder_mode_label = ttk.Label(param_frame, text="Encoder Mode:")
+        encoder_mode_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(encoder_mode_label, "Shared output quality mode. Lossless ignores the numeric CRF/QP field.")
+        self.encoder_mode_combo = ttk.Combobox(
+            param_frame,
+            textvariable=self.encoder_mode_var,
+            values=GLOBAL_ENCODER_MODE_CHOICES,
+            state="readonly",
+            width=12,
+        )
+        self.encoder_mode_combo.grid(row=current_row, column=1, sticky="w", padx=5)
+        self.encoder_mode_combo.bind("<<ComboboxSelected>>", lambda _e: self.save_config())
         current_row += 1
 
         self._toggle_dynamic_chunk_controls(save=False)
@@ -3224,24 +3306,28 @@ class InpaintingGUI(ThemedTk):
             return
 
         # Set default values for all your configuration variables
-        self.input_folder_var.set("./output_splatted")
-        self.output_folder_var.set("./completed_output")
-        self.hires_blend_folder_var.set("./output_splatted_hires")
-        self.replace_mask_folder_var.set("")
-        self.use_replace_mask_var.set(False)
+        self.input_folder_var.set("./work/splat/")
+        self.output_folder_var.set("./work/output/")
+        self.sharpness_csv_path_var.set("./work/sharpness.csv")
+        self.hires_blend_folder_var.set("")
+        self.replace_mask_folder_var.set("./work/mask/")
+        self.use_replace_mask_var.set(True)
+        self.resume_skip_existing_var.set(True)
         self.num_inference_steps_var.set("5")
         self.enable_dynamic_chunk_var.set(True)
-        self.enable_dynamic_resolution_var.set(False)
-        self.resolution_limit_var.set("100%")
+        self.enable_dynamic_resolution_var.set(True)
+        self.resolution_limit_var.set("90%")
         self.static_mask_divisor_var.set(str(DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR))
         self.tile_mode_var.set("1 and 2")
-        self.tile1_max_size_var.set("22")
-        self.tile2_max_size_var.set("55")
+        self.tile1_max_size_var.set(DEFAULT_TILE1_CHUNK_BUCKETS_4090)
+        self.tile2_max_size_var.set(DEFAULT_TILE2_CHUNK_BUCKETS_4090)
         self.frames_chunk_var.set("23")
         self.overlap_var.set("2")
         self.tail_pad_var.set("1")
         self.original_input_blend_strength_var.set("0.5")
-        self.offload_type_var.set("model")
+        self.output_codec_var.set(DEFAULT_OUTPUT_CODEC)
+        self.encoder_mode_var.set(DEFAULT_OUTPUT_ENCODER_MODE)
+        self.offload_type_var.set("none")
 
         self.mask_initial_threshold_var.set("0.3")
         self.mask_morph_kernel_size_var.set("0.0")
@@ -3321,10 +3407,13 @@ class InpaintingGUI(ThemedTk):
             gui_tail_pad,
             gui_original_input_blend_strength,
             gui_output_crf,
+            output_codec,
+            encoder_mode,
             process_length,
             enable_dynamic_resolution,
             resolution_scale,
             static_mask_divisor,
+            resume_skip_existing,
         ):
         """
         Orchestrates the batch processing of videos, handling sidecar JSON,
@@ -3358,6 +3447,21 @@ class InpaintingGUI(ThemedTk):
                 if self.stop_event.is_set():
                     logger.info("Processing stopped by user.")
                     break
+
+                expected_output_path, _ = self._setup_video_info_and_hires(
+                    video_path,
+                    output_folder,
+                    self._infer_input_layout_from_stem(os.path.splitext(os.path.basename(video_path))[0]),
+                )
+                if resume_skip_existing and expected_output_path and os.path.exists(expected_output_path):
+                    logger.info(
+                        "Resume: skipping %s because output already exists: %s",
+                        os.path.basename(video_path),
+                        expected_output_path,
+                    )
+                    self.after(0, self.update_status_label, f"Skipping existing output {idx + 1} of {self.total_videos.get()}")
+                    self.processed_count.set(idx + 1)
+                    continue
                 
                 # Initialize current video's parameters with GUI fallbacks
                 current_overlap = gui_overlap
@@ -3444,11 +3548,13 @@ class InpaintingGUI(ThemedTk):
                     update_info_callback=_threaded_update_info_callback, 
                     original_input_blend_strength=current_original_input_blend_strength,
                     output_crf=current_output_crf,
+                    output_codec=output_codec,
+                    output_encoding_mode=encoder_mode,
                     process_length=current_process_length,
                     static_mask_divisor=static_mask_divisor,
                 )
                 
-                if completed:
+                if completed and not resume_skip_existing:
                     # Define finished folder paths dynamically
                     low_res_input_folder = input_folder
                     hires_input_folder = self.hires_blend_folder_var.get()
@@ -3476,8 +3582,10 @@ class InpaintingGUI(ThemedTk):
                                 logger.error(f"Failed to move Hi-Res input {hi_res_input_path} to {hires_finished_folder}: {e}")
                         else:
                             logger.warning(f"Skipping Hi-Res move: Folder {hires_input_folder} is same as Low-Res folder.")
-                else:
+                elif not completed:
                     logger.info(f"Processing of {video_path} was stopped or skipped due to issues.")
+                elif resume_skip_existing:
+                    logger.info("Resume: completed %s without moving source files.", os.path.basename(video_path))
                 
                 self.processed_count.set(idx + 1)
                 
@@ -3499,7 +3607,7 @@ class InpaintingGUI(ThemedTk):
             "Developed by [Your Name/Alias] for StereoCrafter projects." # Customize this!
         )
         messagebox.showinfo("About Batch Video Inpainting", about_text)
-    
+
     def start_processing(self):
         input_folder = self.input_folder_var.get()
         output_folder = self.output_folder_var.get()
@@ -3518,6 +3626,10 @@ class InpaintingGUI(ThemedTk):
             gui_tail_pad = int(self.tail_pad_var.get())
             gui_original_input_blend_strength = float(self.original_input_blend_strength_var.get())
             gui_output_crf = int(self.output_crf_var.get()) # NEW: Get CRF
+            output_codec = normalize_codec(self.output_codec_var.get(), DEFAULT_OUTPUT_CODEC)
+            encoder_mode = normalize_global_encoder_mode(self.encoder_mode_var.get(), DEFAULT_OUTPUT_ENCODER_MODE)
+            self.output_codec_var.set(output_codec)
+            self.encoder_mode_var.set(encoder_mode)
             # Get Process Length and Validate
             process_length = int(self.process_length_var.get())
             if process_length != -1 and process_length <= 0:
@@ -3537,6 +3649,29 @@ class InpaintingGUI(ThemedTk):
             messagebox.showerror("Error", "Invalid input or output folder")
             return
 
+        if enable_dynamic_chunk or enable_dynamic_resolution:
+            sharpness_csv = os.path.normpath(str(self.sharpness_csv_path_var.get() or "").strip())
+            if not sharpness_csv or not os.path.isfile(sharpness_csv):
+                dynamic_features = []
+                if enable_dynamic_chunk:
+                    dynamic_features.append("Dynamic Chunk")
+                if enable_dynamic_resolution:
+                    dynamic_features.append("Dynamic Resolution")
+                feature_text = " / ".join(dynamic_features)
+                messagebox.showerror(
+                    "Missing sharpness.csv",
+                    (
+                        f"{feature_text} requires sharpness.csv and cannot continue without it.\n\n"
+                        f"Configured path:\n{sharpness_csv or '(empty)'}\n\n"
+                        "Create it before running Inpainting:\n"
+                        "python ./Utilities/analyze_inpaint_sharpness.py\n\n"
+                        "Typical standalone usage:\n"
+                        f"python ./Utilities/analyze_inpaint_sharpness.py \"{input_folder}\" "
+                        f"--out_csv \"{self.sharpness_csv_path_var.get()}\""
+                    ),
+                )
+                return
+
         self.processed_count.set(0)
         self.total_videos.set(0)
         self.stop_event.clear()
@@ -3546,7 +3681,7 @@ class InpaintingGUI(ThemedTk):
         self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
 
         threading.Thread(target=self.run_batch_process,
-                         args=(input_folder, output_folder, num_inference_steps, tile_mode, offload_type, enable_dynamic_chunk, tile1_max_size, tile2_max_size, frames_chunk, gui_overlap, gui_tail_pad, gui_original_input_blend_strength, gui_output_crf, process_length, enable_dynamic_resolution, resolution_scale, static_mask_divisor),
+                         args=(input_folder, output_folder, num_inference_steps, tile_mode, offload_type, enable_dynamic_chunk, tile1_max_size, tile2_max_size, frames_chunk, gui_overlap, gui_tail_pad, gui_original_input_blend_strength, gui_output_crf, output_codec, encoder_mode, process_length, enable_dynamic_resolution, resolution_scale, static_mask_divisor, bool(self.resume_skip_existing_var.get())),
                          daemon=True).start()
 
     def stop_processing(self):
@@ -3646,9 +3781,15 @@ class InpaintingGUI(ThemedTk):
                 self._normalize_tile_mode(self.tile_mode_var.get(), tile_num=2)
             )
             if not self.tile1_max_size_var.get().strip():
-                self.tile1_max_size_var.set("22")
+                self.tile1_max_size_var.set(DEFAULT_TILE1_CHUNK_BUCKETS_4090)
             if not self.tile2_max_size_var.get().strip():
-                self.tile2_max_size_var.set("55")
+                self.tile2_max_size_var.set(DEFAULT_TILE2_CHUNK_BUCKETS_4090)
+            if hasattr(self, "output_codec_var"):
+                self.output_codec_var.set(normalize_codec(self.output_codec_var.get(), DEFAULT_OUTPUT_CODEC))
+            if hasattr(self, "encoder_mode_var"):
+                self.encoder_mode_var.set(
+                    normalize_global_encoder_mode(self.encoder_mode_var.get(), DEFAULT_OUTPUT_ENCODER_MODE)
+                )
 
             self._apply_theme() # Re-apply theme in case dark mode setting was loaded
             # --- FIX: Correct function name for updating blend fields state ---

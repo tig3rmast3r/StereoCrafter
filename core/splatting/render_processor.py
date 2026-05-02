@@ -74,6 +74,8 @@ class RenderProcessor:
         global_depth_max: float,
         depth_stream_info: Optional[dict],
         user_output_crf: Optional[int] = None,
+        force_output_codec: Optional[str] = None,
+        encoding_mode: Optional[str] = None,
         is_low_res_task: bool = False,
         depth_gamma: float = 1.0,
         depth_dilate_size_x: float = 0.0,
@@ -125,6 +127,8 @@ class RenderProcessor:
             global_max_depth: Global max depth used for normalization
             depth_stream_info: Metadata for depth map
             user_output_crf: Output quality value (CRF for libx, QP for NVENC)
+            force_output_codec: Explicit codec for shared encoder profiles
+            encoding_mode: Shared encoder profile, e.g. lossless
             is_low_res_task: Whether this is a low-res pass
             depth_gamma: Gamma correction for depth
             depth_dilate_size_x: X dilation for depth
@@ -175,6 +179,8 @@ class RenderProcessor:
                 fps=processed_fps,
                 video_stream_info=encode_stream_info,
                 user_output_crf=user_output_crf,
+                force_output_codec=force_output_codec,
+                encoding_mode=encoding_mode,
                 output_format_str="splatted_single_warp" if layout == "single_warp" else "splatted_grid",
                 debug_label=task_name,
             )

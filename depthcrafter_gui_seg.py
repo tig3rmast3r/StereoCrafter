@@ -147,8 +147,8 @@ class DepthCrafterGUI:
         self.root.title(f"DepthCrafter GUI Seg {GUI_VERSION}")
         self.dark_mode_var = tk.BooleanVar(value=False)
         self.current_theme_colors = LIGHT_MODE_COLORS # Initialize theme colors dictionary
-        self.input_dir_or_file_var = tk.StringVar(value=os.path.normpath("./input_clips"))
-        self.output_dir = tk.StringVar(value=os.path.normpath("./output_depthmaps"))
+        self.input_dir_or_file_var = tk.StringVar(value=os.path.normpath("./work/seg/"))
+        self.output_dir = tk.StringVar(value=os.path.normpath("./work/depthmap/"))
         self.guidance_scale = tk.DoubleVar(value=1.0)
         self.inference_steps = tk.IntVar(value=4)
         self.seed = tk.IntVar(value=42)
@@ -159,6 +159,7 @@ class DepthCrafterGUI:
         self.window_size = tk.IntVar(value=110)
         self.overlap = tk.IntVar(value=25)
         self.process_as_segments_var = tk.BooleanVar(value=False)
+        self.resume_skip_existing_var = tk.BooleanVar(value=True)
         self.save_final_output_json_var = tk.BooleanVar(value=False)
         self.merge_output_format_var = tk.StringVar(value="mp4")
         self.merge_alignment_method_var = tk.StringVar(value="Shift & Scale")
@@ -207,6 +208,7 @@ class DepthCrafterGUI:
             "window_size": self.window_size,
             "overlap": self.overlap,
             "process_as_segments_var": self.process_as_segments_var,
+            "resume_skip_existing_var": self.resume_skip_existing_var,
             "save_final_output_json_var": self.save_final_output_json_var,
             "merge_output_format_var": self.merge_output_format_var,
             "merge_alignment_method_var": self.merge_alignment_method_var,
@@ -633,7 +635,9 @@ class DepthCrafterGUI:
 
         final_status = master_meta_for_this_vid.get("overall_status", "all_failed")
 
-        if self.effective_move_original_on_completion:
+        if self.resume_skip_existing_var.get():
+            _logger.info(f"Resume: leaving original source '{original_basename}' in place.")
+        elif self.effective_move_original_on_completion:
             target_subfolder_name = ""
             if final_status == "all_success":
                 target_subfolder_name = "finished"
@@ -1588,6 +1592,15 @@ class DepthCrafterGUI:
         _create_hover_tooltip(self.save_final_json_cb, "save_final_json")
         self.widgets_to_disable_during_processing.append(self.save_final_json_cb); row_idx +=1
 
+        self.resume_skip_existing_cb = ttk.Checkbutton(
+            fs_frame,
+            text="Resume / Skip Existing (do not move inputs)",
+            variable=self.resume_skip_existing_var,
+        )
+        self.resume_skip_existing_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.resume_skip_existing_cb, "resume_skip_existing")
+        self.widgets_to_disable_during_processing.append(self.resume_skip_existing_cb); row_idx += 1
+
         # Process as Segments
         self.process_as_segments_cb = ttk.Checkbutton(fs_frame, text="Process as Segments (Low VRAM Mode)", variable=self.process_as_segments_var, command=self.toggle_merge_related_options_active_state)
         self.process_as_segments_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
@@ -2204,6 +2217,17 @@ class DepthCrafterGUI:
             gui_win_setting = self.window_size.get()
             gui_ov_setting = self.overlap.get()
 
+            if self.resume_skip_existing_var.get() and self.process_as_segments_var.get():
+                segment_final_output = os.path.join(
+                    self.output_dir.get(),
+                    f"{original_basename}{self.merge_output_suffix_var.get()}.mp4",
+                )
+                if os.path.exists(segment_final_output):
+                    _logger.info(f"Resume: skipping {original_basename}; merged output already exists: {segment_final_output}")
+                    total_sources_processed += 1
+                    self.message_queue.put(("progress", total_sources_processed))
+                    continue
+
             log_msg_base = f"Source {source_idx+1}/{len(source_specs_to_process)}: {original_basename}"
             _logger.debug(f"--- Defining Jobs for {log_msg_base}...")
             self.status_message_var.set(f"Defining jobs for {source_idx+1} of {len(source_specs_to_process)}")
@@ -2287,7 +2311,10 @@ class DepthCrafterGUI:
             else: # Full video processing mode
                 full_out_check_path = os.path.join(self.output_dir.get(), get_full_video_output_filename(original_basename, "mp4"))
                 proceed_full = True
-                if os.path.exists(full_out_check_path):
+                if self.resume_skip_existing_var.get() and os.path.exists(full_out_check_path):
+                    _logger.info(f"Resume: skipping {original_basename}; output already exists: {full_out_check_path}")
+                    proceed_full = False
+                elif os.path.exists(full_out_check_path):
                     if not messagebox.askyesno("Overwrite?", f"An output file for '{original_basename}' might exist (e.g., MP4):\n{full_out_check_path}\n\nOverwrite if it exists?"):
                         _logger.info(f"Skipping {original_basename} (full video processing, user chose not to overwrite).")
                         proceed_full = False

@@ -25,6 +25,12 @@ from dependency.repo_paths import config_path, log_path
 from runners.mask_formerge_nogui import (
     load_motion_defaults as load_mask_formerge_motion_defaults,
 )
+from dependency.ffmpeg_encoding_profiles import (
+    FFMPEG_CODEC_CHOICES,
+    GLOBAL_ENCODER_MODE_CHOICES,
+    normalize_codec,
+    normalize_global_encoder_mode,
+)
 from dependency.stereocrafter_util import (
     Tooltip,
     logger,
@@ -1695,12 +1701,12 @@ class MergingGUI(ThemedTk):
 
     # --- Centralized Default Settings ---
     APP_DEFAULTS = {
-        "inpainted_folder": "./completed_output",
-        "original_folder": "./input_source_clips",
-        "mask_folder": "./output_splatted/hires",
-        "replace_mask_folder": "",  # optional; if empty uses splatted folder
+        "inpainted_folder": "./work/output/",
+        "original_folder": "./work/seg/",
+        "mask_folder": "./work/splat/hires/",
+        "replace_mask_folder": "./work/mask/",
         "mask_formerge_folder": "./work/mask_for_merge",
-        "output_folder": "./final_videos",
+        "output_folder": "./work/sbs/",
         "use_replace_mask": True,
         "use_mask_formerge": False,
         "mask_binarize_threshold": -0.01,
@@ -1720,15 +1726,18 @@ class MergingGUI(ThemedTk):
         "shadow_component_merge_y_tol_px": 4,
         "shadow_alpha_down": 0.45,
         "preview_shadow_temporal": False,
-        "use_gpu": True,
+        "use_gpu": False,
         "output_format": "Full SBS (Left-Right)",
+        "ffmpeg_codec": "libx264",
+        "encoder_mode": "lossless",
+        "resume": True,
         "pad_to_16_9": False,
         "add_borders": False,
         "enable_color_transfer": True,
         "ct_preset": "1) safe sr=ring ts=inpainted ref=warped",
         "auto_ct_eval": True,
-        "ct_auto_mode": CT_AUTO_MODE_ON,
-        "ct_csv_blend_path": "",
+        "ct_auto_mode": CT_AUTO_MODE_CSV_BLEND,
+        "ct_csv_blend_path": "./work/autoct.csv",
         "show_blend_in_preview": True,
         "ct_advanced": False,
         "ct_strength": 1.0,
@@ -2052,6 +2061,18 @@ class MergingGUI(ThemedTk):
         )
         if self.output_format_var.get() not in self.OUTPUT_FORMAT_CHOICES:
             self.output_format_var.set(self.APP_DEFAULTS["output_format"])
+        self.ffmpeg_codec_var = tk.StringVar(
+            value=normalize_codec(
+                self.app_config.get("ffmpeg_codec", self.APP_DEFAULTS["ffmpeg_codec"]),
+                self.APP_DEFAULTS["ffmpeg_codec"],
+            )
+        )
+        self.encoder_mode_var = tk.StringVar(
+            value=normalize_global_encoder_mode(
+                self.app_config.get("encoder_mode", self.APP_DEFAULTS["encoder_mode"]),
+                self.APP_DEFAULTS["encoder_mode"],
+            )
+        )
         self.pad_to_16_9_var = tk.BooleanVar(
             value=self.app_config.get("pad_to_16_9", self.APP_DEFAULTS["pad_to_16_9"])
         )
@@ -2453,6 +2474,11 @@ class MergingGUI(ThemedTk):
                     logger.error(
                         f"Could not apply setting for '{key}' with value '{value}': {e}"
                     )
+
+        self.ffmpeg_codec_var.set(normalize_codec(self.ffmpeg_codec_var.get(), self.APP_DEFAULTS["ffmpeg_codec"]))
+        self.encoder_mode_var.set(
+            normalize_global_encoder_mode(self.encoder_mode_var.get(), self.APP_DEFAULTS["encoder_mode"])
+        )
 
         if "ct_auto_mode" not in settings_dict and "auto_ct_eval" in settings_dict:
             self.ct_auto_mode_var.set(
@@ -3285,6 +3311,30 @@ class MergingGUI(ThemedTk):
         self._create_hover_tooltip(output_format_combo, "output_format")
         self.widgets_to_disable.append(output_format_combo)
 
+        ttk.Label(options_frame, text="Codec:").pack(side="left", padx=(10, 5))
+        ffmpeg_codec_combo = ttk.Combobox(
+            options_frame,
+            textvariable=self.ffmpeg_codec_var,
+            values=FFMPEG_CODEC_CHOICES,
+            state="readonly",
+            width=10,
+        )
+        ffmpeg_codec_combo.pack(side="left", padx=5)
+        ffmpeg_codec_combo.bind("<<ComboboxSelected>>", lambda _e: self.save_config())
+        self.widgets_to_disable.append(ffmpeg_codec_combo)
+
+        ttk.Label(options_frame, text="Encoder:").pack(side="left", padx=(10, 5))
+        encoder_mode_combo = ttk.Combobox(
+            options_frame,
+            textvariable=self.encoder_mode_var,
+            values=GLOBAL_ENCODER_MODE_CHOICES,
+            state="readonly",
+            width=10,
+        )
+        encoder_mode_combo.pack(side="left", padx=5)
+        encoder_mode_combo.bind("<<ComboboxSelected>>", lambda _e: self.save_config())
+        self.widgets_to_disable.append(encoder_mode_combo)
+
         color_check = ttk.Checkbutton(
             options_frame,
             text="Color Transfer",
@@ -3320,7 +3370,9 @@ class MergingGUI(ThemedTk):
         self.widgets_to_disable.append(borders_check)
 
         # Resume
-        self.resume_var = tk.BooleanVar(value=self.app_config.get("resume", False))
+        self.resume_var = tk.BooleanVar(
+            value=self.app_config.get("resume", self.APP_DEFAULTS["resume"])
+        )
         self.resume_var.trace_add("write", self._on_resume_changed)
         resume_check = ttk.Checkbutton(
             options_frame, text="Resume", variable=self.resume_var
@@ -3835,6 +3887,10 @@ class MergingGUI(ThemedTk):
                 "add_borders": self.add_borders_var.get(),
                 "resume": self.resume_var.get(),
                 "output_format": self.output_format_var.get(),
+                "ffmpeg_codec": normalize_codec(self.ffmpeg_codec_var.get(), self.APP_DEFAULTS["ffmpeg_codec"]),
+                "encoder_mode": normalize_global_encoder_mode(
+                    self.encoder_mode_var.get(), self.APP_DEFAULTS["encoder_mode"]
+                ),
                 "batch_chunk_size": int(self.batch_chunk_size_var.get()),
                 "enable_color_transfer": self.enable_color_transfer_var.get(),
                 "ct_preset": selected_preset_label,
@@ -3982,35 +4038,9 @@ class MergingGUI(ThemedTk):
             self.after(0, self.processing_done)
             return
 
-        # --- NEW: Skip already finished files when Resume is enabled ---
         resume_enabled = settings.get("resume", False)
-        if resume_enabled and not single_mode:
-            finished_dir = os.path.join(settings["inpainted_folder"], "finished")
-            if os.path.isdir(finished_dir):
-                finished_files = set(os.listdir(finished_dir))
-                original_count = len(inpainted_videos)
-                inpainted_videos = [
-                    v
-                    for v in inpainted_videos
-                    if os.path.basename(v) not in finished_files
-                ]
-                skipped_count = original_count - len(inpainted_videos)
-                if skipped_count > 0:
-                    logger.info(
-                        f"Resume: Skipped {skipped_count} already processed files."
-                    )
-            else:
-                logger.info("Resume: No 'finished' folder found. Processing all files.")
-
-        if not inpainted_videos:
-            self.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Info", "All videos have already been processed (Resume mode)."
-                ),
-            )
-            self.after(0, self.processing_done)
-            return
+        if resume_enabled:
+            logger.info("Resume: existing outputs will be skipped and inputs will not be moved.")
         # --- END NEW ---
 
         # --- NEW: Clear any failed moves from a previous run ---
@@ -4278,6 +4308,15 @@ class MergingGUI(ThemedTk):
                 output_path = os.path.join(settings["output_folder"], output_filename)
                 # --- END NEW ---
 
+                if resume_enabled and os.path.exists(output_path):
+                    logger.info(
+                        "Resume: skipping %s because output already exists: %s",
+                        base_name,
+                        output_path,
+                    )
+                    self.after(0, self.progress_var.set, i + 1)
+                    continue
+
                 # --- NEW: Pass padding setting to FFmpeg ---
                 ffmpeg_process = start_ffmpeg_pipe_process(
                     content_width=output_width,
@@ -4287,6 +4326,8 @@ class MergingGUI(ThemedTk):
                     video_stream_info=video_stream_info,
                     pad_to_16_9=settings["pad_to_16_9"],
                     output_format_str=output_format,
+                    force_output_codec=settings.get("ffmpeg_codec", self.APP_DEFAULTS["ffmpeg_codec"]),
+                    encoding_mode=settings.get("encoder_mode", self.APP_DEFAULTS["encoder_mode"]),
                 )  # Pass the format string
 
                 if ffmpeg_process is None:
@@ -4964,8 +5005,8 @@ class MergingGUI(ThemedTk):
                     time.sleep(0.1)  # Give OS a moment to release file handles
                     logger.debug("Source video file handles released.")
 
-                    # --- NEW: Move files to finished folder if Resume is enabled ---
-                    if settings.get("resume", False):
+                    # With Resume off, preserve the legacy move-to-finished cleanup path.
+                    if not settings.get("resume", True):
                         self.cleanup_queue.put(
                             (inpainted_video_path, settings["inpainted_folder"])
                         )

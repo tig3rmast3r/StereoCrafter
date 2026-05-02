@@ -26,6 +26,12 @@ from typing import Optional, Tuple, Any, Dict
 from PIL import Image
 import math
 from dependency.repo_paths import config_path, repo_path
+from dependency.ffmpeg_encoding_profiles import (
+    FFMPEG_CODEC_CHOICES,
+    GLOBAL_ENCODER_MODE_CHOICES,
+    normalize_codec,
+    normalize_global_encoder_mode,
+)
 
 # --- Depth Map Visualization Levels ---
 # These affect ONLY depth-map visualization (Preview 'Depth Map' and Map Test images),
@@ -94,10 +100,10 @@ GUI_VERSION = "26-02-07.1"
 # ----------------------------------------------------------------------
 # Staircase smoothing (post-warp) defaults (used by GUI + processing)
 # ----------------------------------------------------------------------
-SPLAT_STAIR_SMOOTH_ENABLED = False
+SPLAT_STAIR_SMOOTH_ENABLED = True
 SPLAT_BLUR_KERNEL = 3
 SPLAT_STAIR_EDGE_X_OFFSET = 2
-SPLAT_STAIR_STRIP_PX = 3
+SPLAT_STAIR_STRIP_PX = 4
 SPLAT_STAIR_STRENGTH = 1.0
 SPLAT_STAIR_DEBUG_MASK = False
 
@@ -175,19 +181,19 @@ class SplatterGUI(ThemedTk):
         "OUTPUT_SIDECAR_EXT": ".spsidecar",
         "DEFAULT_CONFIG_FILENAME": str(config_path("config_splat.json")),
         # GUI/Processing Defaults (Used for reset/fallback)
-        "MAX_DISP": "30.0",
+        "MAX_DISP": "20.0",
         "CONV_POINT": "0.5",
         "PROC_LENGTH": "-1",
-        "BATCH_SIZE_FULL": "10",
-        "BATCH_SIZE_LOW": "15",
+        "BATCH_SIZE_FULL": "50",
+        "BATCH_SIZE_LOW": "50",
         "CRF_OUTPUT": "23",
         # Depth Processing Defaults
         "DEPTH_GAMMA": "1.0",
         "DEPTH_DILATE_SIZE_X": "3",
-        "DEPTH_DILATE_SIZE_Y": "3",
-        "DEPTH_BLUR_SIZE_X": "5",
-        "DEPTH_BLUR_SIZE_Y": "5",
-        "DEPTH_DILATE_LEFT": "0",
+        "DEPTH_DILATE_SIZE_Y": "1.5",
+        "DEPTH_BLUR_SIZE_X": "0",
+        "DEPTH_BLUR_SIZE_Y": "0",
+        "DEPTH_DILATE_LEFT": "1",
         "DEPTH_BLUR_LEFT": "0",
         "DEPTH_BLUR_LEFT_MIX": "0.5",
         "BORDER_WIDTH": "0.0",
@@ -271,8 +277,8 @@ class SplatterGUI(ThemedTk):
         defaults = self.APP_CONFIG_DEFAULTS  # Convenience variable
 
         self.dark_mode_var = tk.BooleanVar(value=False)
-        self.input_source_clips_var = tk.StringVar(value="./input_source_clips")
-        self.input_depth_maps_var = tk.StringVar(value="./input_depth_maps")
+        self.input_source_clips_var = tk.StringVar(value="./work/seg/")
+        self.input_depth_maps_var = tk.StringVar(value="./work/depthmap/")
         self.multi_map_var = tk.BooleanVar(value=False)
         self.selected_depth_map_var = tk.StringVar(value="")
         self.depth_map_subfolders = []
@@ -283,7 +289,7 @@ class SplatterGUI(ThemedTk):
         self._last_loaded_source_video = None
 
         self.input_depth_maps_var.trace_add("write", lambda *args: self._on_depth_map_folder_changed())
-        self.output_splatted_var = tk.StringVar(value="./output_splatted")
+        self.output_splatted_var = tk.StringVar(value="./work/splat/")
         self.max_disp_var = tk.StringVar(value=defaults["MAX_DISP"])
         self.process_length_var = tk.StringVar(value=defaults["PROC_LENGTH"])
         self.process_from_var = tk.StringVar(value="")
@@ -292,7 +298,7 @@ class SplatterGUI(ThemedTk):
         legacy_dual_default = bool(self.app_config.get("dual_output", False))
         layout_default = self.app_config.get(
             "output_layout",
-            "Dual" if legacy_dual_default else "Quad",
+            "Dual" if legacy_dual_default else "Single Warp",
         )
         self.output_layout_var = tk.StringVar(value=_output_layout_to_gui_value(layout_default))
         self.dual_output_var = tk.BooleanVar(
@@ -309,15 +315,26 @@ class SplatterGUI(ThemedTk):
         self.output_crf_var = tk.StringVar(value=defaults["CRF_OUTPUT"])
         self.output_crf_full_var = tk.StringVar(value=defaults["CRF_OUTPUT"])
         self.output_crf_low_var = tk.StringVar(value=defaults["CRF_OUTPUT"])
+        self.output_codec_var = tk.StringVar(
+            value=normalize_codec(self.app_config.get("output_codec", "libx264"), "libx264")
+        )
+        self.encoder_mode_var = tk.StringVar(
+            value=normalize_global_encoder_mode(self.app_config.get("encoder_mode", "lossless"), "lossless")
+        )
         self.color_tags_mode_var = tk.StringVar(value="Auto")
         self.skip_lowres_preproc_var = tk.BooleanVar(value=False)
         self.track_dp_total_true_on_render_var = tk.BooleanVar(value=False)
-        self.move_to_finished_var = tk.BooleanVar(value=True)
+        self.resume_skip_existing_var = tk.BooleanVar(
+            value=bool(self.app_config.get("resume_skip_existing", True))
+        )
+        self.move_to_finished_var = tk.BooleanVar(
+            value=bool(self.app_config.get("move_to_finished", False))
+        )
         self.crosshair_enabled_var = tk.BooleanVar(value=False)
         self.crosshair_white_var = tk.BooleanVar(value=False)
         self.crosshair_multi_var = tk.BooleanVar(value=False)
         self.depth_pop_enabled_var = tk.BooleanVar(value=False)
-        self.auto_convergence_mode_var = tk.StringVar(value="Off")
+        self.auto_convergence_mode_var = tk.StringVar(value="MinBorders")
         self.depth_gamma_var = tk.StringVar(value=defaults["DEPTH_GAMMA"])
         self.depth_dilate_size_x_var = tk.StringVar(value=defaults["DEPTH_DILATE_SIZE_X"])
         self.depth_dilate_size_y_var = tk.StringVar(value=defaults["DEPTH_DILATE_SIZE_Y"])
@@ -1947,8 +1964,43 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.combo_border_mode, "border_mode")
         self._create_hover_tooltip(self.btn_border_rescan, "border_rescan")
 
+        # Row 3: Shared output encoder profile
+        self.codec_frame = ttk.Frame(self.output_settings_frame)
+        self.codec_frame.grid(row=3, column=0, sticky="w", padx=5, pady=0)
+        self.lbl_output_codec = ttk.Label(self.codec_frame, text="Codec:")
+        self.lbl_output_codec.pack(side="left", padx=(0, 3))
+        self.combo_output_codec = ttk.Combobox(
+            self.codec_frame,
+            textvariable=self.output_codec_var,
+            values=FFMPEG_CODEC_CHOICES,
+            state="readonly",
+            width=10,
+        )
+        self.combo_output_codec.pack(side="left")
+        self.combo_output_codec.bind("<<ComboboxSelected>>", lambda _e: self._save_config())
+
+        self.encoder_mode_frame = ttk.Frame(self.output_settings_frame)
+        self.encoder_mode_frame.grid(row=3, column=1, sticky="w", padx=5, pady=0)
+        self.lbl_encoder_mode = ttk.Label(self.encoder_mode_frame, text="Encoder:")
+        self.lbl_encoder_mode.pack(side="left", padx=(0, 3))
+        self.combo_encoder_mode = ttk.Combobox(
+            self.encoder_mode_frame,
+            textvariable=self.encoder_mode_var,
+            values=GLOBAL_ENCODER_MODE_CHOICES,
+            state="readonly",
+            width=10,
+        )
+        self.combo_encoder_mode.pack(side="left")
+        self.combo_encoder_mode.bind("<<ComboboxSelected>>", lambda _e: self._save_config())
+
         # Track these for disabling during processing
-        self.widgets_to_disable.extend([self.combo_color_tags_mode, self.combo_border_mode, self.btn_border_rescan])
+        self.widgets_to_disable.extend([
+            self.combo_color_tags_mode,
+            self.combo_border_mode,
+            self.btn_border_rescan,
+            self.combo_output_codec,
+            self.combo_encoder_mode,
+        ])
 
         current_row = 0  # Reset for next frame
         # ===================================================================
@@ -2183,11 +2235,11 @@ class SplatterGUI(ThemedTk):
         self.global_norm_checkbox.pack(side="left")
         self._create_hover_tooltip(self.global_norm_checkbox, "enable_global_normalization")
 
-        self.move_to_finished_checkbox = ttk.Checkbutton(
-            checkbox_row, text="Resume", variable=self.move_to_finished_var
+        self.resume_skip_existing_checkbox = ttk.Checkbutton(
+            checkbox_row, text="Resume / Skip Existing", variable=self.resume_skip_existing_var
         )
-        self.move_to_finished_checkbox.pack(side="left", padx=(10, 0))
-        self._create_hover_tooltip(self.move_to_finished_checkbox, "move_to_finished_folder")
+        self.resume_skip_existing_checkbox.pack(side="left", padx=(10, 0))
+        self._create_hover_tooltip(self.resume_skip_existing_checkbox, "move_to_finished_folder")
         # Crosshair overlay controls (preview only)
         self.crosshair_checkbox = ttk.Checkbutton(
             checkbox_row,
@@ -2974,6 +3026,10 @@ class SplatterGUI(ThemedTk):
 
         # Legacy CRF mapping
         config["output_crf"] = self.output_crf_full_var.get()
+        config["output_codec"] = normalize_codec(config.get("output_codec", "libx264"), "libx264")
+        config["encoder_mode"] = normalize_global_encoder_mode(config.get("encoder_mode", "lossless"), "lossless")
+        config["resume_skip_existing"] = bool(self.resume_skip_existing_var.get())
+        config["move_to_finished"] = not config["resume_skip_existing"]
 
         # Avoid persisting test-forced preview settings
         try:
@@ -3008,9 +3064,12 @@ class SplatterGUI(ThemedTk):
             output_layout=output_layout,
             zero_disparity_anchor=float(config["convergence_point"]),
             enable_global_norm=config["enable_global_norm"],
-            move_to_finished=config["move_to_finished"],
+            move_to_finished=not bool(config.get("resume_skip_existing", True)),
+            resume_skip_existing=bool(config.get("resume_skip_existing", True)),
             output_crf_full=int(config["output_crf_full"]),
             output_crf_low=int(config["output_crf_low"]),
+            output_codec=normalize_codec(config.get("output_codec", "libx264"), "libx264"),
+            encoder_mode=normalize_global_encoder_mode(config.get("encoder_mode", "lossless"), "lossless"),
             depth_gamma=float(config["depth_gamma"]),
             depth_dilate_size_x=float(config["depth_dilate_size_x"]),
             depth_dilate_size_y=float(config["depth_dilate_size_y"]),
@@ -6462,7 +6521,7 @@ class SplatterGUI(ThemedTk):
         single_finished_depth_folder = None
 
         # --- Check the new GUI variable ---
-        if self.move_to_finished_var.get():
+        if not self.resume_skip_existing_var.get():
             # We assume the finished folder is in the same directory as the original input file/depth map
             single_finished_source_folder = os.path.join(os.path.dirname(single_video_path), "finished")
             single_finished_depth_folder = os.path.join(os.path.dirname(single_depth_path), "finished")

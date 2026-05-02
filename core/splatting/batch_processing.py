@@ -83,6 +83,8 @@ class ProcessingSettings:
         output_crf: Quality CRF value (legacy)
         output_crf_full: CRF for full resolution
         output_crf_low: CRF for low resolution
+        output_codec: Explicit FFmpeg codec for shared encoder modes
+        encoder_mode: Shared encoder mode ("lossless" | "crf/qp 0" | "crf/qp 1")
         depth_gamma: Gamma correction for depth
         depth_dilate_size_x: Horizontal dilation size
         depth_dilate_size_y: Vertical dilation size
@@ -113,10 +115,13 @@ class ProcessingSettings:
     zero_disparity_anchor: float = 0.5
     enable_global_norm: bool = False
     match_depth_res: bool = True
-    move_to_finished: bool = True
+    move_to_finished: bool = False
+    resume_skip_existing: bool = True
     output_crf: int = 23
     output_crf_full: int = 23
     output_crf_low: int = 23
+    output_codec: str = "libx264"
+    encoder_mode: str = "lossless"
     depth_gamma: float = 1.0
     depth_dilate_size_x: float = 0.0
     depth_dilate_size_y: float = 0.0
@@ -462,6 +467,24 @@ class BatchProcessor:
             output_layout = str(getattr(settings, "output_layout", "") or "").strip().lower()
             if output_layout not in {"quad", "dual", "single_warp"}:
                 output_layout = "dual" if bool(getattr(settings, "dual_output", False)) else "quad"
+            expected_output_path = self._expected_output_path(
+                settings=settings,
+                task=task,
+                video_name=video_name,
+                target_width=readers["target_w"],
+                output_layout=output_layout,
+            )
+            if settings.resume_skip_existing and os.path.exists(expected_output_path):
+                self.logger.info(
+                    "Resume: skipping %s for %s because output already exists: %s",
+                    task.name,
+                    video_name,
+                    expected_output_path,
+                )
+                _cleanup_task_readers(readers)
+                processed_count += 1
+                self.progress_queue.put(("processed", initial_task_counter + processed_count))
+                continue
             try:
                 renderer.render_video(
                     input_video_reader=readers["source"],
@@ -483,6 +506,8 @@ class BatchProcessor:
                     global_depth_max=vid_settings.get("global_max", 1.0),
                     depth_stream_info=readers["depth_info"],
                     user_output_crf=settings.output_crf_low if task.is_low_res else settings.output_crf_full,
+                    force_output_codec=settings.output_codec,
+                    encoding_mode=settings.encoder_mode,
                     is_low_res_task=task.is_low_res,
                     depth_gamma=vid_settings["depth_gamma"],
                     depth_dilate_size_x=vid_settings["depth_dilate_size_x"],
@@ -520,6 +545,23 @@ class BatchProcessor:
         gc.collect()
         release_cuda_memory(aggressive=True)
         return len(tasks)
+
+    @staticmethod
+    def _expected_output_path(
+        settings: ProcessingSettings,
+        task: ProcessingTask,
+        video_name: str,
+        target_width: int,
+        output_layout: str,
+    ) -> str:
+        suffix_by_layout = {
+            "single_warp": "_splatted1",
+            "dual": "_splatted2",
+            "quad": "_splatted4",
+        }
+        suffix = suffix_by_layout.get(output_layout, "_splatted4")
+        base_path = os.path.join(settings.output_splatted, task.output_subdir, f"{video_name}.mp4")
+        return f"{os.path.splitext(base_path)[0]}_{int(target_width)}{suffix}.mp4"
 
     def _get_video_specific_settings(self, video_path: str, settings: ProcessingSettings, is_single_file_mode: bool) -> dict:
         """Resolve settings for a specific video, merging sidecar and GUI defaults."""

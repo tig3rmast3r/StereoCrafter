@@ -211,5 +211,6 @@ Still testing, may need some fine tuning<br>
 - [new] benchmark mode will test and setup inpaint chunk sizes based on your GPU
 - [change] new preset changes, "speed" aimed with minimal quality loss, lowered number of inference steps based on sharpness.csv, lowered depthmap steps from 5 to 4, lowered max inpaint resolution to 90%, depthcrafter retries are now faster if the first run fails, with this new setup the first run will process scenes up to ~10 sec, retry 1 up to ~20 sec at 0.95x speed, retry 2 up to ~30 sec at 0.33x speed, retry 3 any length with 1x speed but with stream script (that misses file level latents, only overlap level) 
 - [change] depthcrafter retries are now relative to the chunk size (offsets) so they will adapt automatically based on the chunk size without having to tune them manually
+- [change] all legacy GUI versions now have a resume/skip existing flag that behaves the same, it will skip existing files and doesn't move anything on the "finished" folders (default ON)
 - [fix] Missing requirements for docker setup to enable full headless pipeline
 - [fix] Aligned stand-alone GUI versions with new values and features (retry policy for depthcrafter/inpaint is not available on inpaint/depthcrafter GUI versions)
