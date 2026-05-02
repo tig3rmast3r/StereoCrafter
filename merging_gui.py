@@ -1155,7 +1155,7 @@ def _lookup_csv_blend_preset_rows(
 
 
 def _compute_preset_oscillator_flags(
-    seq: List[int], min_len: int = 4
+    seq: List[int], min_len: int = 5
 ) -> List[bool]:
     flags = [False for _ in seq]
     n = len(seq)
@@ -1189,6 +1189,21 @@ def _compute_preset_oscillator_flags(
     return flags
 
 
+def _compute_same_preset_run_lengths(seq: List[int]) -> List[int]:
+    run_lengths = [0 for _ in seq]
+    n = len(seq)
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and int(seq[j]) == int(seq[i]):
+            j += 1
+        run_len = j - i
+        for k in range(i, j):
+            run_lengths[k] = run_len
+        i = j
+    return run_lengths
+
+
 def _build_csv_blend_weights_by_frame(
     target_preset_ids: List[int],
     transition_alphas: Optional[List[float]] = None,
@@ -1208,6 +1223,7 @@ def _build_csv_blend_weights_by_frame(
     run_len = 0
 
     osc_flags = _compute_preset_oscillator_flags(target_preset_ids)
+    same_preset_run_lengths = _compute_same_preset_run_lengths(target_preset_ids)
 
     for idx, pid_raw in enumerate(target_preset_ids):
         pid = int(pid_raw)
@@ -1228,6 +1244,8 @@ def _build_csv_blend_weights_by_frame(
             alpha = float(transition_alphas[run_len - 1])
         else:
             alpha = 1.0
+        if run_len == 1 and same_preset_run_lengths[idx] >= 3:
+            alpha = max(alpha, 0.50)
         alpha = float(max(0.0, min(1.0, alpha)))
 
         if not weights:
