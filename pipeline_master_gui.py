@@ -740,10 +740,10 @@ class PipelineMasterGUI:
             )
         )
         self.inpaint_tile1_max_size_var = tk.StringVar(
-            value=str(self._config.get("inpaint_tile1_max_size", "4,26,33,44,61,89"))
+            value=str(self._config.get("inpaint_tile1_max_size", "3,25,32,43,60,88"))
         )
         self.inpaint_tile2_max_size_var = tk.StringVar(
-            value=str(self._config.get("inpaint_tile2_max_size", "72,87,108,118,118,118"))
+            value=str(self._config.get("inpaint_tile2_max_size", "71,86,107,117,117,117"))
         )
         self.inpaint_dynamic_visible_chunk_steps5_var = tk.StringVar(
             value=str(
@@ -1087,9 +1087,9 @@ class PipelineMasterGUI:
         if self.inpaint_tile_mode_var.get().strip() not in {"1", "2", "1 and 2"}:
             self.inpaint_tile_mode_var.set("1 and 2")
         if self.inpaint_tile1_max_size_var.get().strip() == "":
-            self.inpaint_tile1_max_size_var.set("4,26,33,44,61,89")
+            self.inpaint_tile1_max_size_var.set("3,25,32,43,60,88")
         if self.inpaint_tile2_max_size_var.get().strip() == "":
-            self.inpaint_tile2_max_size_var.set("72,87,108,118,118,118")
+            self.inpaint_tile2_max_size_var.set("71,86,107,117,117,117")
         if self.inpaint_resolution_limit_var.get().strip() not in {"100%", "90%", "80%", "70%", "60%", "50%"}:
             self.inpaint_resolution_limit_var.set("90%")
         if self.inpaint_dynamic_visible_chunk_steps5_var.get().strip() == "":
@@ -8684,8 +8684,8 @@ class PipelineMasterGUI:
         self.inpaint_dynamic_chunk_var.set(True)
         self.inpaint_cpu_offload_var.set("none")
         self.inpaint_tile_mode_var.set("1 and 2")
-        self.inpaint_tile1_max_size_var.set("4,26,33,44,61,89")
-        self.inpaint_tile2_max_size_var.set("72,87,108,118,118,118")
+        self.inpaint_tile1_max_size_var.set("3,25,32,43,60,88")
+        self.inpaint_tile2_max_size_var.set("71,86,107,117,117,117")
         self.inpaint_dynamic_resolution_var.set(True)
         self.inpaint_resolution_limit_var.set("90%")
         self.inpaint_dynamic_visible_chunk_steps5_var.set(

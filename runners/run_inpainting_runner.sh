@@ -17,13 +17,13 @@ GLOB="${GLOB:-*.mp4}"
 HIRES_BLEND_FOLDER="${HIRES_BLEND_FOLDER:-}"                # optional
 REPLACE_MASK_FOLDER="${REPLACE_MASK_FOLDER:-./work/mask/}"              # optional; folder with <splatted_stem>_replace_mask.*
 USE_REPLACE_MASK="${USE_REPLACE_MASK:-1}"                   # 1 => use external replace mask (fast-fail if missing/mismatch)
-OFFLOAD_TYPE="${OFFLOAD_TYPE:-model}"                      # none | model | sequential
+OFFLOAD_TYPE="${OFFLOAD_TYPE:-none}"                       # none | model | sequential
 
 CHUNK_SIZE="${CHUNK_SIZE:-22}"
 ENABLE_DYNAMIC_CHUNK="${ENABLE_DYNAMIC_CHUNK:-1}"
 TILE_MODE="${TILE_MODE:-1 and 2}"
-TILE1_MAX_SIZE="${TILE1_MAX_SIZE:-22,22,22,22,22,22}"
-TILE2_MAX_SIZE="${TILE2_MAX_SIZE:-55,55,55,55,55,55}"
+TILE1_MAX_SIZE="${TILE1_MAX_SIZE:-3,25,32,43,60,88}"
+TILE2_MAX_SIZE="${TILE2_MAX_SIZE:-71,86,107,117,117,117}"
 DYNAMIC_VISIBLE_CHUNK_STEPS5="${DYNAMIC_VISIBLE_CHUNK_STEPS5:-38}"
 DYNAMIC_VISIBLE_CHUNK_STEPS6="${DYNAMIC_VISIBLE_CHUNK_STEPS6:-26}"
 DYNAMIC_VISIBLE_CHUNK_STEPS7="${DYNAMIC_VISIBLE_CHUNK_STEPS7:-18}"
@@ -44,8 +44,8 @@ NO_SHARPNESS_CSV="${NO_SHARPNESS_CSV:-0}"
 SHARPNESS_BASE="${SHARPNESS_BASE:-./work/}"                    # folder containing sharpness.csv; empty => defaults to input folder
 SHARPNESS_CSV_PATH="${SHARPNESS_CSV_PATH:-}"                    # optional explicit sharpness CSV path
 FIXED_STEPS="${FIXED_STEPS:-8}"
-DYNAMIC_RESOLUTION="${DYNAMIC_RESOLUTION:-0}"                  # 1 => scale model resolution from effective steps, output returns to source size
-RESOLUTION_SCALE="${RESOLUTION_SCALE:-1.00}"                   # dynamic ON: max scale cap; dynamic OFF: fixed scale
+DYNAMIC_RESOLUTION="${DYNAMIC_RESOLUTION:-1}"                  # 1 => scale model resolution from effective steps, output returns to source size
+RESOLUTION_SCALE="${RESOLUTION_SCALE:-0.90}"                   # dynamic ON: max scale cap; dynamic OFF: fixed scale
 
 # Mask settings
 MASK_INITIAL_THRESHOLD="${MASK_INITIAL_THRESHOLD:-0.3}"

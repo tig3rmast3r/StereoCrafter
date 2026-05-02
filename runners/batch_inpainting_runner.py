@@ -720,7 +720,7 @@ def run_batch(args):
 
     def _ensure_pipeline(offload_type: str):
         nonlocal pipeline, pipeline_mode
-        mode = _norm_offload_mode(offload_type, "model")
+        mode = _norm_offload_mode(offload_type, "none")
         if pipeline is not None and pipeline_mode == mode:
             return
         _drop_pipeline()
@@ -1129,13 +1129,13 @@ def main():
                    help="Ignore sharpness.csv and use --fixed_steps for all files")
     p.add_argument("--fixed_steps", type=float, default=8.0,
                    help="Fallback effective steps when sharpness.csv is missing or ignored")
-    p.add_argument("--resolution_scale", type=float, default=1.0,
+    p.add_argument("--resolution_scale", type=float, default=0.90,
                    help="Dynamic resolution max scale when enabled, fixed model scale when disabled.")
     p.add_argument("--enable_dynamic_resolution", dest="enable_dynamic_resolution", action="store_true",
                    help="Resize inpaint inputs dynamically from model steps, then upscale back to source size.")
     p.add_argument("--disable_dynamic_resolution", dest="enable_dynamic_resolution", action="store_false",
                    help="Keep inpaint inputs at source resolution.")
-    p.set_defaults(enable_dynamic_resolution=False)
+    p.set_defaults(enable_dynamic_resolution=True)
     p.add_argument("--chunk_size", type=int, default=22,
                    help="Processed chunk size (visible + overlap, no tail) used when dynamic chunk is disabled.")
     p.add_argument("--enable_dynamic_chunk", dest="enable_dynamic_chunk", action="store_true",
@@ -1144,8 +1144,8 @@ def main():
                    help="Use fixed --chunk_size instead of dynamic chunk selection.")
     p.set_defaults(enable_dynamic_chunk=True)
     p.add_argument("--tile_mode", type=str, default="1 and 2", choices=["1", "2", "1 and 2"])
-    p.add_argument("--tile1_max_size", type=str, default="22")
-    p.add_argument("--tile2_max_size", type=str, default="55")
+    p.add_argument("--tile1_max_size", type=str, default=igs.DEFAULT_TILE1_CHUNK_BUCKETS_4090)
+    p.add_argument("--tile2_max_size", type=str, default=igs.DEFAULT_TILE2_CHUNK_BUCKETS_4090)
     p.add_argument("--dynamic_visible_chunk_steps5", type=int, default=igs.DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS5)
     p.add_argument("--dynamic_visible_chunk_steps6", type=int, default=igs.DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS6)
     p.add_argument("--dynamic_visible_chunk_steps7", type=int, default=igs.DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS7)
@@ -1157,7 +1157,7 @@ def main():
     p.add_argument("--original_input_blend_strength", type=float, default=0.0)
     p.add_argument("--process_length", type=int, default=-1)
 
-    p.add_argument("--offload_type", type=str, default="model", choices=["none", "model", "sequential"],
+    p.add_argument("--offload_type", type=str, default="none", choices=["none", "model", "sequential"],
                    help="Matches GUI offload_type")
     p.add_argument("--retry_policy_json", type=str, default="",
                    help="Optional JSON policy for per-file retries (run/retry1/retry2/retry3).")

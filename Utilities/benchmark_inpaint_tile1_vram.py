@@ -965,7 +965,7 @@ def main() -> int:
                             else:
                                 break
                     measured_safe = last_ok if last_ok > 0 else 0
-                    default_chunk = max(1, measured_safe - 1) if measured_safe > 0 else 1
+                    default_chunk = max(1, measured_safe - 2) if measured_safe > 0 else 1
                     measured_safe_chunks.append(measured_safe)
                     default_chunks.append(default_chunk)
                     current_start = max(1, measured_safe)
@@ -983,7 +983,8 @@ def main() -> int:
                 benchmark_chunks_by_tile[tile_num] = default_chunks
             json_out = Path(args.json_out).resolve()
             payload = {
-                "schema": "stereocrafter.inpaint_tile_chunk_benchmark.v2",
+                "schema": "stereocrafter.inpaint_tile_chunk_benchmark.v3",
+                "default_chunk_offset": -2,
                 "scale_pcts": scale_values,
                 "tail_pad": int(args.tail_pad),
                 "overlap": int(args.overlap),

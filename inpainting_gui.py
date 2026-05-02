@@ -60,8 +60,8 @@ DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS6 = 26
 DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS7 = 18
 DEFAULT_DYNAMIC_VISIBLE_CHUNK_STEPS8_PLUS = 14
 DEFAULT_DYNAMIC_STATIC_MASK_DIVISOR = 2.0
-DEFAULT_TILE1_CHUNK_BUCKETS_4090 = "4,26,33,44,61,89"
-DEFAULT_TILE2_CHUNK_BUCKETS_4090 = "72,87,108,118,118,118"
+DEFAULT_TILE1_CHUNK_BUCKETS_4090 = "3,25,32,43,60,88"
+DEFAULT_TILE2_CHUNK_BUCKETS_4090 = "71,86,107,117,117,117"
 DEFAULT_OUTPUT_CODEC = "libx264"
 DEFAULT_OUTPUT_ENCODER_MODE = "lossless"
 
@@ -2442,6 +2442,95 @@ class InpaintingGUI(ThemedTk):
         ).clamp(0.0, 1.0)
 
     @staticmethod
+    def _ffprobe_video_packet_count(path: str) -> Optional[int]:
+        """Fast frame-count estimate from video packets; avoids decoding the clip."""
+        try:
+            proc = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-count_packets",
+                    "-show_entries",
+                    "stream=nb_read_packets",
+                    "-of",
+                    "default=nw=1:nk=1",
+                    str(path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            if proc.returncode != 0:
+                logger.debug(f"ffprobe packet count failed for {path}: {proc.stderr.strip()}")
+                return None
+            for line in (proc.stdout or "").splitlines():
+                value = line.strip()
+                if not value or value.upper() == "N/A":
+                    continue
+                count = int(float(value))
+                return count if count > 0 else None
+        except Exception as exc:
+            logger.debug(f"ffprobe packet count unavailable for {path}: {exc}")
+        return None
+
+    def _start_ffprobe_video_packet_count_async(self, path: str) -> dict[str, object]:
+        state: dict[str, object] = {"done": False, "count": None}
+
+        def _worker() -> None:
+            state["count"] = self._ffprobe_video_packet_count(path)
+            state["done"] = True
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        state["thread"] = thread
+        thread.start()
+        return state
+
+    @staticmethod
+    def _build_inpaint_chunk_schedule(
+        total_frames: int,
+        processed_chunk: int,
+        overlap: int,
+    ) -> list[dict[str, int]]:
+        total = max(0, int(total_frames))
+        chunk = max(1, int(processed_chunk))
+        ov = min(max(0, int(overlap)), max(0, chunk - 1))
+        visible = max(1, chunk - ov)
+        schedule: list[dict[str, int]] = []
+
+        i = 0
+        while i < total:
+            planned_core = visible if not schedule else chunk
+            remaining = total - i
+            core_span = min(planned_core, remaining)
+            if core_span <= 0:
+                break
+            output_frames = core_span if not schedule else max(0, core_span - ov)
+            if schedule and output_frames <= 0:
+                break
+            schedule.append(
+                {
+                    "start": int(i),
+                    "core_span": int(core_span),
+                    "output_frames": int(output_frames),
+                }
+            )
+            if i + core_span >= total:
+                break
+            i += max(1, core_span - ov)
+
+        if len(schedule) >= 2 and 1 <= int(schedule[-1]["output_frames"]) <= 2:
+            tail_output = int(schedule[-1]["output_frames"])
+            schedule[-2]["core_span"] = int(schedule[-2]["core_span"]) + tail_output
+            schedule[-2]["output_frames"] = int(schedule[-2]["output_frames"]) + tail_output
+            schedule.pop()
+
+        return schedule
+
+    @staticmethod
     def _normalize_tile_mode(tile_mode: Optional[str], tile_num: int = 1) -> str:
         raw = str(tile_mode or "").strip().lower()
         if raw in {"1", "tile 1"}:
@@ -2732,6 +2821,7 @@ class InpaintingGUI(ThemedTk):
         frames_chunk = int(chunk_plan["processed_chunk_final"])
         tile_num = int(chunk_plan["selected_tile"])
         model_inference_steps = int(chunk_plan["model_steps"])
+        ffprobe_state = self._start_ffprobe_video_packet_count_async(input_video_path)
         logger.info(
             "[chunk-plan] "
             f"effective_steps={chunk_plan['effective_steps']:.2f} "
@@ -2836,8 +2926,23 @@ class InpaintingGUI(ThemedTk):
 
         
         # 3. INPAINTING CHUNKS (The main loop)
-        # This part of the loop remains the same, but the logic inside is simplified
+        # Pre-plan the chunk boundaries so tiny 1-2 frame tail chunks can be
+        # absorbed by the previous chunk instead of producing a visibly sharper tail.
         total_frames_to_process_actual = num_frames_original
+        ffprobe_packet_count = ffprobe_state.get("count") if ffprobe_state.get("done") else None
+        if ffprobe_packet_count is None:
+            logger.debug("ffprobe packet count still pending/unavailable; using reader frame count for chunk schedule.")
+        else:
+            ffprobe_process_count = int(ffprobe_packet_count)
+            if process_length is not None and int(process_length) > 0:
+                ffprobe_process_count = min(ffprobe_process_count, int(process_length))
+            if abs(int(ffprobe_process_count) - int(total_frames_to_process_actual)) > 1:
+                logger.debug(
+                    "ffprobe packet count differs from reader count for %s: ffprobe=%s reader=%s",
+                    base_video_name,
+                    ffprobe_process_count,
+                    total_frames_to_process_actual,
+                )
         frames_chunk = max(1, int(frames_chunk))
         current_overlap_base = min(max(0, int(overlap)), max(0, frames_chunk - 1))
         min_processed_chunk = max(1, 2 * current_overlap_base + 1)
@@ -2848,6 +2953,20 @@ class InpaintingGUI(ThemedTk):
             )
             frames_chunk = min_processed_chunk
         tail_pad = max(0, int(tail_pad))
+        chunk_schedule = self._build_inpaint_chunk_schedule(
+            total_frames=total_frames_to_process_actual,
+            processed_chunk=frames_chunk,
+            overlap=current_overlap_base,
+        )
+        if not chunk_schedule:
+            logger.warning(f"No inpainting chunks planned for {input_video_path}.")
+            return False, None
+        logger.info(
+            "[chunk-schedule] "
+            f"frames={total_frames_to_process_actual} processed={frames_chunk} "
+            f"overlap={current_overlap_base} chunks={len(chunk_schedule)} "
+            f"last_output={chunk_schedule[-1]['output_frames']}"
+        )
 
         # Streaming encode (write MP4 as we generate frames) drastically reduces RAM usage.
         # NOTE: If Hi-Res blending is enabled, we fall back to the original (non-streaming) path.
@@ -2888,16 +3007,16 @@ class InpaintingGUI(ThemedTk):
                 ffmpeg_p = None
                 video_only_path = None
 
-        i = 0
-        while i < total_frames_to_process_actual:
+        for chunk_index, chunk_info in enumerate(chunk_schedule):
+            i = int(chunk_info["start"])
             if stop_event and stop_event.is_set():
                 logger.info(f"Stopping processing of {input_video_path}")
                 return False, None
 
-            current_processed_chunk = frames_chunk
-            current_overlap = min(max(0, int(overlap)), max(0, current_processed_chunk - 1))
-            current_visible_chunk = max(1, current_processed_chunk - current_overlap)
-            current_core_real_span = current_visible_chunk if i == 0 else current_processed_chunk
+            current_processed_chunk = int(chunk_info["core_span"])
+            current_overlap = current_overlap_base
+            current_visible_chunk = int(chunk_info["output_frames"])
+            current_core_real_span = int(chunk_info["core_span"])
             current_tail_pad = min(tail_pad, max(0, current_core_real_span - 1))
             
             # --- CHUNK SLICING AND PADDING LOGIC ---
@@ -2906,7 +3025,7 @@ class InpaintingGUI(ThemedTk):
             # - Last chunk: append tail_pad DUPLICATED tail frames and discard them from output.
             # A chunk is "last" when its core real span reaches EOF.
             # Using next_chunk_start can misclassify near-tail chunks and drop frames.
-            is_last_chunk = (i + current_core_real_span) >= total_frames_to_process_actual
+            is_last_chunk = chunk_index == len(chunk_schedule) - 1
             guard_extra_real_requested = 0 if is_last_chunk else current_tail_pad
             end_idx_for_slicing = min(
                 i + current_core_real_span + guard_extra_real_requested,
@@ -3161,8 +3280,6 @@ class InpaintingGUI(ThemedTk):
             # Stop after processing the true last chunk.
             if is_last_chunk:
                 break
-            next_stride = max(1, emit_sliced_length - current_overlap)
-            i += next_stride
         # If streaming encoding is enabled, we have already written frames to ffmpeg as they were generated.
         if stream_encode_enabled and ffmpeg_p is not None and video_only_path is not None:
             if update_info_callback:
