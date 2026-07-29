@@ -69,6 +69,10 @@ python Utilities/prepare_seg_mono_to_sbs.py # if you have mono files on seg-mono
 
 [Fork changelog](assets/Fork_change_log.md)
 
+## Support
+
+If you find this useful, you can leave a tip through [my Ko-fi page](https://ko-fi.com/tig3rmast3r) by using the Sponsor button at the top of this repository. Every contribution is appreciated and helps me dedicate more time to updates, fixes, and new projects.
+
 <br>
 <br>
 
